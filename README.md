@@ -12,8 +12,8 @@ BELLS implements a 3-tier memory hierarchy for MoE expert weights:
 
 | Tier | Storage | Access Speed | Contents |
 |------|---------|--------------|----------|
-| L1 | VRAM | ~1TB/s | Hot experts (pinned permanently) |
-| L2 | RAM | ~50GB/s | Warm experts (pre-loaded) |
+| L1 | VRAM | ~1TB/s | Burning experts (pinned permanently) |
+| L2 | RAM | ~50GB/s | Hot experts (pre-loaded) |
 | L3 | NVMe | ~3-10GB/s | Cold experts (mmap on demand) |
 
 A learned router predicts which experts will be needed next and promotes them up the hierarchy before they're required, hiding latency behind compute.

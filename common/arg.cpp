@@ -2297,6 +2297,60 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
     add_opt(common_arg(
+        {"--bells"},
+        "enable the BELLS expert cache, sizing it automatically from free VRAM. Equivalent to "
+        "--bells-slots -1. Use with --cpu-moe, which keeps the expert weights on the host",
+        [](common_params & params) {
+            params.bells_enabled = true;
+            params.bells_n_slot  = 0;
+        }
+    ).set_env("LLAMA_ARG_BELLS"));
+    add_opt(common_arg(
+        {"--bells-slots"}, "N",
+        "BELLS: keep N MoE experts per layer resident in VRAM and stream the rest in on demand. "
+        "Use -1 to size the cache automatically from free VRAM. Use together with --cpu-moe, "
+        "which keeps the expert weights on the host where BELLS reads them from "
+        "(default: 0 = disabled)",
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("invalid value");
+            }
+            // -1 means auto; the runtime treats 0 as "pick from free VRAM", and the enable
+            // flag is carried separately so that 0 can still mean off at the CLI
+            params.bells_enabled = value != 0;
+            params.bells_n_slot  = value > 0 ? (uint32_t) value : 0;
+        }
+    ).set_env("LLAMA_ARG_BELLS_SLOTS"));
+    add_opt(common_arg(
+        {"--bells-prefetch"}, "N",
+        "BELLS: experts to prefetch per layer per token (default: half the cache). In "
+        "--bells-drop-missing mode this is the only way experts become resident, so raising it "
+        "improves output at the cost of more PCIe traffic",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.bells_n_prefetch = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_BELLS_PREFETCH"));
+    add_opt(common_arg(
+        {"--bells-drop-missing"},
+        "BELLS: let an expert that is not resident contribute nothing, instead of fetching it "
+        "on demand. Removes the per-layer host sync that dominates decode time, at the cost of "
+        "exact output. Compare perplexity before relying on it",
+        [](common_params & params) {
+            params.bells_drop_missing = true;
+        }
+    ).set_env("LLAMA_ARG_BELLS_DROP_MISSING"));
+    add_opt(common_arg(
+        {"--bells-table"}, "FNAME",
+        "BELLS: expert predictor table built by bells_build_table.py; without it BELLS runs "
+        "demand-only and misses cost a synchronous copy",
+        [](common_params & params, const std::string & value) {
+            params.bells_table = value;
+        }
+    ).set_env("LLAMA_ARG_BELLS_TABLE"));
+    add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
         [](common_params & params, int value) {

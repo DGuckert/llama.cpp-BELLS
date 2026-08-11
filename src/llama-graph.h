@@ -2,6 +2,7 @@
 
 #include "llama-arch.h"
 #include "llama-batch.h"
+#include "llama-bells.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
 
@@ -545,6 +546,8 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    bells_runtime * bells = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -758,6 +761,8 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+
+    bells_runtime * bells;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

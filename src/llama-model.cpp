@@ -9677,6 +9677,10 @@ int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
 }
 
+int32_t llama_model_n_expert_used(const struct llama_model * model) {
+    return model->hparams.n_expert_used;
+}
+
 int32_t llama_model_n_devices(const struct llama_model * model) {
     return (int32_t)model->devices.size();
 }

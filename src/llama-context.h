@@ -225,6 +225,10 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // residency correction: fires on ffn_moe_topk-<il>, guarantees the selected experts are
+    // in the cache and refreshes the slot table before the gather downstream reads it
+    bool bells_eval(ggml_tensor * t, bool ask);
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -253,6 +257,8 @@ private:
     llama_adapter_loras_ptr loras;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
+
+    std::unique_ptr<bells_runtime> bells;
 
     std::unique_ptr<llama_memory_i> memory;
 

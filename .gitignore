@@ -147,3 +147,7 @@ poetry.toml
 a.out.*
 
 AGENTS.local.md
+
+# BELLS working notes, not for publication
+bells_reading.txt
+

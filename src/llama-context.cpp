@@ -364,6 +364,48 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    if (params.bells_enabled) {
+        std::vector<bells_tensors::layer_src> srcs;
+
+        for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
+            const auto & layer = model.layers[il];
+
+            if (!layer.ffn_gate_exps && !layer.ffn_up_exps && !layer.ffn_gate_up_exps) {
+                continue; // dense layer
+            }
+
+            bells_tensors::layer_src s;
+            s.il      = (int32_t) il;
+            s.gate    = layer.ffn_gate_exps;
+            s.up      = layer.ffn_up_exps;
+            s.down    = layer.ffn_down_exps;
+            s.gate_up = layer.ffn_gate_up_exps;
+
+            srcs.push_back(s);
+        }
+
+        if (srcs.empty()) {
+            LLAMA_LOG_WARN("%s: BELLS requested but this model has no MoE layers\n", __func__);
+        } else {
+            bells_params bp;
+            bp.enabled      = true;
+            bp.n_slot       = params.bells_n_slot;
+            bp.table        = params.bells_table ? params.bells_table : "";
+            bp.drop_missing = params.bells_drop_missing;
+            bp.n_prefetch   = params.bells_n_prefetch;
+
+            // the cache lives wherever the graph runs, i.e. next to the rest of the offload
+            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends.front().get());
+
+            bells = std::make_unique<bells_runtime>();
+            if (!bells->init(bp, buft, srcs, model.hparams.n_expert,
+                             model.hparams.n_expert_used, backends.front().get())) {
+                LLAMA_LOG_WARN("%s: BELLS disabled\n", __func__);
+                bells.reset();
+            }
+        }
+    }
 }
 
 llama_context::~llama_context() {
@@ -1184,7 +1226,62 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+bool llama_context::bells_eval(ggml_tensor * t, bool ask) {
+    static const char * prefix = "ffn_moe_topk-";
+    static const size_t plen   = strlen(prefix);
+
+    // the suffix must be digits and nothing else: ggml_cont names its output
+    // "ffn_moe_topk-<il> (cont)", which a plain prefix test would also accept
+    bool is_topk = strncmp(t->name, prefix, plen) == 0 && t->type == GGML_TYPE_I32;
+    if (is_topk) {
+        const char * s = t->name + plen;
+        if (*s == '\0') {
+            is_topk = false;
+        }
+        for (; *s && is_topk; ++s) {
+            is_topk = *s >= '0' && *s <= '9';
+        }
+    }
+
+    // chain to any user callback (imatrix, eval-callback). It may see nodes it did not ask
+    // for when BELLS wants them too, which is harmless for observation-only consumers.
+    const bool user = cparams.cb_eval ? cparams.cb_eval(t, ask, cparams.cb_eval_user_data) : false;
+
+    if (ask) {
+        return is_topk || user;
+    }
+
+    if (is_topk && bells && bells->ready()) {
+        const int il = atoi(t->name + plen);
+
+        // the topk tensor is a strided view of the argsort, so read it row by row
+        const int64_t k    = t->ne[0];
+        const int64_t rows = ggml_nrows(t);
+
+        std::vector<int32_t> ids((size_t) k*rows);
+        for (int64_t i = 0; i < rows; ++i) {
+            ggml_backend_tensor_get(t, ids.data() + i*k, i*t->nb[1], k*sizeof(int32_t));
+        }
+
+        if (!bells->on_routing(il, ids.data(), ids.size())) {
+            LLAMA_LOG_ERROR("%s: layer %d needs more experts than the cache holds, "
+                            "raise --bells-slots\n", __func__, il);
+        }
+    }
+
+    return true;
+}
+
+static bool llama_bells_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
+    return ((llama_context *) user_data)->bells_eval(t, ask);
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (bells && bells->ready()) {
+        bells->begin_ubatch(ubatch.token && ubatch.n_tokens > 0 ? ubatch.token[0] : -1,
+                            ubatch.n_tokens);
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1213,7 +1310,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        if (bells && bells->needs_correction()) {
+            ggml_backend_sched_set_eval_callback(sched.get(), llama_bells_eval_cb, this);
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         //const auto t_start_us = ggml_time_us();
 
@@ -2195,6 +2296,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.bells       =*/ bells.get(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -2943,6 +3045,11 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
+        /*.bells_enabled               =*/ false,
+        /*.bells_n_slot                =*/ 0,
+        /*.bells_table                 =*/ nullptr,
+        /*.bells_n_prefetch            =*/ 0,
+        /*.bells_drop_missing          =*/ false,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,

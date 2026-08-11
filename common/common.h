@@ -527,6 +527,12 @@ struct common_params {
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading
+    bool        bells_enabled = false; // BELLS on at all
+    uint32_t    bells_n_slot = 0;   // MoE experts resident per layer, 0 = size from free VRAM
+    std::string bells_table;        // BELLS predictor table
+    uint32_t    bells_n_prefetch = 0; // experts prefetched per layer per token, 0 = n_slot/2
+    bool        bells_drop_missing = false; // drop non-resident experts instead of fetching them
+
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

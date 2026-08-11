@@ -171,6 +171,47 @@ Two caveats:
 Note also that `-ngl` is not merely slower here, it cannot run the model at all. Expert-level
 caching lets a 27 GB model run on a 24 GB card; layer-level offload does not.
 
+## Correction: active parameters matter more than sparsity
+
+An earlier version of this file, and of the README, said Mixtral-style models (2 of 8 experts)
+were a poor fit and that high sparsity was what made BELLS work. Measured on an A10G 24 GB
+with 8 vCPU and 128 GB RAM, Mixtral-8x7B-Instruct Q4_K_M, 64 tokens:
+
+| Config | ms/token | tok/s | hit | vs baseline |
+|---|---|---|---|---|
+| `--cpu-moe` | 1244.4 | 0.80 | - | 1.00x |
+| BELLS, 2 slots (1.0x ratio) | 323.3 | 3.09 | 43.2% | **3.85x** |
+| BELLS, 4 slots (2.0x ratio) | 211.4 | 4.73 | 64.3% | **5.88x** |
+
+That is the largest speedup measured anywhere in this project, on the model previously
+described as hopeless, and it wins even at a 1.0x cache ratio - below the threshold where the
+calculator prints "cache too small to help".
+
+The mistake was treating sparsity as the driver. The real quantity is **how much CPU work is
+being offloaded relative to how many bytes must move**. Mixtral activates ~13B parameters per
+token against Qwen3-Next's ~3B, so its CPU baseline is enormous (1244 ms versus 64 ms) and
+even 2.5 GB/token of PCIe traffic is cheap by comparison. Qwen3-Next gains only 1.18x because
+there is very little CPU work to take away in the first place.
+
+Restated: BELLS trades PCIe bandwidth for CPU compute. It wins when the compute you avoid
+costs more than the bytes you move. High sparsity keeps the byte cost down, which helps, but
+plenty of active parameters keeps the compute saving up, which helps more.
+
+**Caveat that cuts the other way.** This instance has 8 vCPU, far weaker than the 6 GB test
+desktop. A slow CPU inflates every BELLS result, because the baseline it is beating is worse.
+The same model on a fast desktop CPU would show a smaller gain. Ratios measured on cloud
+instances with few vCPUs should not be read as desktop numbers.
+
+## A note on old GGUFs
+
+MoE quantisations made before roughly early 2024 will not load in current llama.cpp at all,
+BELLS or not. Expert weights moved from per-expert tensors (`blk.0.ffn_down.0.weight`) to a
+stacked layout (`blk.0.ffn_down_exps.weight`), and older files fail with
+`missing tensor 'blk.0.ffn_down_exps.weight'`.
+
+This bites when testing older models, because the best-known GGUF repositories for them often
+predate the change. Use a recent requantisation.
+
 ## What is measured and what is calculated
 
 Four configurations have real benchmarks: Qwen3-Next-80B and Qwen3-30B-A3B and GPT-OSS-120B

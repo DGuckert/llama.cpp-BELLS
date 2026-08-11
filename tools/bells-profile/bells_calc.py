@@ -72,6 +72,12 @@ def analyse(layers, experts, active, hidden, ffn, quant, vram_gb, ram_gb, model_
     slots = int(usable_gb*1e9 / expert_bytes / layers) if expert_bytes else 0
     ratio = slots/active if active else 0
 
+    # Active expert parameters per token. This is the CPU work BELLS offloads, and it turns
+    # out to matter more than the cache ratio: Mixtral-8x7B measured 3.85x faster at a 1.0x
+    # ratio, because ~13B active parameters make the CPU baseline enormous. Qwen3-Next gains
+    # only 1.18x at 4.7x, because 3B active is barely any work to take away.
+    active_params = layers * active * 3 * hidden * ffn
+
     return {
         "expert_mb":    expert_bytes/1e6,
         "working_gb":   working_set/1e9,
@@ -82,6 +88,7 @@ def analyse(layers, experts, active, hidden, ffn, quant, vram_gb, ram_gb, model_
         "usable_gb":    usable_gb,
         "slots":        slots,
         "ratio":        ratio,
+        "active_b":     active_params/1e9,
         "fits_ram":     model_gb <= ram_gb * 0.9,
         # if the whole model fits on the card there is nothing to stream and BELLS is moot
         "fits_vram":    model_gb <= vram_gb * 0.85,
@@ -96,7 +103,18 @@ def verdict(r):
                       "pays that read plus a PCIe copy. Strictly worse than --cpu-moe.")
     if r["slots"] < 1:
         return ("NO", "no VRAM left for a cache after attention and buffers")
+
+    # Models with a lot of active expert parameters have an expensive CPU baseline, so BELLS
+    # can pay off even when the cache is small. Mixtral-8x7B (5.1B active expert params)
+    # measured 3.85x faster at a 1.0x ratio, which the ratio alone would have written off.
+    heavy = r["active_b"] >= 3.0
+
+    if r["ratio"] < 1.0:
+        return ("NO", "cache cannot hold even one token's experts")
     if r["ratio"] < 1.5:
+        if heavy:
+            return ("MAYBE", f"small cache, but {r['active_b']:.1f}B active expert params "
+                             "make the CPU baseline expensive - worth measuring")
         return ("NO", "cache below 1.5x the working set - it will thrash")
     if r["ratio"] < 2.0:
         return ("MAYBE", "marginal, may be slower than --cpu-moe")
@@ -138,12 +156,17 @@ def matrix():
         print(row)
 
     print("\n  columns are VRAM/RAM in GB\n")
-    print("  Measured calibration (RTX 2060 6 GB, paired runs):")
-    print("    gpt-oss-120b   1.0x -> 1.59x SLOWER")
-    print("    qwen3-30b-a3b  2.2x -> 1.52x faster")
-    print("    qwen3-next-80b 4.7x -> 1.18x faster")
-    print("  Ratio screens candidates; it does not promise a speedup. Absolute working-set")
-    print("  size matters too, and BELLS accelerates generation only, never prompt processing.\n")
+    print("  Measured calibration:")
+    print("    RTX 2060 6 GB, paired runs")
+    print("      gpt-oss-120b   1.0x ratio, 1.4B active  ->  1.59x SLOWER")
+    print("      qwen3-30b-a3b  2.2x ratio, 1.8B active  ->  1.52x faster")
+    print("      qwen3-next-80b 4.7x ratio, 1.5B active  ->  1.18x faster")
+    print("    A10G 24 GB with only 8 vCPU, which inflates these")
+    print("      mixtral-8x7b   1.0x ratio, 5.1B active  ->  3.85x faster")
+    print("      mixtral-8x7b   2.0x ratio, 5.1B active  ->  5.88x faster")
+    print("  Ratio screens candidates, it does not rank them. Active parameters drive the")
+    print("  size of the win, and a slow CPU makes every result look better.")
+    print("  BELLS accelerates generation only, never prompt processing.\n")
 
 
 def main():
@@ -192,6 +215,7 @@ def main():
     print(f"  expert size          {r['expert_mb']:8.2f} MB")
     print(f"  sparsity             {r['sparsity']:8.1f}:1   ({experts} experts, {active} active)")
     print(f"  per-token working set{r['working_gb']:8.2f} GB   ({layers} layers x {active} x expert)")
+    print(f"  active expert params {r['active_b']:8.1f} B    (the CPU work BELLS offloads)")
     print(f"  all experts          {r['all_gb']:8.1f} GB")
     print(f"  model                {r['model_gb']:8.1f} GB   {'fits RAM' if r['fits_ram'] else 'EXCEEDS RAM'}")
     print()

@@ -38,6 +38,13 @@ Across three models on the 6 GB card:
 | Qwen3-Next-80B (Q2_K) | 4.7x | 15.5 tok/s | 18.4 tok/s | **1.18x** |
 | GPT-OSS-120B (MXFP4) | 1.0x | 1.82 tok/s | 1.15 tok/s | **0.63x - slower** |
 
+And on a 24 GB A10G with only 8 vCPU, where a weak CPU makes the baseline easier to beat:
+
+| Model | cache ratio | baseline | BELLS | result |
+|---|---|---|---|---|
+| Mixtral-8x7B (Q4_K_M) | 2.0x | 0.80 tok/s | 4.73 tok/s | **5.88x** |
+| Qwen3-Next-80B (Q2_K) | 25x | 14.3 tok/s | 39.9 tok/s | **2.80x** |
+
 **Quality is unaffected.** Teacher-forced perplexity, scored one token at a time so the cache
 is actually exercised: **2.0276 with BELLS, 2.0296 without.**
 
@@ -90,29 +97,35 @@ olmoe-1b-7b              2.0x     vram     vram     vram     vram     vram     v
 deepseek-v4-flash         RAM      RAM      RAM      RAM      RAM      RAM      RAM     4.7x    11.7x    21.0x
 deepseek-v3               RAM      RAM      RAM      RAM      RAM      RAM      RAM      RAM     4.0x     6.8x
 kimi-k2                   RAM      RAM      RAM      RAM      RAM      RAM      RAM      RAM      RAM     5.1x
-mixtral-8x7b              RAM        .        .        .        .        .     2.0x     2.0x     vram     vram
-mixtral-8x22b             RAM      RAM      RAM      RAM      RAM      RAM      RAM        .        .     2.0x
+mixtral-8x7b              RAM        .        .        .        .    ~1.0x     2.0x     2.0x     vram     vram
+mixtral-8x22b             RAM      RAM      RAM      RAM      RAM      RAM      RAM        .    ~1.0x     2.0x
 
-N.Nx = worth using    ~ = marginal    . = cache too small to help
+N.Nx = worth using    ~ = marginal, measure it    . = cache too small to help
 vram = model fits on the card, load it normally    RAM = model exceeds RAM
 ```
 
-**This table is calculated, not measured.** Only four cells have benchmarks behind them:
-qwen3-next-80b and qwen3-30b-a3b at 6/32, gpt-oss-120b at 6/32, and qwen3-next-80b on a
+**This table is calculated, not measured.** Six cells have benchmarks behind them:
+qwen3-next-80b, qwen3-30b-a3b and gpt-oss-120b at 6/32; qwen3-next-80b and mixtral-8x7b on a
 24 GB A10G. The rest is arithmetic from each model's `config.json`, validated against those
-four (predicted expert sizes land within 1% of what the runtime reports). Treat it as a
-screening tool.
+(predicted expert sizes land within 1% of what the runtime reports). Treat it as a screening
+tool.
 
-Two patterns worth reading off it. **RAM is usually the binding constraint, not VRAM** - most
-cells that say no say `RAM`. And **Mixtral is the shape that does not work**: 2-of-8 routing
-means the cache would have to be half the model before it helps.
+**RAM is usually the binding constraint, not VRAM** - most cells that say no say `RAM`.
+
+**Ratio screens candidates but does not rank them.** Mixtral-8x7B measured **5.88x faster** at
+a 2.0x ratio and **3.85x** at 1.0x, while Qwen3-Next-80B manages 1.18x at 4.7x. The difference
+is active parameters: Mixtral offloads ~11B of expert compute per token against Qwen3-Next's
+~1.5B, so there is far more CPU work to move to the GPU. An earlier version of this README
+called Mixtral hopeless on sparsity grounds; that was wrong, and the measurement is in
+[RESULTS.md](RESULTS.md).
 
 Three further conditions:
 
 - **The model must fit in RAM.** Once it does not, BELLS reads cold experts from the same
   mmap the baseline does, so a miss costs the same disk read *plus* a PCIe copy. Strictly worse.
-- **Sparse models only.** Look for many small experts and few active. Qwen3-Next has 512
-  experts of ~1 MB with 10 active. GPT-OSS has 12.6 MB experts, and that alone sinks it.
+- **Plenty of active expert parameters helps most.** That is the CPU work being moved to the
+  GPU. Mixtral-8x7B offloads ~11B per token and gained 5.88x; Qwen3-Next offloads ~1.5B and
+  gained 1.18x. Small experts keep transfer cheap, but they also mean less compute to save.
 - **Helps decode, not prefill.** A 512-token prompt touches 57-64 of 64 experts, so there is
   no hot set to exploit. Long prompts pay full price.
 

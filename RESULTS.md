@@ -171,6 +171,18 @@ Two caveats:
 Note also that `-ngl` is not merely slower here, it cannot run the model at all. Expert-level
 caching lets a 27 GB model run on a 24 GB card; layer-level offload does not.
 
+## What is measured and what is calculated
+
+Four configurations have real benchmarks: Qwen3-Next-80B and Qwen3-30B-A3B and GPT-OSS-120B
+on a 6 GB RTX 2060, plus Qwen3-Next-80B on a 24 GB A10G. Everything in the compatibility
+matrix in the README beyond those is arithmetic from each model's `config.json`.
+
+The arithmetic is validated where it can be: predicted expert sizes land within 1% of what the
+runtime reports (1.10 vs 1.09 MB, 2.93 vs 2.92 MB, 12.69 vs 12.61 MB), and predicted cache
+ratios match the auto-sizer's choices (4.4x vs 4.3x, 2.0x vs 2.2x, 1.2x vs 1.0x). But a
+correct ratio is not a measured speedup, and the ratio is explicitly not a promise - see
+Qwen3-30B beating Qwen3-Next despite a worse ratio.
+
 ## Which models it helps, remeasured
 
 Every model below was rerun with the current code (pure LRU, no prefetch) using paired

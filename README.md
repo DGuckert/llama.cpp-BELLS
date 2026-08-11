@@ -97,6 +97,12 @@ N.Nx = worth using    ~ = marginal    . = cache too small to help
 vram = model fits on the card, load it normally    RAM = model exceeds RAM
 ```
 
+**This table is calculated, not measured.** Only four cells have benchmarks behind them:
+qwen3-next-80b and qwen3-30b-a3b at 6/32, gpt-oss-120b at 6/32, and qwen3-next-80b on a
+24 GB A10G. The rest is arithmetic from each model's `config.json`, validated against those
+four (predicted expert sizes land within 1% of what the runtime reports). Treat it as a
+screening tool.
+
 Two patterns worth reading off it. **RAM is usually the binding constraint, not VRAM** - most
 cells that say no say `RAM`. And **Mixtral is the shape that does not work**: 2-of-8 routing
 means the cache would have to be half the model before it helps.
@@ -187,6 +193,11 @@ minutes. The same configuration with byte-identical cache behaviour measured 42.
 a session and 58.55 ms later. An earlier draft of these results claimed 1.40x by comparing a
 fast BELLS run against a slow baseline. Alternate configurations back-to-back and quote the
 paired ratio.
+
+**A third trap, for anyone extending this:** the cache ratio screens candidates but does not
+rank them. Qwen3-30B-A3B wins bigger at 2.2x than Qwen3-Next-80B does at 4.7x, because its
+CPU baseline is slower and there was more work to move to the GPU. Two models with the same
+ratio can behave differently, so treat the calculator as a filter, not a prediction.
 
 ---
 

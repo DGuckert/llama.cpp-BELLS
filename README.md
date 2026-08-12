@@ -134,15 +134,35 @@ Three further conditions:
 ## Usage
 
 ```
-llama-server -m model.gguf -ngl 99 --cpu-moe --bells-slots -1 -fit off
+llama-server -m model.gguf -ngl 99 --cpu-moe --bells-slots -1
 ```
 
 - `--cpu-moe` keeps attention on the GPU and experts on the host, where BELLS reads them from.
   On its own it is worth ~2x over plain `-ngl` on MoE models - use it whether or not you use
   BELLS.
 - `--bells-slots -1` sizes the cache from free VRAM. Pass a number to override.
-- `-fit off` avoids llama.cpp's memory-probe pass, which otherwise constructs the cache twice
-  and briefly doubles VRAM use.
+
+### Serving concurrent requests
+
+BELLS serves batched decode up to `n_slot / n_expert_used` tokens per ubatch, which it prints
+at load (`serves ubatch <= 3`). Beyond that the cache could not be guaranteed to hold every
+expert a batch asks for, so those batches run the normal path. Prefill always runs the normal
+path: a 512-token batch touches nearly every expert, so there is no hot set to exploit.
+
+On `llama-server` with Qwen3-Next-80B on a 6 GB 2060, aggregate throughput over 100-token chat
+completions, three passes each after a heavy warmup:
+
+| concurrency | baseline | BELLS | ratio |
+|---|---|---|---|
+| 1 | 15.0 | 15.2 tok/s | 1.01x |
+| 2 | 19.3 | 22.0 tok/s | 1.14x |
+| 3 | 22.2 | 25.0 tok/s | 1.12x |
+| 4 | 23.1 | 23.0 tok/s | 1.00x |
+
+Note this is well below the 1.18x the same model shows in single-stream profiling, and the
+gap is the point: a server request also pays prefill, which BELLS bypasses, plus template and
+sampling overhead that a short generation does not amortise. Benchmark numbers taken with
+`llama-bells-profile` are an upper bound on what a server workload will see.
 
 `--bells-drop-missing` exists and is **not safe**: perplexity 52.97 against a baseline of
 2.03, with generations collapsing into repetition loops. Research only.

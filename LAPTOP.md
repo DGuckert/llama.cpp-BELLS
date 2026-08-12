@@ -37,17 +37,16 @@ llama-cli -m Qwen3-30B-A3B-Q2_K.gguf -ngl 99 --cpu-moe
 ```
 
 `--cpu-moe` keeps attention on the GPU and experts on the CPU, and beat plain `-ngl` by 2x on
-every MoE tested. Then add `--bells-slots -1 -fit off` and compare.
+every MoE tested. Then add `--bells-slots -1` and compare.
 
 ## If you want to test BELLS anyway
 
 ```
 llama-bells-profile -m model.gguf -f corpus.txt -o out.json -c 512 -n 128 \
-    -ngl 99 --cpu-moe --bells-slots -1 -fit off
+    -ngl 99 --cpu-moe --bells-slots -1
 ```
 
-`--bells-slots -1` sizes the cache from free VRAM and prints a fit verdict at load. `-fit off`
-avoids llama.cpp's memory-probe pass, which otherwise constructs the cache twice.
+`--bells-slots -1` sizes the cache from free VRAM and prints a fit verdict at load.
 
 Then compare against the baseline **in the same session, alternating runs**. Absolute
 throughput drifts 30%+ over tens of minutes on a warm machine; comparing a number from one

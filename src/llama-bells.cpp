@@ -452,6 +452,32 @@ bool bells_runtime::init(const bells_params & params,
         return false;
     }
 
+    // copy_expert reads straight out of the source tensors, so they must be allocated and host
+    // resident. Checked first, before anything is sized, printed or allocated, because
+    // common_fit_params probes memory by building a throwaway context over a model loaded with
+    // no_alloc. That model has no tensor data, and BELLS used to build a full second cache
+    // against it - briefly doubling VRAM use and pushing tight configurations into OOM, which
+    // is why the docs had to tell people to pass -fit off.
+    for (const auto & s : srcs) {
+        for (ggml_tensor * t : { s.gate, s.up, s.down, s.gate_up }) {
+            if (!t) {
+                continue;
+            }
+
+            if (!t->buffer || !t->data) {
+                // the memory-fit probe. Stay silent: the real context initialises BELLS
+                // properly a moment later, and a warning here only looks like a failure.
+                return false;
+            }
+
+            if (!ggml_backend_buffer_is_host(t->buffer)) {
+                fprintf(stderr, "%s: layer %d expert tensors are not host resident, "
+                                "BELLS needs them on the CPU (try --cpu-moe)\n", __func__, s.il);
+                return false;
+            }
+        }
+    }
+
     // bytes one expert occupies, summed over whatever projections this arch uses
     size_t per_expert = 0;
     for (ggml_tensor * t : { srcs[0].gate, srcs[0].up, srcs[0].down, srcs[0].gate_up }) {
@@ -523,18 +549,6 @@ bool bells_runtime::init(const bells_params & params,
                         "cache holds %.1fx it -> %s\n",
                 __func__, working_set/1024.0/1024.0/1024.0, srcs.size(), n_expert_used,
                 per_expert/1024.0/1024.0, ratio, verdict);
-    }
-
-    // copy_expert reads straight out of the source tensors, so they must stay host resident.
-    // That is the normal state when experts are offloaded, but check rather than assume.
-    for (const auto & s : srcs) {
-        for (ggml_tensor * t : { s.gate, s.up, s.down, s.gate_up }) {
-            if (t && t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
-                fprintf(stderr, "%s: layer %d expert tensors are not host resident, "
-                                "BELLS needs them on the CPU (try --cpu-moe)\n", __func__, s.il);
-                return false;
-            }
-        }
     }
 
     if (!tensors_.init(buft, srcs, n_slot, backend)) {

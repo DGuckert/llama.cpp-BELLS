@@ -215,18 +215,46 @@ caching lets a 27 GB model run on a 24 GB card; layer-level offload does not.
 ## The comparable set: one GPU, one CPU count, four models
 
 Everything below was measured on the same A10G 24 GB with **16 vCPU and 128 GB RAM**, same
-build, 128 generated tokens, best slot count for each model. This is the table to trust; the
-older 8 vCPU numbers elsewhere in this file are superseded and marked as such.
+build, 128 generated tokens, at the best slot count found for each model. This is the table to
+trust; the older 8 vCPU numbers elsewhere in this file are superseded and marked as such.
 
-| Model | expert | active | baseline | BELLS | result |
-|---|---|---|---|---|---|
-| Qwen3-Next-80B (Q2_K) | 1.09 MB | 3 B | 18.56 | **30.19** | **1.63x** |
-| Qwen3-235B-A22B (Q2_K) | 6.61 MB | 14 B | 2.37 | **3.55** | **1.50x** |
-| Mixtral-8x7B (Q4_K_M) | 18 MB | 13 B | 3.70 | 3.93 | 1.06x |
-| GPT-OSS-120B (MXFP4) | 12.6 MB | 5 B | 13.21 | 2.17 | **0.16x** |
+| Model | expert | active | baseline | BELLS | result | best slots |
+|---|---|---|---|---|---|---|
+| Qwen3-Next-80B (Q2_K) | 1.09 MB | 3 B | 19.84 | **41.30** | **2.08x** | 128+ |
+| Qwen3-235B-A22B (Q2_K) | 6.61 MB | 14 B | 3.10 | **5.61** | **1.81x** | 28 |
+| Mixtral-8x7B (Q4_K_M) | 18 MB | 13 B | 3.70 | 3.93 | 1.06x | 4 |
+| GPT-OSS-120B (MXFP4) | 12.6 MB | 5 B | 13.21 | 2.17 | **0.16x** | <=16 |
 
 Plain `-ngl` failed to load every one of these on a 24 GB card, so `--cpu-moe` is the only
-honest baseline.
+honest baseline. Highlights: **an 80B at 41 tok/s and a 235B at 5.6 tok/s, on one 24 GB card.**
+
+**Pair within a run, never across runs.** Modal reads the model from a network volume, so the
+first configuration in a fresh container pays cold reads. The 235B baseline measured 2.37,
+3.10 and 2.11 tok/s in three different containers - a 47% spread on identical settings. Every
+ratio above comes from a baseline and a BELLS run inside the *same* container, back to back.
+Absolute tok/s from different runs are not comparable, which is the cloud version of the
+session-drift warning at the top of this file.
+
+### Cache size has an optimum, and it is per-model
+
+Slot counts were first carried over from a 6 GB card and reported as if tuned, which understated
+two models badly. Swept properly:
+
+| Model | behaviour as the cache grows |
+|---|---|
+| Qwen3-Next-80B | climbs to a knee at 128 slots (6.7 GB), then flat: 38.2, 40.0, 39.8, 41.3 tok/s at 128/192/256/320. The last 10 GB of VRAM buys nothing. |
+| Qwen3-235B-A22B | climbs to 28 slots (17.4 GB, 5.61 tok/s), then collapses: 32 slots 1.02x, 36 slots 0.73x |
+| Mixtral-8x7B | peaks at 4 slots; 8 slots (every expert resident) is 0.80x |
+| GPT-OSS-120B | already past its peak at 16; 28 slots is slower despite a better hit rate |
+
+Two different failure modes for oversizing. On a small card, or when the cache approaches VRAM
+capacity, it starves the context and compute buffers - the 235B at 32 slots is 19.9 GB on a
+24 GB card, and an 81-slot cache on a 6 GB card measured 25% slower than 48. On GPT-OSS the
+cache never got large in absolute terms and it still degraded, which is not explained.
+
+**There is no general answer to "how big should the cache be".** It depends on the model and
+the card, the penalty for guessing high can be severe, and the auto-sizer's "one third of free
+VRAM" happens to land near the knee on a 6 GB card by coincidence rather than design.
 
 ### There is no working predictor, and this is the main negative result
 
@@ -240,6 +268,17 @@ falsified by the next measurement:
    artifact - at 16 cores Mixtral is 1.06x and the hypothesis dies with it.
 4. **Expert size** decides it. Falsified within one table: Mixtral's 18 MB experts score 1.06x
    while GPT-OSS's 12.6 MB score 0.16x.
+5. **BELLS is CPU-independent**, so the ratio only measures how weak the baseline's CPU is.
+   This one is half-supported and stated here as a hypothesis, not a finding. Qwen3-Next backs
+   it exactly - 39.9 tok/s at 8 vCPU and 41.3 at 16, while its baseline moved 14.3 to 19.84.
+   Mixtral contradicts it, going 4.73 down to 3.93 at the same slot count with twice the cores,
+   which is most likely cold-volume variance but is not demonstrated to be.
+
+Five hypotheses, each reasonable on the data available when it was written, four of them dead.
+With four models and infrastructure noisy enough to move a baseline 47%, almost any rule will
+fit the points in hand and break on the next one. The discipline that actually worked was not
+better theorising: it was pairing every comparison inside one run and re-measuring anything
+that looked interesting.
 
 Hit rate does not work either, in either direction: GPT-OSS got *slower* as its hit rate rose
 (61.1% -> 74.2%, 460 -> 577 ms), while Qwen3-Next got faster (53.1% -> 73.6%). Any two of these

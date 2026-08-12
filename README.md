@@ -12,8 +12,8 @@ compute buffers. **Expert**: per-expert granularity, as opposed to the layer gra
 `-ngl`. **LRU**: plain least-recently-used, which beat the predictive scheme this project was
 originally built around.
 
-**A 235B model on one 24 GB card at 3.55 tok/s, up from 2.37.** An 80B on the same card at
-30.19 tok/s, up from 18.56. Both are models plain `-ngl` cannot load at all.
+**A 235B model on one 24 GB card at 5.6 tok/s, up from 3.1.** An 80B on the same card at
+41.3 tok/s, up from 19.8. Both are models plain `-ngl` cannot load at all.
 
 **It does not help every model, and there is no known way to predict which.** Of four models
 measured on identical hardware, two gain about 1.5x, one gains nothing, and one is six times
@@ -30,16 +30,20 @@ Four models, one machine: A10G 24 GB (the same silicon as an RTX 3090), 16 vCPU,
 128 generated tokens, best slot count each. Plain `-ngl` cannot load any of them on 24 GB, so
 `--cpu-moe` is the only honest baseline.
 
-| Model | expert size | active params | `--cpu-moe` | BELLS | result |
-|---|---|---|---|---|---|
-| Qwen3-Next-80B (Q2_K) | 1.09 MB | 3 B | 18.56 tok/s | **30.19** | **1.63x** |
-| Qwen3-235B-A22B (Q2_K) | 6.61 MB | 14 B | 2.37 tok/s | **3.55** | **1.50x** |
-| Mixtral-8x7B (Q4_K_M) | 18 MB | 13 B | 3.70 tok/s | 3.93 | 1.06x |
-| GPT-OSS-120B (MXFP4) | 12.6 MB | 5 B | 13.21 tok/s | 2.17 | **0.16x** |
+| Model | expert size | active params | `--cpu-moe` | BELLS | result | slots |
+|---|---|---|---|---|---|---|
+| Qwen3-Next-80B (Q2_K) | 1.09 MB | 3 B | 19.84 tok/s | **41.30** | **2.08x** | 128+ |
+| Qwen3-235B-A22B (Q2_K) | 6.61 MB | 14 B | 3.10 tok/s | **5.61** | **1.81x** | 28 |
+| Mixtral-8x7B (Q4_K_M) | 18 MB | 13 B | 3.70 tok/s | 3.93 | 1.06x | 4 |
+| GPT-OSS-120B (MXFP4) | 12.6 MB | 5 B | 13.21 tok/s | 2.17 | **0.16x** | 16 |
 
 No property in that table orders the results. Expert size fails (18 MB beats 12.6 MB), cache
 ratio fails (GPT-OSS was rated a 7.8x "good fit"), active parameters fail (14 B wins, 13 B does
 not), and hit rate fails in both directions.
+
+**Cache size has a per-model optimum and guessing high can be expensive.** The 235B peaks at 28
+slots and falls to 0.73x at 36; Mixtral peaks at 4 and drops to 0.80x at 8; Qwen3-Next reaches
+a knee at 128 and then simply stops improving. Start with `--bells-slots -1` and sweep.
 
 Across three models on the 6 GB card:
 

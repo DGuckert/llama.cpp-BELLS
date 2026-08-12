@@ -16,10 +16,38 @@
 > worth ~2x over plain `-ngl`. The rest of this page is kept for anyone who wants to measure it
 > anyway.
 
-Build: `build-1050/`, compiled for Pascal (`CMAKE_CUDA_ARCHITECTURES=61`). The `build-bells/`
-binaries will not run on this GPU - they are `sm_86` only.
+Build: compiled for Pascal (`CMAKE_CUDA_ARCHITECTURES=61`). The `build-bells/` binaries will not
+run on this GPU - they are `sm_86` only.
 
-**Untested.** The build exists; nothing has been benchmarked on this hardware.
+## Measured on the hardware
+
+**Correctness passes.** `llama-bells-selftest` was built and run on a real GTX 1050 Mobile
+(Debian 13, gcc 14.2, CUDA 12.4, driver 550.163.01). The cache path is bit-identical to the full
+expert tensor, the mid-graph slot update is visible to the gather, 16000 residency states hold,
+and the runtime loop matches exactly. **sm_61 is a supported target** - three architectures now
+validated (sm_61, sm_75, sm_86).
+
+**Host-to-device bandwidth is the problem.** Same benchmark, both machines:
+
+| | pageable | pinned | PCIe link |
+|---|---|---|---|
+| RTX 2060 desktop | 9.0 GB/s | **12.25 GB/s** | 3.0 x16 |
+| GTX 1050 laptop | 3.11 GB/s | **3.14 GB/s** | **3.0 x4 (downgraded from x16)** |
+
+`lspci` confirms it: `LnkCap: Width x16` but `LnkSta: Width x4 (downgraded)`. The slot is wired
+with a quarter of the lanes, which is normal for a laptop dGPU and matches the measurement
+(PCIe 3.0 x4 is ~3.94 GB/s theoretical). Note also that pinned memory buys nothing here - 3.11
+vs 3.14 - where it is worth ~1.4x on the desktop.
+
+**Why that decides it.** Instrumentation shows copies are ~87% of BELLS's per-layer cost, so a
+4x slower link makes the dominant term 4x worse. The selftest's own transfer projection for
+Qwen3-30B-A3B at a 2x cache ratio: **81.3 ms/token on this laptop against 20.8 ms on the
+desktop**, transfer alone, assuming perfect overlap. And the desktop at 6 GB already measures
+0.94-0.97x through `llama-server`.
+
+So there are now two independent reasons, both measured rather than argued: not enough VRAM to
+fund a cache and a real context together, and a PCIe link a quarter as wide as the machine where
+it already fails.
 
 ## Two constraints
 

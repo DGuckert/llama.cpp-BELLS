@@ -212,6 +212,34 @@ Two caveats:
 Note also that `-ngl` is not merely slower here, it cannot run the model at all. Expert-level
 caching lets a 27 GB model run on a 24 GB card; layer-level offload does not.
 
+## Portability: three GPU architectures and the first Linux build
+
+Everything in this project was developed on Windows/MSVC against sm_75 and sm_86. Both of those
+turned out to be hiding things.
+
+**The code had never compiled on Linux.** MSVC pulls in headers transitively that gcc does not,
+so `exp()` and `log()` in the perplexity path had no `<cmath>`. A cloud builder found it months
+in. With that one line fixed, a full build on Debian 13 / gcc 14.2 is clean - 220/220 targets,
+no errors and no warnings in the BELLS sources.
+
+**sm_61 (Pascal) works.** Built and run on a GTX 1050 Mobile: cache path bit-identical, mid-graph
+slot update visible to the gather, 16000 residency states, runtime loop exact. The graph trick
+this project depends on - `mul_mat_id` over a slot-remapped tensor with an in-graph
+`ggml_get_rows` id remap - is not architecture-specific. Three architectures validated: **sm_61,
+sm_75, sm_86.**
+
+**PCIe width matters more than the GPU.** The same bandwidth benchmark on both machines:
+
+| | pageable | pinned | link |
+|---|---|---|---|
+| RTX 2060 desktop | 9.0 GB/s | 12.25 GB/s | 3.0 x16 |
+| GTX 1050 laptop | 3.11 GB/s | 3.14 GB/s | 3.0 x4 (downgraded from x16) |
+
+A laptop dGPU wired at x4 gets a quarter of the bandwidth, and pinned memory stops helping
+entirely. Since copies are ~87% of BELLS's per-layer cost, that scales the dominant term
+directly. Worth checking `lspci -vv | grep LnkSta` before assuming a card's bandwidth from its
+model name.
+
 ## On a 6 GB card, under a server workload, BELLS does not help
 
 The 1.52x recorded for Qwen3-30B-A3B on an RTX 2060 was measured with `llama-bells-profile` at

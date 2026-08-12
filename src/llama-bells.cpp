@@ -344,27 +344,36 @@ bool bells_runtime::init(const bells_params & params,
 
     uint32_t n_slot = params.n_slot;
 
-    if (n_slot == 0) {
-        // Size from what the device actually has spare. Leave headroom: over-allocating the
-        // cache starves the context and compute buffers and measurably slows decode, so more
-        // cache is not monotonically better.
-        size_t dev_free = 0, dev_total = 0;
+    size_t dev_free = 0, dev_total = 0;
+    {
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
         if (dev) {
             ggml_backend_dev_memory(dev, &dev_free, &dev_total);
         }
+    }
 
-        // A third of the free VRAM, floored at 1 GiB. This is a heuristic tuned on one model
-        // (Qwen3-Next-80B on a 6 GB card, where 3.6 GiB was free at this point and the best
-        // cache was ~2.5 GiB). Being greedy loses badly - sizing to 81 slots measured 25%
-        // slower than 48 because the context and compute buffers got squeezed - so the
-        // default errs small. Pass --bells-slots N to override.
+    if (n_slot == 0) {
+        // A third of the free VRAM, floored at 1 GiB of headroom.
+        //
+        // Deliberately conservative, and NOT tuned. It was originally fitted to one model on a
+        // 6 GB card - a configuration since measured at 0.94-0.97x, i.e. one where BELLS does
+        // not help at all - so it is a safe starting point rather than an optimum.
+        //
+        // It errs small because oversizing is punished much harder than undersizing. The cache
+        // and the compute buffers come out of the same VRAM: a 19.9 GB cache on a 24 GB card
+        // took the 235B from 1.81x to 1.02x, and 22.4 GB took it to 0.73x. An 81-slot cache on
+        // a 6 GB card measured 25% slower than 48.
+        //
+        // Not re-tuned on the newer data because doing that honestly needs a slot sweep per
+        // model per card, and every static rule this project has fitted to four models has had
+        // to be retracted. A sweep beats this; --bells-slots N takes the result.
         const size_t headroom = std::max<size_t>(1024ull*1024*1024, dev_free/3);
         const size_t budget   = dev_free > headroom ? dev_free - headroom : 0;
 
         n_slot = (uint32_t) std::min<size_t>(n_expert, budget/(per_expert*srcs.size()));
 
-        fprintf(stderr, "%s: auto-sizing from %.1f GiB free, %.1f GiB headroom -> %u slots\n",
+        fprintf(stderr, "%s: auto-sizing from %.1f GiB free, %.1f GiB headroom -> %u slots "
+                        "(conservative, sweep --bells-slots to beat it)\n",
                 __func__, dev_free/1024.0/1024.0/1024.0,
                 headroom/1024.0/1024.0/1024.0, n_slot);
     }
@@ -445,10 +454,24 @@ bool bells_runtime::init(const bells_params & params,
     ready_         = true;
     n_copied_      = 0;
 
-    fprintf(stderr, "%s: %u slots/layer of %u experts, %.1f MiB VRAM, serves ubatch <= %u%s\n",
-            __func__, n_slot, n_expert, tensors_.vram_bytes()/1024.0/1024.0,
+    const double vram_gib  = tensors_.vram_bytes()/1024.0/1024.0/1024.0;
+    const double vram_frac = dev_total > 0 ? (double) tensors_.vram_bytes()/dev_total : 0.0;
+
+    fprintf(stderr, "%s: %u slots/layer of %u experts, %.2f GiB VRAM (%.0f%% of the card), "
+                    "serves ubatch <= %u%s\n",
+            __func__, n_slot, n_expert, vram_gib, 100.0*vram_frac,
             params_.max_tokens,
             params_.passive ? "  [PASSIVE: cache allocated but unused, research mode]" : "");
+
+    // Measured danger zone. The cache competes with the compute buffers, and past roughly
+    // four fifths of the card that competition dominates: on a 24 GB card the 235B fell to
+    // 1.02x at 19.9 GB of cache (83%) and 0.73x at 22.4 GB (93%), having peaked at 17.4 GB.
+    // Only a warning, since the exact threshold is model dependent and this is one data point.
+    if (vram_frac > 0.75) {
+        fprintf(stderr, "%s: that is most of the card, and past ~80%% the cache starts starving "
+                        "the compute buffers - measured 1.02x at 83%% and 0.73x at 93%% on one "
+                        "model. Try fewer slots if it is slow.\n", __func__);
+    }
 
     return true;
 }

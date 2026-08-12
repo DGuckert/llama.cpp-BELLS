@@ -246,16 +246,69 @@ Three further conditions:
 
 ---
 
-## Usage
+## Start here
+
+Nothing about your model or your card predicts whether this helps. The only thing that does is
+your own `--cpu-moe` number, so measure that first. Twenty minutes, four steps.
+
+**1. Get your baseline.** This is stock llama.cpp and needs nothing from this fork. It is worth
+~2x over plain `-ngl` on MoE models, and for many people it is the whole answer.
 
 ```
-llama-server -m model.gguf -ngl 99 --cpu-moe --bells-slots -1
+llama-bells-profile -m model.gguf -f corpus.txt -o base.json -c 512 -n 128 -ngl 99 --cpu-moe
 ```
 
-- `--cpu-moe` keeps attention on the GPU and experts on the host, where BELLS reads them from.
-  On its own it is worth ~2x over plain `-ngl` on MoE models - use it whether or not you use
-  BELLS.
-- `--bells-slots -1` sizes the cache from free VRAM. Pass a number to override.
+**2. Check a cache can physically fit.** This rules things out; it cannot rule them in.
+
+```
+python tools/bells-profile/bells_calc.py --vram 24 --ram 128 --preset qwen3-next-80b
+```
+
+**3. Measure BELLS against it, in the same session.**
+
+```
+llama-bells-profile -m model.gguf -f corpus.txt -o bells.json -c 512 -n 128 -ngl 99 \
+    --cpu-moe --bells-slots 128
+```
+
+**4. Sweep the slot count.** There is a per-model optimum and no rule for finding it. The 235B
+peaks at 28 slots and falls to 0.73x at 36; Mixtral peaks at 4 and drops to 0.80x at 8;
+Qwen3-Next climbs to 128 and then goes flat. Try a few, keep the best.
+
+> **Alternate the two configurations inside one session and quote the paired ratio.** Absolute
+> throughput drifts 30%+ over tens of minutes on a warm machine, which is more than the effect
+> you are measuring. Nearly every wrong number in this project came from ignoring that.
+
+Then run it for real:
+
+```
+llama-server -m model.gguf -ngl 99 --cpu-moe --bells-slots 128
+```
+
+`--bells-slots -1` sizes the cache automatically. It is deliberately conservative and a sweep
+usually beats it - see [Automatic sizing](#automatic-sizing) below.
+
+### Will it help me?
+
+| your situation | expect |
+|---|---|
+| 24 GB card, weak or busy CPU, model too big for `-ngl` | **the good case** - up to ~2x |
+| 24 GB card, strong CPU | smaller gain, possibly none - measure |
+| your `--cpu-moe` already beats what BELLS reaches | **it will lose.** Do not use it |
+| 6-8 GB card | **no.** Not enough VRAM for a cache and a real context at once |
+| model does not fit in RAM | **no.** Strictly worse than `--cpu-moe` |
+
+### Automatic sizing
+
+`--bells-slots -1` takes free VRAM minus a third for headroom. That heuristic was calibrated on
+a 6 GB card, which is now known to be a configuration where BELLS does not help at all, so treat
+it as a safe starting point rather than a tuned one. It errs small on purpose: oversizing is
+punished hard - a 19.9 GB cache on a 24 GB card took the 235B to 1.02x and 22.4 GB took it to
+0.73x, because the cache and the compute buffers come out of the same VRAM.
+
+It has not been re-tuned because doing so honestly needs a slot sweep per model per card, and a
+heuristic fitted to four models would be the sixth predictor this project has had to retract.
+Sweep instead; the runtime prints the cache size in MiB at load so you can see what you got.
 
 ### Serving concurrent requests
 

@@ -250,6 +250,16 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // Also expose the pinned host buffer type, e.g. CUDA_Host. Tensors deliberately kept
+        // on the CPU are the source of every host-to-device copy, and from pageable memory
+        // cudaMemcpyAsync is not asynchronous - the driver stages through its own pinned
+        // buffer and blocks the caller. Naming the host buffer type here allows
+        //   -ot "\.ffn_(gate|up|down)_exps\.=CUDA_Host" --no-mmap
+        // which puts the offloaded experts somewhere the copy engine can DMA from directly.
+        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (host_buft) {
+            buft_list[ggml_backend_buft_name(host_buft)] = host_buft;
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {

@@ -391,9 +391,6 @@ llama_context::llama_context(
             bells_params bp;
             bp.enabled      = true;
             bp.n_slot       = params.bells_n_slot;
-            bp.table        = params.bells_table ? params.bells_table : "";
-            bp.drop_missing = params.bells_drop_missing;
-            bp.n_prefetch   = params.bells_n_prefetch;
 
             // the cache lives wherever the graph runs, i.e. next to the rest of the offload
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends.front().get());
@@ -1278,8 +1275,7 @@ static bool llama_bells_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (bells && bells->ready()) {
-        bells->begin_ubatch(ubatch.token && ubatch.n_tokens > 0 ? ubatch.token[0] : -1,
-                            ubatch.n_tokens);
+        bells->begin_ubatch(ubatch.n_tokens);
     }
 
     if (mctx && !mctx->apply()) {
@@ -1310,7 +1306,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        if (bells && bells->needs_correction()) {
+        if (bells && bells->ready()) {
             ggml_backend_sched_set_eval_callback(sched.get(), llama_bells_eval_cb, this);
         } else {
             ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
@@ -3047,9 +3043,6 @@ llama_context_params llama_context_default_params() {
         /*.abort_callback_data         =*/ nullptr,
         /*.bells_enabled               =*/ false,
         /*.bells_n_slot                =*/ 0,
-        /*.bells_table                 =*/ nullptr,
-        /*.bells_n_prefetch            =*/ 0,
-        /*.bells_drop_missing          =*/ false,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,

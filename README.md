@@ -164,8 +164,9 @@ gap is the point: a server request also pays prefill, which BELLS bypasses, plus
 sampling overhead that a short generation does not amortise. Benchmark numbers taken with
 `llama-bells-profile` are an upper bound on what a server workload will see.
 
-`--bells-drop-missing` exists and is **not safe**: perplexity 52.97 against a baseline of
-2.03, with generations collapsing into repetition loops. Research only.
+Two flags that used to be here, `--bells-table` and `--bells-drop-missing`, have been removed.
+Both are described under [Findings](#findings): one never won a benchmark, the other produced
+a broken model. Git history has them if you want to revisit either.
 
 ---
 
@@ -204,6 +205,17 @@ switched off. Hit rate was the wrong objective: demand loading moves exactly the
 token needs, prediction moves a superset, and on a bandwidth-bound path the extra traffic
 costs more than the extra hits save. The project is named after a predictive loading system
 that did not survive its own benchmarks.
+
+The predictor has now been **deleted from the runtime** rather than left switched off, because
+a flag that never helps is a trap for the next reader. `bells_predict.py` still scores
+prediction against LRU and Belady offline, which is where the question belongs.
+
+`--bells-drop-missing` went with it. Letting a non-resident expert contribute nothing removed
+the per-layer host sync and was the fastest thing this project ever measured, but it scored
+perplexity **52.97 against a baseline of 2.03** - a broken model, not an approximate one. It
+also only ever half-worked: prefetching was the sole way an expert became resident in that
+mode, so without a predictor table loaded the slot tensors were never written at all and the
+graph indexed the cache with uninitialised VRAM. It could not survive the predictor's removal.
 
 **Cross-layer expert identity carries no signal.** 0.99 shared experts between layer L and
 L+1 against a chance value of 1.00. Predicting deeper layers from shallower ones is dead.

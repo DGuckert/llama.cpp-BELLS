@@ -41,6 +41,37 @@ the ratio falls from 1.40x to 1.18x.
 Rule: alternate the configurations inside one session and quote the paired ratio. Never
 compare a number from one session against a number from another.
 
+### The same trap, second encounter: a cold page cache
+
+The rule above is necessary and not sufficient. Measuring `llama-server` concurrency, a first
+attempt produced 0.68x for BELLS and a confident explanation - batching turns the CPU's
+per-token GEMV into a GEMM, so the baseline gains what BELLS loses. The explanation was
+plausible and the measurement was worthless.
+
+The model is 27 GB against 32 GB of RAM. A freshly restarted server reads experts off disk,
+and each configuration needed its own restart because the flag is set at startup. The BELLS
+run went first and paid the cold reads; the baseline ran second on a cache BELLS had warmed.
+An 8-token warmup did not begin to fix it. The giveaway was that throughput rose monotonically
+with *run order* rather than with concurrency: 7.92, 11.48, 20.58, 22.36 tok/s.
+
+With three full-concurrency warmup rounds and passes repeated until consecutive ones agree:
+
+| concurrency | baseline | BELLS | ratio |
+|---|---|---|---|
+| 1 | 15.0 | 15.2 | 1.01x |
+| 2 | 19.3 | 22.0 | 1.14x |
+| 3 | 22.2 | 25.0 | 1.12x |
+| 4 | 23.1 | 23.0 | 1.00x |
+
+Cold-versus-warm on this machine is worth more than 2x, which is larger than any effect being
+measured. Whenever the model approaches the size of RAM, warm until consecutive passes agree
+before believing anything.
+
+Note also that concurrency 1 here is 1.01x, against 1.18x from `llama-bells-profile` on the
+same model and machine. Both are correct: a server request also pays prefill, which BELLS
+bypasses, plus template and sampling overhead that a 100-token generation does not amortise.
+Profiler numbers are an upper bound on what a served workload sees.
+
 Each row is the mean of two runs. Run-to-run variance: baseline 60.04/60.99, exact
 52.32/48.21, drop 42.41/42.10.
 
@@ -91,7 +122,18 @@ is the right instrument and it says exact mode changes nothing.
 
 Drop-missing is not "slightly approximate". A perplexity of 53 is a broken model.
 
-## `--bells-drop-missing` is not safe
+## `--bells-drop-missing` was not safe, and has been removed
+
+**Removed along with the predictor.** Prefetching was the only way an expert became resident
+in this mode - `on_routing` was skipped entirely - so with the predictor gone, every expert
+would be non-resident and contribute nothing. The flag could not survive its dependency.
+
+A second defect found while removing it, which does not change the numbers below but is worth
+recording: the slot-table publish sat behind a `predictor enabled` check. Running
+`--bells-drop-missing` *without* `--bells-table` therefore never wrote the slot tensors at
+all, and the graph indexed the cache with whatever uninitialised VRAM `ggml_new_tensor_1d`
+returned. The measurements here all used a table (`pf 12`), so they were taken on the path
+that worked; anyone who tried the flag on its own was measuring garbage.
 
 Letting a non-resident expert contribute nothing removes the per-layer host sync and is
 genuinely faster, but it destabilises generation in an input-dependent way:
@@ -101,10 +143,9 @@ genuinely faster, but it destabilises generation in an input-dependent way:
 - C++ corpus, 128 tokens: collapsed to a single token repeated 120 times
 
 Both collapses produced the *fastest* timings in the whole project (25.9 and 28.0 ms/token),
-because a looping model touches almost no distinct experts. The flag is left in for research
-but should not be used for anything real without a repetition penalty and a perplexity check.
+because a looping model touches almost no distinct experts.
 
-An 80B model at 23.6 tok/s on a 6 GB card.
+An 80B model at 23.6 tok/s on a 6 GB card - and not worth having at that perplexity.
 
 Note the run length. Over 24 generated tokens the same drop-missing config measures 54.5
 ms/token; over 128 it measures 42.4. The cache is still warming during the first few dozen
@@ -303,8 +344,13 @@ table really does beat LRU by 20-35 points *as a hit-rate statistic*. But hit ra
 wrong objective. Demand loading moves exactly the experts a token needs; prediction moves a
 superset. On a bandwidth-bound path, a worse policy that moves less data wins.
 
-The predictor code is kept because the measurements are interesting and the trace tooling is
-reusable, but it is off by default and should stay off.
+**The predictor has since been deleted from the runtime.** Keeping it switched off was the
+wrong call: a flag that never helps is a trap for whoever reads the code next, and it kept
+`--bells-drop-missing` alive as a dependent. The offline analysis below is unaffected, and
+`bells_predict.py` still scores prediction against LRU and Belady on any trace, which is where
+the question belongs. Git history has the runtime for anyone who wants to revisit it with a
+cheaper transfer path - and note that the finding is specific to *this* transfer path, not a
+proof that prediction cannot work.
 
 ## Predictor hit-rate analysis (offline, not load-bearing)
 
@@ -368,10 +414,16 @@ Three constraints the graph depends on, each found by crashing into it:
 ```
 llama-bells-profile -m model.gguf -f corpus.txt -o profile.json --chunks 8 -c 512 -n 128 \
     -ngl 99 --cpu-moe
-python bells_build_table.py profile.trace.bin model.bells 32
 llama-bells-profile -m model.gguf -f corpus.txt -o out.json -c 512 -n 128 -ngl 99 \
     --cpu-moe --bells-slots 40
 ```
 
-Add `--bells-drop-missing --bells-prefetch 12 --bells-table model.bells` for the faster,
-approximate path.
+Alternate the two inside one session and quote the paired ratio - see the methodology warning
+at the top of this file, twice.
+
+The prediction analysis is offline and needs no runtime support:
+
+```
+python bells_build_table.py profile.trace.bin model.bells 32   # table, for analysis only
+python bells_predict.py profile.trace.bin                      # LRU vs table vs Belady
+```

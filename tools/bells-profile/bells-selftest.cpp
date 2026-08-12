@@ -287,8 +287,6 @@ static bool test_cache() {
         bells_cache cache;
         cache.init(n_layer, n_expert, n_slot);
 
-        bells_predictor none;
-
         std::vector<bells_copy> copies;
         std::vector<int32_t> want(n_used);
         std::vector<int32_t> pool(n_expert);
@@ -518,41 +516,10 @@ static bool test_runtime(ggml_backend_t backend) {
     return ok;
 }
 
-static bool test_predictor(const char * path) {
-    printf("\n-- predictor table --\n");
-
-    bells_predictor p;
-    if (!p.load(path)) {
-        printf("FAIL: could not load %s\n", path);
-        return false;
-    }
-
-    // a known token and an id far outside the table must both return usable rankings
-    const int32_t * a = p.predict(0, 0);
-    const int32_t * b = p.predict(1 << 30, 0);
-
-    if (!a || !b) {
-        printf("FAIL: null prediction\n");
-        return false;
-    }
-
-    printf("n_take %u, layer 0 top-8 for token 0:", p.n_take());
-    for (uint32_t i = 0; i < std::min(8u, p.n_take()); ++i) {
-        printf(" %d", a[i]);
-    }
-    printf("\nunseen token falls back to prior:");
-    for (uint32_t i = 0; i < std::min(8u, p.n_take()); ++i) {
-        printf(" %d", b[i]);
-    }
-    printf("\nPASS\n");
-
-    return true;
-}
-
-// Replays a real routing trace through the shipped C++ cache and predictor. The Python
-// harness measured the policy; this measures the implementation, so a gap between them
-// means the C++ does not do what was analysed.
-static bool test_replay(const char * trace_path, const char * table_path) {
+// Replays a real routing trace through the shipped C++ cache. The Python harness measured the
+// policy; this measures the implementation, so a gap between them means the C++ does not do
+// what was analysed.
+static bool test_replay(const char * trace_path) {
     printf("\n-- trace replay through the real cache --\n");
 
     std::ifstream f(trace_path, std::ios::binary);
@@ -581,12 +548,8 @@ static bool test_replay(const char * trace_path, const char * table_path) {
     std::vector<uint32_t> layer_ids(n_layer);
     f.read((char *) layer_ids.data(), (std::streamsize) n_layer*4);
 
-    bells_predictor pred;
-    const bool have_pred = pred.load(table_path);
-
-    printf("%llu records, %u layers, %u experts, %u used, predictor %s\n",
-           (unsigned long long) n_rec, n_layer, n_expert, n_used,
-           have_pred ? "loaded" : "MISSING");
+    printf("%llu records, %u layers, %u experts, %u used\n",
+           (unsigned long long) n_rec, n_layer, n_expert, n_used);
 
     for (uint32_t mult : { 1u, 2u, 4u }) {
         const uint32_t n_slot = std::min(mult*n_used, n_expert);
@@ -603,11 +566,6 @@ static bool test_replay(const char * trace_path, const char * table_path) {
         std::vector<uint16_t>   row((size_t) n_layer*n_used);
 
         bool ok = true;
-        uint64_t n_prefetched = 0;
-        uint64_t n_lookup     = 0;
-        uint64_t n_in_table   = 0;
-        uint64_t n_recall     = 0;
-        uint64_t n_want       = 0;
 
         for (uint64_t r = 0; r < n_rec && ok; ++r) {
             uint32_t token = 0, pos = 0;
@@ -624,36 +582,8 @@ static bool test_replay(const char * trace_path, const char * table_path) {
             }
 
             for (uint32_t l = 0; l < n_layer; ++l) {
-                // prefetch on the token id, which is known before any layer runs
-                if (have_pred) {
-                    const int32_t * p = pred.predict((int32_t) token, l);
-                    if (p) {
-                        const uint32_t take = std::min(pred.n_take(), n_slot);
-                        copies.clear();
-                        cache.prefetch(layer_ids[l], p, take, copies);
-                        n_prefetched += copies.size();
-                    }
-                }
-
                 for (uint32_t k = 0; k < n_used; ++k) {
                     want[k] = row[(size_t) l*n_used + k];
-                }
-
-                // direct recall of the prediction, independent of any cache behaviour
-                if (have_pred) {
-                    const int32_t * p = pred.predict((int32_t) token, l);
-                    const uint32_t take = std::min(pred.n_take(), n_slot);
-                    n_lookup++;
-                    n_in_table += pred.in_table((int32_t) token) ? 1 : 0;
-                    for (uint32_t k = 0; k < n_used; ++k) {
-                        for (uint32_t j = 0; j < take; ++j) {
-                            if (p[j] == want[k]) {
-                                n_recall++;
-                                break;
-                            }
-                        }
-                    }
-                    n_want += n_used;
                 }
 
                 copies.clear();
@@ -670,14 +600,11 @@ static bool test_replay(const char * trace_path, const char * table_path) {
         }
 
         const uint64_t tot = cache.n_hit() + cache.n_miss();
-        printf("n_slot %-3u (%2ux used)  hit %5.1f%%  recall %5.1f%%  in-table %5.1f%%  prefetched %llu\n",
-               n_slot, mult, 100.0*cache.n_hit()/std::max<uint64_t>(1, tot),
-               100.0*n_recall/std::max<uint64_t>(1, n_want),
-               100.0*n_in_table/std::max<uint64_t>(1, n_lookup),
-               (unsigned long long) n_prefetched);
+        printf("n_slot %-3u (%2ux used)  hit %5.1f%%\n",
+               n_slot, mult, 100.0*cache.n_hit()/std::max<uint64_t>(1, tot));
     }
 
-    printf("PASS (in-sample: table was built from this trace, so held-out is lower)\n");
+    printf("PASS\n");
 
     return true;
 }
@@ -841,17 +768,15 @@ int main(int argc, char ** argv) {
     const bool cache_ok   = test_cache();
     const bool runtime_ok = test_runtime(backend);
 
-    bool pred_ok = true;
+    // optional: a .trace.bin from llama-bells-profile, replayed through the real cache
+    bool replay_ok = true;
     if (argc > 1) {
-        pred_ok = test_predictor(argv[1]);
-    }
-    if (argc > 2) {
-        pred_ok = test_replay(argv[2], argv[1]) && pred_ok;
+        replay_ok = test_replay(argv[1]);
     }
 
     test_bandwidth(backend, device);
 
     ggml_backend_free(backend);
 
-    return (pass && cache_ok && runtime_ok && pred_ok) ? 0 : 1;
+    return (pass && cache_ok && runtime_ok && replay_ok) ? 0 : 1;
 }

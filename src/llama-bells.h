@@ -37,10 +37,6 @@ public:
     // expert -> slot for layer il, -1 where not resident. Uploaded to the graph each token.
     const std::vector<int32_t> & slot_table(uint32_t il) const { return layers_[il].expert_slot; }
 
-    // Speculative: admit as many of `experts` as fit, never evicting anything in `experts`.
-    // Misses here are harmless, they just cost a later ensure().
-    void prefetch(uint32_t il, const int32_t * experts, size_t n, std::vector<bells_copy> & out);
-
     // Mandatory: after this every expert in `experts` is resident, or it returns false
     // because the request exceeds n_slot and cannot be satisfied at all.
     bool ensure(uint32_t il, const int32_t * experts, size_t n, std::vector<bells_copy> & out);
@@ -169,36 +165,27 @@ private:
     uint32_t n_slot_           = 0;
 };
 
-// token id -> per-layer expert ranking, built by counting over a routing trace.
+// There was a bells_predictor here: a token id -> per-layer expert ranking, counted over a
+// routing trace and used to prefetch before layer 0 ran. It worked, in the sense that it
+// predicted 68-77% of the expert set against LRU's 35%, and it lost every benchmark it was
+// in. Hit rate was the wrong objective. Demand loading moves exactly the experts a token
+// needs; a predictor moves a superset, and on a bandwidth-bound path the extra traffic costs
+// more than the extra hits save.
 //
-// Measured on OLMoE and Qwen3, the token id alone determines roughly 68-77% of the expert
-// set, which is enough lead time to prefetch: the id is known before layer 0 runs.
-class bells_predictor {
-public:
-    bool load(const std::string & path);
-
-    bool enabled() const { return n_layer_ > 0; }
-
-    uint32_t n_take() const { return n_take_; }
-
-    // ranked experts for (token, layer); falls back to the global prior for unseen tokens
-    const int32_t * predict(int32_t token, uint32_t il) const;
-
-    bool in_table(int32_t token) const;
-
-private:
-    uint32_t n_layer_ = 0;
-    uint32_t n_take_  = 0;
-
-    std::vector<int32_t> tokens_;   // sorted, for binary search
-    std::vector<int32_t> ranked_;   // n_token * n_layer * n_take
-    std::vector<int32_t> fallback_; // n_layer * n_take, global prior
-};
+// It is deleted rather than left switched off because a flag that never helps is a trap for
+// whoever reads this next. tools/bells-profile/bells_predict.py still scores prediction
+// against LRU and Belady offline, which is where that question belongs. Git history has the
+// runtime if anyone wants to revisit it with a cheaper transfer path.
+//
+// A drop_missing mode went with it: a non-resident expert contributed nothing instead of being
+// fetched, which removed the per-layer host sync and was the fastest thing this project ever
+// measured. It was also a broken model - perplexity 52.97 against a baseline of 2.03, with
+// generations collapsing into repetition loops. It could not have survived anyway, since
+// prefetch was the only way an expert ever became resident in that mode.
 
 struct bells_params {
     bool        enabled    = false;
     uint32_t    n_slot     = 0;   // experts resident per layer
-    uint32_t    n_prefetch = 0;   // per-layer prefetch budget, 0 = n_slot/2
     // Largest ubatch BELLS will serve. 0 means derive it from the cache size.
     //
     // n tokens can request up to n * n_expert_used distinct experts, and a graph already under
@@ -210,15 +197,9 @@ struct bells_params {
     // at 1, BELLS silently did nothing as soon as two requests decoded together.
     uint32_t    max_tokens = 0;
 
-    // When true, an expert that is not resident contributes nothing instead of being fetched
-    // on demand. This removes the per-layer host round-trip entirely, which measurements show
-    // is the dominant cost, at the price of exact output.
-    bool        drop_missing = false;
-
     // Threads used to fault source pages in before copying. Only matters when the model is
     // larger than RAM; 0 disables. Exists to give the NVMe enough queue depth.
     int         n_fault_threads = 8;
-    std::string table;            // predictor table, optional
 };
 
 // Ties the pieces together for the inference path.
@@ -248,17 +229,12 @@ public:
 
     const bells_tensors & tensors() const { return tensors_; }
 
-    // Called once per ubatch before it is computed. The token id is known before layer 0
-    // runs, which is the source of the prefetch lead time. n_tokens decides whether this
-    // ubatch uses the cache at all, and gates on_routing so prefill does not churn it.
-    void begin_ubatch(int32_t token, int64_t n_tokens);
+    // Called once per ubatch before it is computed. n_tokens decides whether this ubatch uses
+    // the cache at all, and gates on_routing so prefill does not churn it.
+    void begin_ubatch(int64_t n_tokens);
 
-    // called once layer il's router has produced its selection; guarantees residency.
-    // Not used in drop_missing mode, where nothing needs correcting.
+    // called once layer il's router has produced its selection; guarantees residency
     bool on_routing(uint32_t il, const int32_t * experts, size_t n);
-
-    // whether the graph needs the residency correction callback at all
-    bool needs_correction() const { return ready_ && !params_.drop_missing; }
 
     uint64_t n_hit()       const { return cache_.n_hit();  }
     uint64_t n_miss()      const { return cache_.n_miss(); }
@@ -266,22 +242,13 @@ public:
     uint64_t bytes_moved() const { return n_copied_*(uint64_t) tensors_.bytes_per_expert(); }
 
 private:
-    bells_params    params_;
-    bells_cache     cache_;
-    bells_tensors   tensors_;
-    bells_predictor predictor_;
+    bells_params  params_;
+    bells_cache   cache_;
+    bells_tensors tensors_;
 
-    struct pending_copy {
-        uint32_t   il;
-        bells_copy copy;
-    };
-
-    std::vector<bells_copy>   copies_;
-    std::vector<pending_copy> pending_;
+    std::vector<bells_copy> copies_;
     std::vector<std::pair<uint32_t, int32_t>> faults_;
-    std::vector<int32_t>      table_;   // slot table with misses pointed at the zero slot
 
-    int32_t  token_      = -1;
     bool     ready_      = false;
     bool     active_now_ = false;
     uint64_t n_copied_   = 0;

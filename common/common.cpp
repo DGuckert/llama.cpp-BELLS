@@ -1516,9 +1516,6 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kv_unified        = params.kv_unified;
     cparams.bells_enabled      = params.bells_enabled;
     cparams.bells_n_slot       = params.bells_n_slot;
-    cparams.bells_table        = params.bells_table.empty() ? nullptr : params.bells_table.c_str();
-    cparams.bells_drop_missing = params.bells_drop_missing;
-    cparams.bells_n_prefetch   = params.bells_n_prefetch;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

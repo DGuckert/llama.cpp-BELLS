@@ -367,10 +367,6 @@ extern "C" {
         // Requires the expert tensors to stay host resident, i.e. use together with --cpu-moe.
         bool         bells_enabled; // enable the BELLS expert cache
         uint32_t     bells_n_slot;  // resident experts per layer, 0 = size from free VRAM
-        const char * bells_table;   // predictor table built by bells_build_table.py, may be null
-        uint32_t     bells_n_prefetch; // experts prefetched per layer per token, 0 = n_slot/2
-        bool         bells_drop_missing; // non-resident experts contribute nothing; removes the
-                                         // per-layer sync at the cost of exact output
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)

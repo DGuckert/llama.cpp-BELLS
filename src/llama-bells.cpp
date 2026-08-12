@@ -65,45 +65,6 @@ int32_t bells_cache::victim(layer & l, const int32_t * keep, size_t n_keep) cons
     return best;
 }
 
-void bells_cache::prefetch(uint32_t il, const int32_t * experts, size_t n, std::vector<bells_copy> & out) {
-    if (!enabled() || il >= n_layer_) {
-        return;
-    }
-
-    layer & l = layers_[il];
-
-    clock_++;
-
-    for (size_t i = 0; i < n; ++i) {
-        const int32_t e = experts[i];
-        if (e < 0 || (uint32_t) e >= n_expert_) {
-            continue;
-        }
-
-        if (l.expert_slot[e] >= 0) {
-            l.last_used[l.expert_slot[e]] = clock_;
-            continue;
-        }
-
-        const int32_t s = victim(l, experts, n);
-        if (s < 0) {
-            // everything resident is wanted by this same prefetch, nothing to give up
-            break;
-        }
-
-        const int32_t evicted = l.slot_expert[s];
-        if (evicted >= 0) {
-            l.expert_slot[evicted] = -1;
-        }
-
-        l.slot_expert[s] = e;
-        l.expert_slot[e] = s;
-        l.last_used[s]   = clock_;
-
-        out.push_back({ e, s });
-    }
-}
-
 bool bells_cache::ensure(uint32_t il, const int32_t * experts, size_t n, std::vector<bells_copy> & out) {
     if (!enabled() || il >= n_layer_) {
         return true;
@@ -370,71 +331,6 @@ void bells_tensors::upload_slots(uint32_t il, const std::vector<int32_t> & table
 }
 
 //
-// predictor
-//
-
-bool bells_predictor::load(const std::string & path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
-        return false;
-    }
-
-    char magic[8] = { 0 };
-    f.read(magic, 8);
-    if (memcmp(magic, "BELLSPR1", 8) != 0) {
-        return false;
-    }
-
-    uint32_t version  = 0;
-    uint32_t n_token  = 0;
-
-    f.read((char *) &version,  sizeof(version));
-    f.read((char *) &n_layer_, sizeof(n_layer_));
-    f.read((char *) &n_take_,  sizeof(n_take_));
-    f.read((char *) &n_token,  sizeof(n_token));
-
-    if (version != 1 || n_layer_ == 0 || n_take_ == 0) {
-        n_layer_ = 0;
-        return false;
-    }
-
-    tokens_.resize(n_token);
-    fallback_.resize((size_t) n_layer_*n_take_);
-    ranked_.resize((size_t) n_token*n_layer_*n_take_);
-
-    f.read((char *) tokens_.data(),   tokens_.size()  *sizeof(int32_t));
-    f.read((char *) fallback_.data(), fallback_.size()*sizeof(int32_t));
-    f.read((char *) ranked_.data(),   ranked_.size()  *sizeof(int32_t));
-
-    if (!f) {
-        n_layer_ = 0;
-        return false;
-    }
-
-    return true;
-}
-
-bool bells_predictor::in_table(int32_t token) const {
-    const auto it = std::lower_bound(tokens_.begin(), tokens_.end(), token);
-    return it != tokens_.end() && *it == token;
-}
-
-const int32_t * bells_predictor::predict(int32_t token, uint32_t il) const {
-    if (!enabled() || il >= n_layer_) {
-        return nullptr;
-    }
-
-    const auto it = std::lower_bound(tokens_.begin(), tokens_.end(), token);
-    if (it == tokens_.end() || *it != token) {
-        return fallback_.data() + (size_t) il*n_take_;
-    }
-
-    const size_t idx = it - tokens_.begin();
-
-    return ranked_.data() + ((size_t) idx*n_layer_ + il)*n_take_;
-}
-
-//
 // runtime
 //
 
@@ -563,16 +459,6 @@ bool bells_runtime::init(const bells_params & params,
 
     cache_.init(n_layer, n_expert, n_slot);
 
-    if (!params.table.empty() && !predictor_.load(params.table)) {
-        fprintf(stderr, "%s: could not load predictor table '%s', "
-                        "running demand-only\n", __func__, params.table.c_str());
-    }
-
-    if (params_.n_prefetch == 0) {
-        params_.n_prefetch = std::max(1u, n_slot/2);
-    }
-    params_.n_prefetch = std::min(params_.n_prefetch, n_slot);
-
     if (params_.max_tokens == 0) {
         // n tokens may request up to n * n_expert_used distinct experts; anything beyond what
         // the cache holds could fail ensure() mid-graph, where there is no way to recover.
@@ -583,10 +469,9 @@ bool bells_runtime::init(const bells_params & params,
     ready_         = true;
     n_copied_      = 0;
 
-    fprintf(stderr, "%s: %u slots/layer of %u experts, %.1f MiB VRAM, serves ubatch <= %u, "
-                    "predictor %s\n",
+    fprintf(stderr, "%s: %u slots/layer of %u experts, %.1f MiB VRAM, serves ubatch <= %u\n",
             __func__, n_slot, n_expert, tensors_.vram_bytes()/1024.0/1024.0,
-            params_.max_tokens, predictor_.enabled() ? "on" : "off");
+            params_.max_tokens);
 
     return true;
 }
@@ -604,83 +489,36 @@ void bells_runtime::free() {
     cache_.reset();
 
     ready_    = false;
-    token_    = -1;
     n_copied_ = 0;
 }
 
-void bells_runtime::begin_ubatch(int32_t token, int64_t n_tokens) {
-    token_      = token;
+void bells_runtime::begin_ubatch(int64_t n_tokens) {
     active_now_ = active(n_tokens);
-
-    if (!active_now_ || !predictor_.enabled() || token < 0) {
-        return;
-    }
-
-    // Prefetch every layer here, before the graph runs. Doing this inside on_routing would
-    // be pointless: by then the router has already said which experts it wants, so there is
-    // no lead time left to hide anything behind.
-    // Decide every layer's admissions first, fault all the source pages in parallel, then
-    // copy. Faulting inside the copy loop leaves the drive at queue depth 1.
-    pending_.clear();
-    faults_.clear();
-
-    for (int32_t il : tensors_.layers()) {
-        const int32_t * p = predictor_.predict(token, (uint32_t) il);
-        if (!p) {
-            continue;
-        }
-
-        const uint32_t take = std::min(predictor_.n_take(), params_.n_prefetch);
-
-        copies_.clear();
-        cache_.prefetch((uint32_t) il, p, take, copies_);
-
-        for (const auto & c : copies_) {
-            pending_.push_back({ (uint32_t) il, c });
-            faults_.emplace_back((uint32_t) il, c.expert);
-        }
-    }
-
-    if (params_.n_fault_threads > 0) {
-        tensors_.prefault(faults_, params_.n_fault_threads);
-    }
-
-    for (const auto & pc : pending_) {
-        tensors_.copy_expert(pc.il, pc.copy.expert, pc.copy.slot);
-    }
-    n_copied_ += pending_.size();
-
-    for (int32_t il : tensors_.layers()) {
-
-        // In drop_missing mode nothing later fixes up the table, so publish it now with every
-        // non-resident expert pointed at the zero slot. The graph then runs start to finish
-        // without a single host round-trip.
-        if (params_.drop_missing) {
-            table_ = cache_.slot_table((uint32_t) il);
-
-            const int32_t zero = tensors_.zero_slot();
-            for (auto & s : table_) {
-                if (s < 0) {
-                    s = zero;
-                }
-            }
-
-            tensors_.upload_slots((uint32_t) il, table_);
-        }
-    }
 }
 
 bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
     // prefill bypasses the cache in the graph, so it must not touch residency here either
-    if (!ready_ || !active_now_ || params_.drop_missing) {
+    if (!ready_ || !active_now_) {
         return true;
     }
 
-    // prefetching already happened in begin_ubatch; all that is left is to correct whatever
-    // the prediction missed, which must be resident before the matmul reads the slot table
+    // Every expert this layer asked for must be resident before the matmul reads the slot
+    // table, so this is a demand fetch with no lead time to hide it behind.
     copies_.clear();
     if (!cache_.ensure(il, experts, n, copies_)) {
         return false;
+    }
+
+    // Fault all the source pages in first, across threads, then copy. When the model is larger
+    // than RAM these reads come off disk, and faulting inside the copy loop leaves the drive at
+    // queue depth 1 - worth 2042 -> 1430 ms on GPT-OSS-120B when this ran on the prefetch path.
+    // Skipped for a single copy, where the thread handoff costs more than it saves.
+    if (params_.n_fault_threads > 0 && copies_.size() > 1) {
+        faults_.clear();
+        for (const auto & c : copies_) {
+            faults_.emplace_back(il, c.expert);
+        }
+        tensors_.prefault(faults_, params_.n_fault_threads);
     }
 
     for (const auto & c : copies_) {

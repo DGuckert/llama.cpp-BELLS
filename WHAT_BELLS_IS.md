@@ -108,7 +108,8 @@ help. Every winning configuration is plain LRU. The offline analysis was sound -
 really does predict 68-77% of its experts, and a counting table really does beat LRU by 20-35
 points on hit rate - but hit rate was the wrong objective. Demand loading moves exactly the
 experts a token needs; prediction moves a superset, and on a bandwidth-bound path the extra
-traffic costs more than the extra hits save.
+traffic costs more than the extra hits save. The predictor has since been deleted from the
+runtime; the offline analysis that produced the finding is still in `bells_predict.py`.
 
 **Dropping missing experts.** Fastest timings in the project, and a broken model: perplexity
 52.97 against a baseline of 2.03, with generations collapsing into single-token loops.

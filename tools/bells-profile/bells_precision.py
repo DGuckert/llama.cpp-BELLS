@@ -40,9 +40,8 @@ import numpy as np
 from bells_policy import load, _victim
 
 
-def build_table(rows, tokens, layers, n_expert, train_frac=0.6):
+def build_table(rows, tokens, layers, n_expert, n_train):
     """token id -> per-layer expert frequencies, counted on a training prefix."""
-    n_train = int(len(tokens)*train_frac)
     table = {il: defaultdict(lambda: np.zeros(n_expert, dtype=np.int32)) for il in layers}
     seen = defaultdict(int)
 
@@ -56,7 +55,7 @@ def build_table(rows, tokens, layers, n_expert, train_frac=0.6):
     return table, seen, n_train
 
 
-def simulate(rows, tokens, il, table, seen, n_slot, n_expert, start, thresh, expert_mb):
+def simulate(rows, tokens, il, table, seen, n_slot, n_expert, start, thresh, expert_mb, end=None):
     """Replay LRU, and at each token also consider prefetching predicted experts.
 
     A prefetch is only issued when the predictor's confidence for that expert clears `thresh`,
@@ -71,7 +70,10 @@ def simulate(rows, tokens, il, table, seen, n_slot, n_expert, start, thresh, exp
     pf_used = 0              # ...that the token actually wanted
     saved = 0                # demand misses converted to hits by a prefetch
 
-    for i in range(start, len(tokens)):
+    if end is None:
+        end = len(tokens)
+
+    for i in range(start, end):
         tick += 1
         tok = int(tokens[i])
         want = list(map(int, rows[i, il, :]))
@@ -114,7 +116,7 @@ def simulate(rows, tokens, il, table, seen, n_slot, n_expert, start, thresh, exp
                 del resident[v]
             resident[e] = tick
 
-    n_tok = len(tokens) - start
+    n_tok = end - start
     return {
         "demand_miss": demand_miss,
         "pf_issued": pf_issued,
@@ -136,6 +138,15 @@ def main():
     ap.add_argument("--expert-mb", type=float, default=1.09)
     ap.add_argument("--pcie", type=float, default=7.09, help="GB/s measured")
     ap.add_argument("--decode-ms", type=float, default=24.2, help="ms/token at this cache size")
+    ap.add_argument("--train-frac", type=float, default=0.6)
+    # Absolute record windows, so one table can be scored against two different domains. A trace
+    # collected over prose-then-code has a domain boundary at a known record; training below it
+    # and evaluating on either side is the difference between in-distribution precision and the
+    # precision that generalises.
+    ap.add_argument("--train-end",  type=int, default=0, help="0 = use --train-frac")
+    ap.add_argument("--eval-start", type=int, default=0, help="0 = straight after training")
+    ap.add_argument("--eval-end",   type=int, default=0, help="0 = end of trace")
+    ap.add_argument("--label", default="", help="tag for the evaluation window")
     a = ap.parse_args()
 
     t = load(a.trace, a.limit)
@@ -149,8 +160,14 @@ def main():
     print(f"layers {layers}, expert {a.expert_mb} MB, PCIe {a.pcie} GB/s, "
           f"decode {a.decode_ms} ms/token\n")
 
-    table, seen, n_train = build_table(t["rows"], t["tokens"], layers, t["n_expert"])
-    print(f"predictor trained on {n_train} tokens, evaluated on {t['n_rec'] - n_train} held out\n")
+    n_train = a.train_end or int(t["n_rec"]*a.train_frac)
+    ev_start = a.eval_start or n_train
+    ev_end = a.eval_end or t["n_rec"]
+
+    table, seen, _ = build_table(t["rows"], t["tokens"], layers, t["n_expert"], n_train)
+    tag = f" [{a.label}]" if a.label else ""
+    print(f"predictor trained on records 0..{n_train}, "
+          f"evaluated on {ev_start}..{ev_end} ({ev_end - ev_start} tokens){tag}\n")
 
     # Only a few layers are simulated, so their traffic must be scaled to the whole model
     # before being compared against a per-token bandwidth budget. Getting this wrong made the
@@ -170,7 +187,7 @@ def main():
         agg = defaultdict(float)
         for il in layers:
             r = simulate(t["rows"], t["tokens"], il, table, seen, n_slot,
-                         t["n_expert"], n_train, thr, a.expert_mb)
+                         t["n_expert"], ev_start, thr, a.expert_mb, ev_end)
             for k, v in r.items():
                 agg[k] += v
 

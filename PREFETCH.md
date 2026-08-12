@@ -191,6 +191,46 @@ per token) exceed GPU compute (~16 ms), so perfect overlap would still leave tra
 A second stream helps most where the hit rate is high and transfers are small - which is the same
 regime this whole document is about.
 
+## The precision above is in-distribution, and that matters
+
+Everything above was measured by training the table on the first 60% of a trace and evaluating
+on the remaining 40% **of the same trace**. Held-out tokens, but not held-out *text*. Since the
+entire premise is that routing is conditioned on token id, a table counted on one kind of text
+will flatter itself on that same kind of text.
+
+A 205k-token trace collected over 54 markdown files followed by 171 C/C++ files puts a domain
+boundary at record 152883. Training on records 0..91729 (prose only) and scoring the same table
+on both sides of that boundary separates the two:
+
+| | precision @0.90 | demand traffic removed | baseline demand |
+|---|---|---|---|
+| held-out **prose** (in-distribution) | **82.2%** | 30.0% | 119.1 MB/token |
+| held-out **code** (cross-domain) | **67.9%** | 22.2% | 65.9 MB/token |
+
+**Precision falls 14.3 points, from 82.2% to 67.9%.** The predictor degrades under domain shift
+but does not collapse - two of every three prefetched experts are still used. Token-id routing
+statistics are a real effect, not an artifact of a narrow trace.
+
+Three cautions on reading this table:
+
+- **The in-distribution figure is optimistic even for in-distribution use.** The prose evaluation
+  window is directly adjacent to the training window - same documents, same section of `docs/`.
+  It shares local vocabulary and topic, so 82.2% is an upper bound flattered by locality, not
+  just by domain. There is no equally-distant prose window to control against, because the prose
+  is contiguous.
+- **"Traffic removed" is not comparable across the two rows.** The code region has a much lower
+  intrinsic miss rate - 65.9 MB/token against 119.1 - so LRU alone already does well there and
+  there is simply less to win. That column conflates domain shift with a different baseline.
+  Precision is the clean comparison; traffic is not.
+- **This is a mild shift.** Technical prose to C++, both from one repository, both English-
+  adjacent. It is evidence, not proof. Fiction, dialogue or non-English text would be the real
+  test, and has not been run.
+
+Note also what this does to the 73.3% quoted earlier in this document: a larger table (6980
+tokens rather than 605) raises in-distribution precision to 82.2%, but the number that
+generalises is 67.9% - **below** the figure the earlier sections were built on. A bigger table
+buys accuracy within a domain and does not buy it across domains.
+
 ## Before anyone builds this
 
 - The 8% is an estimate, and this project's estimates have a poor record. Four of five

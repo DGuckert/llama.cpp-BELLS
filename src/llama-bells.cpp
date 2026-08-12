@@ -378,25 +378,48 @@ bool bells_runtime::init(const bells_params & params,
         return false;
     }
 
-    // The fit verdict. This one ratio decided every result we measured.
+    // The fit verdict.
+    //
+    // A high ratio does NOT mean BELLS will help - GPT-OSS-120B measured 6.1x slower at 4x -
+    // so this only says whether a cache is physically worth attempting. A low ratio does
+    // reliably mean it will not: 1.2x measured 0.83x against --cpu-moe.
+    const double ratio = (double) n_slot/std::max(1u, n_expert_used);
     {
-        // Thresholds calibrated against measured outcomes on a 6 GB card, not guessed:
-        //   GPT-OSS-120B  1.0x -> 1.59x slower
-        //   Qwen3-30B-A3B 2.2x -> 1.52x faster
-        //   Qwen3-Next80B 4.7x -> 1.18x faster
-        // The useful threshold sits near 2x. An earlier draft demanded 8x and would have
-        // told users to skip configurations that measure as the biggest wins we have.
-        const double ratio = (double) n_slot/std::max(1u, n_expert_used);
         const char * verdict =
-            ratio >= 4.0 ? "good fit"     :
-            ratio >= 2.0 ? "workable"     :
-            ratio >= 1.5 ? "marginal, may be slower than --cpu-moe" :
-                           "poor fit, expect a slowdown";
+            ratio >= 4.0 ? "enough to try, but measure - a high ratio does not predict a speedup" :
+            ratio >= 2.0 ? "workable, measure against --cpu-moe" :
+                           "marginal, likely slower than --cpu-moe";
 
         fprintf(stderr, "%s: working set %.2f GiB (%zu layers x %u experts x %.2f MiB), "
                         "cache holds %.1fx it -> %s\n",
                 __func__, working_set/1024.0/1024.0/1024.0, srcs.size(), n_expert_used,
                 per_expert/1024.0/1024.0, ratio, verdict);
+    }
+
+    // Refuse rather than warn. Below 1.5x the cache thrashes and BELLS is a measured loss -
+    // 1.2x on a 6 GB card gave 0.83x - and it still costs its VRAM the whole time, which
+    // squeezes the compute buffers even for the ubatches it declines to serve. Printing
+    // "poor fit, expect a slowdown" and enabling anyway just meant users ate the slowdown
+    // without reading the line.
+    //
+    // Auto-sizing lands here mostly because the KV cache got the VRAM first, so say that: the
+    // actionable fix is a shorter context, not a different flag. An explicit --bells-slots is
+    // taken as deliberate and honoured, since research needs to be able to measure bad configs.
+    if (ratio < 1.5) {
+        if (params.n_slot == 0) {
+            fprintf(stderr,
+                    "%s: only %u slots fit (%.1fx the working set), which is slower than plain "
+                    "--cpu-moe. BELLS disabled.\n"
+                    "%s: the expert cache and the KV cache come out of the same VRAM and the KV "
+                    "cache is allocated first, so a shorter -c leaves room for a bigger cache. "
+                    "Pass --bells-slots N to force it anyway.\n",
+                    __func__, n_slot, ratio, __func__);
+            return false;
+        }
+
+        fprintf(stderr, "%s: %u slots is only %.1fx the working set and measured slower than "
+                        "--cpu-moe at this ratio; continuing because it was requested "
+                        "explicitly\n", __func__, n_slot, ratio);
     }
 
     if (!tensors_.init(buft, srcs, n_slot, backend)) {

@@ -3,12 +3,17 @@
 I wanted to run models that do not fit in my GPU. The result is a working expert cache that
 gets a 235B model to 5.6 tok/s on a single 24 GB card. That part worked.
 
-The more useful output is the other part: over the course of building it I proposed **five
-different rules** for predicting which models the technique helps. Four of them are dead. Each
-one was reasonable given the data I had, and each was killed by the next measurement. What
-killed them was almost never the code - it was the way the numbers were taken.
+The more useful output is the other part: over the course of building it I proposed **six
+different rules** for predicting when the technique helps. Five of them are dead. Each was
+reasonable given the data I had, and each was killed by the next measurement. What killed them
+was almost never the code - it was the way the numbers were taken.
 
-This is a writeup of both.
+The last one to die was the one I cared about most. I built this on a 6 GB RTX 2060, tuned it
+there, and published a 1.52x speedup from it. Measured properly, **on the card I built it on it
+is 5% slower than not using it at all.** It works on 24 GB cards. The card it was developed on
+is the one where it does not help.
+
+This is a writeup of both halves.
 
 ---
 
@@ -78,15 +83,57 @@ rested on one measurement taken against a CPU too weak to run the model.
 win, 12.6 MB experts lose catastrophically. Bytes moved per token is what matters. *Killed
 within one table* - Mixtral's 18 MB experts score 1.06x while GPT-OSS's 12.6 MB score 0.16x.
 
-**5. BELLS is CPU-independent, so the ratio only measures how weak your CPU is.** Once experts
+**5. It works on the card I built it on.** For months the flagship result was 1.52x on a 6 GB
+RTX 2060, measured with my own profiler at `-c 512`. *Killed by* running it through
+`llama-server` at a context length someone would actually use: **0.94-0.97x, consistently
+slower**. More on this below, because it is the most instructive failure of the six.
+
+**6. BELLS is CPU-independent, so the ratio only measures how weak your CPU is.** Once experts
 are resident, the work is on the GPU. Doubling cores moved Qwen3-Next's BELLS number from 39.9
 to 41.3 tok/s - nothing - while its baseline went 14.3 to 19.8. This is *still standing*, and I
 am not claiming it, because Mixtral contradicts it and the infrastructure noise is large enough
 to explain the contradiction either way.
 
-**Four models produced four falsified hypotheses.** Any two of them can be used to argue any of
+**Four models produced five falsified hypotheses.** Any two of them can be used to argue any of
 the rules above. That is the actual lesson: with a small sample and noisy infrastructure, almost
 any rule fits the points in hand and breaks on the next one.
+
+### The benchmark that measured the wrong thing for months
+
+Hypothesis 5 deserves its own section, because it did not fail on a subtlety. It failed because
+my benchmark harness measured pure decode and nothing else.
+
+`llama-bells-profile` runs at `-c 512`, generates tokens one at a time, and does no prefill
+worth the name, no chat template, and no sampling. It measured 1.52x on Qwen3-30B-A3B. That
+number is *correct for what it measures*.
+
+Through `llama-server` at `-c 4096`, 100-token chat completions, paired and warmed, same card
+and same model:
+
+| concurrency | `--cpu-moe` | BELLS | ratio |
+|---|---|---|---|
+| 1 | 10.70 | 10.02 | 0.94x |
+| 2 | 13.18 | 12.79 | 0.97x |
+| 3 | 15.16 | 14.40 | 0.95x |
+| 4 | 17.69 | 17.00 | 0.96x |
+
+Two things were hiding behind the profiler. First, **a 512-token context leaves VRAM free, and a
+16K context does not.** The expert cache and the KV cache come out of the same pool and
+llama.cpp allocates the KV cache first, so at `-c 16384` only a 1.2x cache ratio fits - a
+configuration my own code labels *"poor fit, expect a slowdown"* before enabling itself anyway.
+It duly measured 0.83x.
+
+Second, and worse: the ratios above are ~0.95x at *every* concurrency, including the ones where
+the cache is bypassed entirely and should cost exactly nothing. **The cache holds its VRAM
+whether it is used or not.** On a 6 GB card, taking 1.5 GB away from the compute buffers costs
+about 5% unconditionally, and the benefit never covers it.
+
+So the correct advice for the hardware this was built on is: don't use it. Use `--cpu-moe`,
+which is stock llama.cpp. The 24 GB results are untouched, and the reason is now obvious - that
+card has room for a 16K context *and* a 128-slot cache at the same time. Six gigabytes does not.
+
+I have since made it refuse to enable itself below a 1.5x ratio rather than warn and continue,
+which is what it should have done from the start.
 
 ---
 
@@ -131,7 +178,12 @@ that GCC does not. The perplexity path used `exp()` and `log()` with no `<cmath>
 llama.cpp fork - where essentially the whole audience is on Linux - "builds clean here" was
 carrying far more weight than it had earned. A cloud builder told me, months in.
 
+**The harness measured a workload nobody runs.** Covered above: pure decode at a 512-token
+context, which is both the friendliest case for an expert cache and the one furthest from how
+anyone uses a server.
+
 The pattern: **every one of these moved the result by more than the effect being measured.**
+Not one of them was a bug in the cache. The cache was fine.
 
 ---
 
@@ -166,14 +218,19 @@ the predictor. The project is named after it.
   `-ngl` on MoE models. If you want to run a big MoE on a small card, start and possibly stop
   there. On a 24 GB card with 128 GB of RAM, GPT-OSS-120B runs at 13.2 tok/s on `--cpu-moe`
   alone, and every expert-caching configuration I tried made it worse.
+- **Benchmark the workload you actually have.** This is the one that cost the most. A profiler
+  measuring pure decode at a 512-token context flattered the technique for months, and the gap
+  only appeared when I ran it as a server at a realistic context length.
 - **Pair every comparison inside one run.** Never compare a number from one session against a
   number from another. This one rule would have prevented most of the errors above.
 - **Re-measure anything interesting.** Every surprising result in this project was wrong the
   first time.
 - **Check what your environment is deciding for you.** Core counts, RAM headroom, page-cache
-  state, compiler, and parameters inherited from different hardware. Each of those silently
-  determined a result here.
+  state, compiler, context length, and parameters inherited from different hardware. Each of
+  those silently determined a result here.
 - **Distrust proxy metrics.** Hit rate is not speed. Cache ratio is not speedup.
+- **A tool that warns and proceeds is a tool that does nothing.** Mine printed "poor fit,
+  expect a slowdown" and enabled itself anyway. Nobody reads startup lines. It refuses now.
 
 The code is MIT and the measurements are reproducible. Whether the technique helps *your* model
 on *your* hardware is not something I can predict - four attempts to build that predictor all

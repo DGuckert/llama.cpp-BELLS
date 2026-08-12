@@ -106,6 +106,20 @@ core count:
 
 BELLS moves 13% across an 8x change in cores. The baseline moves 2.6x.
 
+Replicated on Mixtral-8x7B, chosen because it was the model that appeared to *contradict* this:
+
+| vCPU | `--cpu-moe` | BELLS | ratio |
+|---|---|---|---|
+| 4 | 2.51 | 3.60 | 1.43x |
+| 8 | 2.30 | 3.74 | 1.63x |
+| 16 | 3.77 | 4.47 | 1.19x |
+| 32 | **5.47** | 3.94 | **0.72x** |
+
+BELLS holds 3.6-4.5 tok/s with no trend. And here the rule predicted something before it was
+measured: BELLS converges near 4 tok/s on this model, so it *must* lose once the baseline passes
+4 - and at 32 cores it does. **The same model, same code and same cache spans 1.63x to 0.72x on
+CPU alone.** The earlier apparent contradiction was inside Mixtral's own 24% noise band.
+
 **Five hypotheses died because they all tried to predict the ratio, and the ratio is not a
 property of BELLS.** It is a property of the thing BELLS is being compared against. Once experts
 are resident the work is on the GPU and the CPU stops mattering, so "2.08x faster" is really

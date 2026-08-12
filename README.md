@@ -59,8 +59,13 @@ baseline's CPU.** Which gives the one rule in this project that survived a contr
 > **BELLS converges on a CPU-independent throughput. Measure your `--cpu-moe` baseline - if it
 > is below that number, BELLS wins by the difference; if above, it loses.**
 
-That is why Mixtral's headline 5.88x collapsed to 1.06x on a better CPU, and why GPT-OSS-120B
-loses: its baseline of 13.21 tok/s is already faster than BELLS manages on it.
+Replicated on Mixtral-8x7B, where BELLS holds 3.6-4.5 tok/s while the baseline climbs 2.30 to
+5.47 - so the same model, same code and same cache spans **1.63x at 8 cores to 0.72x at 32**.
+The rule called that in advance: BELLS converges near 4 tok/s on this model, so it has to lose
+once the baseline passes 4.
+
+That is also why Mixtral's headline 5.88x collapsed to 1.06x on a better CPU, and why
+GPT-OSS-120B loses: its baseline of 13.21 tok/s is already faster than BELLS manages on it.
 
 **Cache size has a per-model optimum and guessing high can be expensive.** The 235B peaks at 28
 slots and falls to 0.73x at 36; Mixtral peaks at 4 and drops to 0.80x at 8; Qwen3-Next reaches

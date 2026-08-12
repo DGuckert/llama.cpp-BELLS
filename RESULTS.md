@@ -322,9 +322,25 @@ was pathological for 13 B active parameters. GPT-OSS-120B loses because its base
 13.21 tok/s, above what BELLS reaches on it. The 6 GB card gains nothing because a desktop CPU
 gives a decent baseline while 6 GB caps what BELLS can reach.
 
-Two caveats. This is one model on one GPU, and it should be replicated. And the 32-core baseline
-(16.11) came in *below* the 16-core one (19.62), which is probably thread contention or NUMA but
-is not explained.
+One caveat on that run: the 32-core baseline (16.11) came in *below* the 16-core one (19.62),
+which is probably thread contention and is not explained.
+
+**Replicated on Mixtral-8x7B**, deliberately chosen because it was the model that appeared to
+contradict this hypothesis - 4.73 tok/s at 8 vCPU dropping to 3.93 at 16, at the same slot count:
+
+| vCPU | `--cpu-moe` baseline | BELLS, 4 slots | ratio |
+|---|---|---|---|
+| 4 | 2.51 | 3.60 | 1.43x |
+| 8 | 2.30 | 3.74 | 1.63x |
+| 16 | 3.77 | 4.47 | 1.19x |
+| 32 | **5.47** | 3.94 | **0.72x** |
+
+BELLS sits at 3.6-4.5 tok/s with no trend; the baseline climbs 2.30 to 5.47. The apparent
+contradiction was inside Mixtral's own 24% noise band, not a real effect.
+
+**And the rule predicted something before it was measured.** BELLS converges near 4 tok/s on this
+model, so it must lose once the baseline passes 4 - and at 32 cores it does, 0.72x. The same
+model, same code and same cache spans 1.63x to 0.72x on CPU alone. No property of BELLS changed.
 
 ### The four predictors that did not work
 

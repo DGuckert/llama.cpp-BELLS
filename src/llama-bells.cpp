@@ -1,10 +1,11 @@
-#include "llama-bells.h"
+﻿#include "llama-bells.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <string>
 
 void bells_cache::init(uint32_t n_layer, uint32_t n_expert, uint32_t n_slot) {
     n_layer_  = n_layer;
@@ -63,6 +64,47 @@ int32_t bells_cache::victim(layer & l, const int32_t * keep, size_t n_keep) cons
     }
 
     return best;
+}
+
+void bells_cache::prefetch(uint32_t il, const int32_t * experts, size_t n, std::vector<bells_copy> & out) {
+    if (!enabled() || il >= n_layer_) {
+        return;
+    }
+
+    layer & l = layers_[il];
+
+    clock_++;
+
+    for (size_t i = 0; i < n; ++i) {
+        const int32_t e = experts[i];
+        if (e < 0 || (uint32_t) e >= n_expert_) {
+            continue;
+        }
+
+        if (l.expert_slot[e] >= 0) {
+            l.last_used[l.expert_slot[e]] = clock_;
+            continue;
+        }
+
+        // Only the other members of this prefetch are protected. What the token will actually
+        // want is unknown here, so a wrong guess can evict something needed - that cost is real
+        // and is why the confidence threshold matters.
+        const int32_t s = victim(l, experts, n);
+        if (s < 0) {
+            break;
+        }
+
+        const int32_t evicted = l.slot_expert[s];
+        if (evicted >= 0) {
+            l.expert_slot[evicted] = -1;
+        }
+
+        l.slot_expert[s] = e;
+        l.expert_slot[e] = s;
+        l.last_used[s]   = clock_;
+
+        out.push_back({ e, s });
+    }
 }
 
 bool bells_cache::ensure(uint32_t il, const int32_t * experts, size_t n, std::vector<bells_copy> & out) {
@@ -284,6 +326,100 @@ void bells_tensors::upload_slots(uint32_t il, const std::vector<int32_t> & table
 }
 
 //
+// confidence table
+//
+
+bool bells_conf::load(const std::string & path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        return false;
+    }
+
+    char magic[8] = { 0 };
+    f.read(magic, 8);
+    if (memcmp(magic, "BELLSCF1", 8) != 0) {
+        return false;
+    }
+
+    uint32_t version = 0;
+    uint64_t n_token = 0;
+
+    f.read((char *) &version,   sizeof(version));
+    f.read((char *) &n_layer_,  sizeof(n_layer_));
+    f.read((char *) &n_expert_, sizeof(n_expert_));
+    f.read((char *) &max_k_,    sizeof(max_k_));
+    f.read((char *) &n_token,   sizeof(n_token));
+
+    if (version != 1 || n_layer_ == 0 || max_k_ == 0 || n_token == 0) {
+        n_layer_ = 0;
+        return false;
+    }
+
+    std::vector<uint32_t> layer_ids(n_layer_);
+    f.read((char *) layer_ids.data(), (std::streamsize) n_layer_*sizeof(uint32_t));
+
+    uint32_t max_il = 0;
+    for (uint32_t id : layer_ids) {
+        max_il = std::max(max_il, id);
+    }
+    il_to_row_.assign(max_il + 1, -1);
+    for (uint32_t r = 0; r < n_layer_; ++r) {
+        il_to_row_[layer_ids[r]] = (int32_t) r;
+    }
+
+    tokens_.resize(n_token);
+    f.read((char *) tokens_.data(), (std::streamsize) n_token*sizeof(int32_t));
+
+    const size_t per = (size_t) n_layer_*max_k_;
+
+    ex_.resize(n_token*per);
+    cf_.resize(n_token*per);
+
+    // written as int32[max_k] then float[max_k] per (token, layer)
+    for (size_t t = 0; t < n_token; ++t) {
+        for (uint32_t l = 0; l < n_layer_; ++l) {
+            const size_t o = t*per + (size_t) l*max_k_;
+            f.read((char *) (ex_.data() + o), max_k_*sizeof(int32_t));
+            f.read((char *) (cf_.data() + o), max_k_*sizeof(float));
+        }
+    }
+
+    gex_.resize(per);
+    gcf_.resize(per);
+    for (uint32_t l = 0; l < n_layer_; ++l) {
+        const size_t o = (size_t) l*max_k_;
+        f.read((char *) (gex_.data() + o), max_k_*sizeof(int32_t));
+        f.read((char *) (gcf_.data() + o), max_k_*sizeof(float));
+    }
+
+    if (!f) {
+        n_layer_ = 0;
+        return false;
+    }
+
+    return true;
+}
+
+const int32_t * bells_conf::predict(int32_t token, uint32_t il, const float ** conf) const {
+    if (!enabled() || il >= il_to_row_.size() || il_to_row_[il] < 0) {
+        return nullptr;
+    }
+
+    const size_t row = (size_t) il_to_row_[il];
+    const size_t per = (size_t) n_layer_*max_k_;
+
+    const auto it = std::lower_bound(tokens_.begin(), tokens_.end(), token);
+    if (it == tokens_.end() || *it != token) {
+        *conf = gcf_.data() + row*max_k_;
+        return gex_.data() + row*max_k_;
+    }
+
+    const size_t ti = it - tokens_.begin();
+    *conf = cf_.data() + ti*per + row*max_k_;
+    return ex_.data() + ti*per + row*max_k_;
+}
+
+//
 // runtime
 //
 
@@ -450,9 +586,28 @@ bool bells_runtime::init(const bells_params & params,
         params_.max_tokens = std::max(1u, n_slot/std::max(1u, n_expert_used));
     }
 
+    // Confidence-gated prefetch, off unless a table is supplied. BELLS_CONF sets the threshold;
+    // 0.9 is where offline measurement put precision at 73.9%.
+    if (const char * tp = getenv("BELLS_TABLE")) {
+        if (tp[0]) {
+            if (const char * ct = getenv("BELLS_CONF")) {
+                conf_thresh_ = (float) atof(ct);
+            }
+            if (conf_.load(tp)) {
+                fprintf(stderr, "%s: confidence prefetch on, table %s, threshold %.2f\n",
+                        __func__, tp, conf_thresh_);
+            } else {
+                fprintf(stderr, "%s: could not load confidence table '%s', prefetch off\n",
+                        __func__, tp);
+            }
+        }
+    }
+
     params_.n_slot = n_slot;
     ready_         = true;
     n_copied_      = 0;
+    n_prefetched_  = 0;
+    n_pf_used_     = 0;
 
     const double vram_gib  = tensors_.vram_bytes()/1024.0/1024.0/1024.0;
     const double vram_frac = dev_total > 0 ? (double) tensors_.vram_bytes()/dev_total : 0.0;
@@ -489,6 +644,12 @@ void bells_runtime::free() {
     // every token regardless of hit rate; only copy scales with misses. If readback+upload
     // dominates, no amount of cache tuning helps and the design needs to stop round-tripping
     // through the host.
+    if (n_prefetched_ > 0) {
+        fprintf(stderr, "%s: prefetched %llu experts, %.2f GiB speculative\n", __func__,
+                (unsigned long long) n_prefetched_,
+                n_prefetched_*(double) tensors_.bytes_per_expert()/1024.0/1024.0/1024.0);
+    }
+
     if (n_layer_calls_ > 0) {
         const double per = 1.0/(double) n_layer_calls_;
         fprintf(stderr, "%s: per layer-call: readback %.1f us, copy %.1f us, upload %.1f us "
@@ -505,8 +666,53 @@ void bells_runtime::free() {
     n_copied_ = 0;
 }
 
-void bells_runtime::begin_ubatch(int64_t n_tokens) {
+void bells_runtime::begin_ubatch(int32_t token, int64_t n_tokens) {
     active_now_ = active(n_tokens);
+
+    if (!active_now_ || !conf_.enabled() || token < 0) {
+        return;
+    }
+
+    // Prefetch every layer here, before the graph runs. The token id is known now and layer 47's
+    // experts are not needed for another 47 layers, so there is ample lead time - the reason the
+    // original predictor failed was bandwidth, not warning.
+    //
+    // Only candidates above the confidence threshold are fetched. That is the whole difference
+    // from the removed design, which took the top N regardless and therefore moved a superset.
+    copies_.clear();
+
+    for (int32_t il : tensors_.layers()) {
+        const float * cf = nullptr;
+        const int32_t * ex = conf_.predict(token, (uint32_t) il, &cf);
+        if (!ex || !cf) {
+            continue;
+        }
+
+        int32_t cand[32];
+        uint32_t n = 0;
+        for (uint32_t k = 0; k < conf_.max_k() && n < 32; ++k) {
+            if (ex[k] < 0) {
+                break;
+            }
+            if (cf[k] >= conf_thresh_) {
+                cand[n++] = ex[k];
+            }
+        }
+
+        if (n == 0) {
+            continue;
+        }
+
+        copies_.clear();
+        cache_.prefetch((uint32_t) il, cand, n, copies_);
+
+        for (const auto & c : copies_) {
+            tensors_.copy_expert((uint32_t) il, c.expert, c.slot);
+        }
+
+        n_copied_     += copies_.size();
+        n_prefetched_ += copies_.size();
+    }
 }
 
 bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {

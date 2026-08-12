@@ -1311,7 +1311,8 @@ static bool llama_bells_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (bells && bells->ready()) {
-        bells->begin_ubatch(ubatch.n_tokens);
+        bells->begin_ubatch(ubatch.token && ubatch.n_tokens > 0 ? ubatch.token[0] : -1,
+                            ubatch.n_tokens);
     }
 
     if (mctx && !mctx->apply()) {

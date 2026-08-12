@@ -91,7 +91,11 @@ def simulate(rows, tokens, il, table, seen, n_slot, n_expert, start, thresh, exp
                     pf_used += 1
                     saved += 1
                 if len(resident) >= n_slot:
-                    v = _victim(resident, wset, lambda x: resident[x])
+                    # No protection for what this token will want, because at prefetch time the
+                    # runtime does not know it - layer L's routing is not computed until layer L
+                    # runs. Protecting it here would flatter the result: a prefetch that evicts
+                    # a needed expert turns into an extra demand miss, and that has to be paid.
+                    v = _victim(resident, set(), lambda x: resident[x])
                     if v is None:
                         continue
                     del resident[v]

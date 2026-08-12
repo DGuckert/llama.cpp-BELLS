@@ -41,6 +41,8 @@ def load(path, limit=None):
     version, n_layer, n_expert, n_used, n_vocab = struct.unpack_from("<5I", blob, 8)
     (n_rec,) = struct.unpack_from("<Q", blob, 28)
 
+    layer_ids = np.frombuffer(blob, dtype=np.uint32, count=n_layer, offset=36).copy()
+
     off = 36 + n_layer*4                       # header + layer id list
     rec_bytes = 12 + n_layer*n_used*2          # token,pos,gen,pad + u16 rows
 
@@ -58,6 +60,7 @@ def load(path, limit=None):
     return {
         "n_layer": n_layer, "n_expert": n_expert, "n_used": n_used,
         "n_rec": n_rec, "tokens": tokens, "rows": rows.astype(np.int32),
+        "layer_ids": layer_ids,
     }
 
 

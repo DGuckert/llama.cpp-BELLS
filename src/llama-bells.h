@@ -1,9 +1,10 @@
-#pragma once
+﻿#pragma once
 
 #include "ggml.h"
 #include "ggml-backend.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 // BELLS: a per-layer VRAM expert cache.
@@ -34,6 +35,12 @@ public:
 
     // expert -> slot for layer il, -1 where not resident. Uploaded to the graph each token.
     const std::vector<int32_t> & slot_table(uint32_t il) const { return layers_[il].expert_slot; }
+
+    // Speculative: admit as many of `experts` as fit. Misses here are harmless, they just cost
+    // a later ensure(). Unlike ensure() this cannot protect the experts the token will actually
+    // want, because at prefetch time the router has not run - so a bad guess can evict
+    // something needed and create a miss that would not otherwise have happened.
+    void prefetch(uint32_t il, const int32_t * experts, size_t n, std::vector<bells_copy> & out);
 
     // Mandatory: after this every expert in `experts` is resident, or it returns false
     // because the request exceeds n_slot and cannot be satisfied at all.
@@ -174,6 +181,43 @@ private:
 // generations collapsing into repetition loops. It could not have survived anyway, since
 // prefetch was the only way an expert ever became resident in that mode.
 
+// Token id -> per-layer expert candidates, each with a confidence.
+//
+// The predictor removed from this project stored a ranked list and nothing else, so it could
+// only be used as "prefetch the top N" - which is precisely how it ended up moving a superset of
+// what was needed and losing on wall clock. It was also judged on recall, the metric that
+// rewards fetching more.
+//
+// This one carries P(expert used | token, layer) so the runtime can prefetch only where it is
+// confident. Offline on a held-out split that gives 73.9% precision at a 0.90 threshold, and
+// removes 26.8% of demand traffic at an 8x cache ratio where the bus has room to spare. At a 2x
+// ratio the same thing saturates the bus and loses, which is the regime the original was
+// measured in.
+class bells_conf {
+public:
+    bool load(const std::string & path);
+
+    bool enabled() const { return n_layer_ > 0; }
+
+    uint32_t max_k() const { return max_k_; }
+
+    // candidates for (token, layer); falls back to the global prior for unseen tokens.
+    // returns nullptr if this layer is not in the table.
+    const int32_t * predict(int32_t token, uint32_t il, const float ** conf) const;
+
+private:
+    uint32_t n_layer_  = 0;
+    uint32_t n_expert_ = 0;
+    uint32_t max_k_    = 0;
+
+    std::vector<int32_t> tokens_;     // sorted
+    std::vector<int32_t> ex_;         // n_token * n_layer * max_k
+    std::vector<float>   cf_;
+    std::vector<int32_t> gex_;        // n_layer * max_k, global fallback
+    std::vector<float>   gcf_;
+    std::vector<int32_t> il_to_row_;  // model layer id -> table row, -1 if absent
+};
+
 struct bells_params {
     bool        enabled    = false;
     uint32_t    n_slot     = 0;   // experts resident per layer
@@ -233,7 +277,11 @@ public:
 
     // Called once per ubatch before it is computed. n_tokens decides whether this ubatch uses
     // the cache at all, and gates on_routing so prefill does not churn it.
-    void begin_ubatch(int64_t n_tokens);
+    //
+    // The token id is what makes prefetching possible: it is known before layer 0 runs, while
+    // layer 47's experts are not needed for another 47 layers. Lead time was never the problem
+    // with the old predictor - bandwidth was.
+    void begin_ubatch(int32_t token, int64_t n_tokens);
 
     // called once layer il's router has produced its selection; guarantees residency
     bool on_routing(uint32_t il, const int32_t * experts, size_t n);
@@ -261,6 +309,11 @@ private:
     bells_params  params_;
     bells_cache   cache_;
     bells_tensors tensors_;
+    bells_conf    conf_;
+
+    float    conf_thresh_ = 0.9f;
+    uint64_t n_prefetched_ = 0;
+    uint64_t n_pf_used_    = 0;
 
     std::vector<bells_copy> copies_;
 

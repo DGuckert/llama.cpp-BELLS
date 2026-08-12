@@ -73,6 +73,43 @@ It is the mirror image of per-layer gating, which is the other idea currently al
 Gating removes the failure cases; prefetching raises the ceiling. They do not overlap, and
 neither helps where the other does.
 
+## Built and measured: correct, and still slower
+
+Implemented rather than left as a projection. `bells_conf` loads a confidence table,
+`begin_ubatch` prefetches every candidate above the threshold, and `bells_build_conf.py` builds
+the table from a trace. Qwen3-30B-A3B, 64 slots (8x), two paired passes:
+
+| | hit | moved | prefetched | perplexity | decode |
+|---|---|---|---|---|---|
+| no prefetch | 93.2% | 26.14 GiB | 0 | **13.8380** | 126.7 / 109.8 ms |
+| prefetch 0.90 | 94.8% | 26.37 GiB | 2184 | **13.8380** | 148.9 / 119.0 ms |
+| prefetch 0.70 | 95.5% | 26.83 GiB | 3313 | **13.8380** | 125.2 / 130.3 ms |
+
+**Lossless, confirmed.** Perplexity is identical to four decimals across all six runs. Prefetch
+changes which experts are resident, never what gets computed - `ensure()` still guarantees
+residency before any matmul reads the cache.
+
+**The prediction was right.** Offline this said ~27% of misses would be removed; at 93.2% hit
+that is 6.8% miss dropping to ~5%, i.e. ~95% hit. Measured: 94.8% and 95.5%. The predictor does
+what it claims, at the precision it claims.
+
+**And it is slower**: mean 118 ms becomes 134 ms at 0.90 and 128 ms at 0.70.
+
+The cause is plumbing, not prediction. Prefetch copies are issued **synchronously in
+`begin_ubatch`, for every layer at once, before the token computes anything**. They are a serial
+prologue rather than overlapped work, so the bus headroom the whole argument rests on is never
+used - the transfers are simply extra latency in front of each token. The risk was written into
+the section below before the code was built, and then not designed around.
+
+**The two dead ends interlock.** Prefetching needs genuinely asynchronous transfers; async
+transfers need a pinned source; pinned *staging* measured 37% slower because it duplicates the
+copy the driver already makes internally. The only route left is `cudaHostRegister` on the
+model's pages, which pins them against swap.
+
+So: **correct and unbuildable on the current transfer path.** Not refuted, blocked - which is a
+more useful state than the "prediction does not work" this project believed before, and it names
+the one change that would unblock it.
+
 ## Before anyone builds this
 
 - The 8% is an estimate, and this project's estimates have a poor record. Four of five

@@ -96,6 +96,23 @@ def analyse(layers, experts, active, hidden, ffn, quant, vram_gb, ram_gb, model_
 
 
 def verdict(r):
+    """Whether a cache is POSSIBLE. Not whether it will help.
+
+    This function used to grade the cache ratio - "workable" at 2x, "good fit" at 4x - and it
+    was wrong. GPT-OSS-120B on a 24 GB card with 128 GB of RAM rates 7.8x here and measures
+    6.1x SLOWER than --cpu-moe, the worst result in the project. It also had a special case for
+    models with many active expert parameters, on the strength of Mixtral measuring 5.88x; that
+    number was an artifact of an 8-core cloud baseline and is 1.06x on a normal CPU.
+
+    Four separate rules for predicting the speedup from static properties were tried and all
+    four were falsified. The one that survives cannot be computed from a config.json, because it
+    depends on your CPU:
+
+        BELLS converges on a throughput set by the GPU and the model. Measure your --cpu-moe
+        baseline. Below that number BELLS wins by the difference; above it, BELLS loses.
+
+    So this only rules things out. A low ratio reliably means no; a high ratio means "measure".
+    """
     if r["fits_vram"]:
         return ("N/A", "the whole model fits in VRAM - just load it, BELLS has nothing to do")
     if not r["fits_ram"]:
@@ -104,23 +121,13 @@ def verdict(r):
     if r["slots"] < 1:
         return ("NO", "no VRAM left for a cache after attention and buffers")
 
-    # Models with a lot of active expert parameters have an expensive CPU baseline, so BELLS
-    # can pay off even when the cache is small. Mixtral-8x7B (5.1B active expert params)
-    # measured 3.85x faster at a 1.0x ratio, which the ratio alone would have written off.
-    heavy = r["active_b"] >= 3.0
-
     if r["ratio"] < 1.0:
         return ("NO", "cache cannot hold even one token's experts")
     if r["ratio"] < 1.5:
-        if heavy:
-            return ("MAYBE", f"small cache, but {r['active_b']:.1f}B active expert params "
-                             "make the CPU baseline expensive - worth measuring")
-        return ("NO", "cache below 1.5x the working set - it will thrash")
-    if r["ratio"] < 2.0:
-        return ("MAYBE", "marginal, may be slower than --cpu-moe")
-    if r["ratio"] < 4.0:
-        return ("YES", "workable")
-    return ("YES", "good fit")
+        return ("NO", "cache below 1.5x the working set - it will thrash. Measured 0.83x "
+                      "against --cpu-moe at 1.2x, and the runtime now refuses to enable here.")
+    return ("MEASURE", "a cache is possible. Whether it helps depends on your CPU, which this "
+                       "cannot know - benchmark --cpu-moe against BELLS and compare")
 
 
 def matrix():
@@ -128,8 +135,9 @@ def matrix():
     configs = [(4, 16), (6, 32), (8, 32), (12, 32), (12, 64),
                (16, 64), (24, 64), (24, 128), (48, 256), (80, 512)]
 
-    print("\nBELLS compatibility. Cell shows the cache ratio; >= 2x is where it wins.\n")
-    print("  N.Nx = worth using   ~ = marginal   .  = cache too small to help")
+    print("\nBELLS compatibility. The cell is the cache ratio: whether a cache FITS.")
+    print("It does not predict a speedup - 7.8x here measured 6.1x slower in practice.\n")
+    print("  N.Nx = a cache is possible, measure it   .  = cache too small to help")
     print("  vram = model fits on the card, load it normally   RAM = model exceeds RAM\n")
 
     head = "  " + f"{'model':<20}" + "".join(f"{v}/{r}".rjust(9) for v, r in configs)
@@ -146,10 +154,8 @@ def matrix():
                 cell = "vram"
             elif not r["fits_ram"]:
                 cell = "RAM"
-            elif ans == "YES":
+            elif ans == "MEASURE":
                 cell = f"{r['ratio']:.1f}x"
-            elif ans == "MAYBE":
-                cell = f"~{r['ratio']:.1f}x"
             else:
                 cell = "."
             row += cell.rjust(9)
@@ -234,12 +240,19 @@ def main():
         want_gb = (2.0*active*r['expert_mb']*1e6*layers)/1e9 * 1.5 + r['overhead_gb']
         print(f"  About {want_gb:.0f} GB of VRAM would reach a 2x ratio.\n")
 
-    print("  Calibration (measured, RTX 2060 6 GB, paired runs):")
-    print("    GPT-OSS-120B   1.0x ratio  ->  1.59x SLOWER")
-    print("    Qwen3-30B-A3B  2.2x ratio  ->  1.52x faster")
-    print("    Qwen3-Next-80B 4.7x ratio  ->  1.18x faster")
-    print("  Ratio is a screen, not a promise: absolute working-set size matters too.")
-    print("  BELLS speeds up generation only; long prompts are unaffected.\n")
+    print("  Measured (A10G 24 GB, 16 vCPU, 128 GB RAM, paired within one run):")
+    print("    Qwen3-Next-80B    ratio  27x  ->  2.08x faster")
+    print("    Qwen3-235B-A22B   ratio 1.9x  ->  1.81x faster")
+    print("    Mixtral-8x7B      ratio 2.0x  ->  1.06x")
+    print("    GPT-OSS-120B      ratio 7.8x  ->  6.1x SLOWER")
+    print()
+    print("  The ratio does not order those. What does, and what this tool cannot compute:")
+    print("    BELLS converges on a throughput set by your GPU and model, not your CPU.")
+    print("    Measure --cpu-moe. Below that number BELLS wins; above it, BELLS loses.")
+    print("    Same Mixtral, same cache: 1.63x at 8 cores, 0.72x at 32.")
+    print()
+    print("  BELLS speeds up generation only; long prompts are unaffected.")
+    print("  The cache also competes with the KV cache for VRAM - a shorter -c leaves more.\n")
 
 
 if __name__ == "__main__":

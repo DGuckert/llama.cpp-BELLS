@@ -4,9 +4,13 @@ I wanted to run models that do not fit in my GPU. The result is a working expert
 gets a 235B model to 5.6 tok/s on a single 24 GB card. That part worked.
 
 The more useful output is the other part: over the course of building it I proposed **six
-different rules** for predicting when the technique helps. Five of them are dead. Each was
-reasonable given the data I had, and each was killed by the next measurement. What killed them
-was almost never the code - it was the way the numbers were taken.
+different rules** for predicting when the technique helps. Five are dead. Each was reasonable
+given the data I had, and each was killed by the next measurement. What killed them was almost
+never the code - it was the way the numbers were taken.
+
+The sixth survived, and it explains why the other five could not have worked: **they all tried
+to predict the speedup ratio, and the ratio is not a property of this technique at all.** It is
+a property of the CPU you are comparing against.
 
 The last one to die was the one I cared about most. I built this on a 6 GB RTX 2060, tuned it
 there, and published a 1.52x speedup from it. Measured properly, **on the card I built it on it
@@ -88,15 +92,37 @@ RTX 2060, measured with my own profiler at `-c 512`. *Killed by* running it thro
 `llama-server` at a context length someone would actually use: **0.94-0.97x, consistently
 slower**. More on this below, because it is the most instructive failure of the six.
 
-**6. BELLS is CPU-independent, so the ratio only measures how weak your CPU is.** Once experts
-are resident, the work is on the GPU. Doubling cores moved Qwen3-Next's BELLS number from 39.9
-to 41.3 tok/s - nothing - while its baseline went 14.3 to 19.8. This is *still standing*, and I
-am not claiming it, because Mixtral contradicts it and the infrastructure noise is large enough
-to explain the contradiction either way.
+**6. BELLS is CPU-independent, so the ratio only measures how weak your CPU is.** *This one
+survived*, and it survived because I finally ran a controlled experiment instead of comparing
+whatever numbers I happened to have. Same GPU, same model, same cache size, varying **only** the
+core count:
 
-**Four models produced five falsified hypotheses.** Any two of them can be used to argue any of
-the rules above. That is the actual lesson: with a small sample and noisy infrastructure, almost
-any rule fits the points in hand and breaks on the next one.
+| vCPU | `--cpu-moe` | BELLS | ratio |
+|---|---|---|---|
+| 4 | 7.57 | **44.02** | 5.82x |
+| 8 | 15.35 | **42.25** | 2.75x |
+| 16 | 19.62 | **40.28** | 2.05x |
+| 32 | 16.11 | **38.81** | 2.41x |
+
+BELLS moves 13% across an 8x change in cores. The baseline moves 2.6x.
+
+**Five hypotheses died because they all tried to predict the ratio, and the ratio is not a
+property of BELLS.** It is a property of the thing BELLS is being compared against. Once experts
+are resident the work is on the GPU and the CPU stops mattering, so "2.08x faster" is really
+"your CPU was doing 19.62 tok/s and the GPU does 40."
+
+The rule that works, and the only one I would put my name on:
+
+> **BELLS converges on a CPU-independent throughput. Measure your `--cpu-moe` baseline. If it
+> sits below that number, BELLS wins by the difference. If above, it loses.**
+
+Which retro-explains everything. Mixtral's 5.88x was an 8-core baseline on a 13 B-active model.
+GPT-OSS-120B loses because its baseline is already 13.21 tok/s, faster than BELLS manages on it.
+The 6 GB card gains nothing because a decent desktop CPU meets a cache too small to beat it.
+
+The lesson is not that I should have guessed better. It is that I spent months comparing
+uncontrolled pairs, and one experiment varying a single variable settled in twenty minutes what
+five hypotheses could not.
 
 ### The benchmark that measured the wrong thing for months
 
@@ -189,20 +215,36 @@ Not one of them was a bug in the cache. The cache was fine.
 
 ## The finding I would keep if I could keep one
 
-Mixtral with 8 slots holds *every* expert in VRAM. 100% hit rate. Zero copies. No PCIe traffic
-during decode at all.
+I wrote a section here claiming the per-layer host round-trip was the hard ceiling on this
+design. The reasoning was that Mixtral with every expert resident - 100% hit rate, zero copies,
+no PCIe traffic - still measured 0.80x, so the residual cost had to be the structural one:
+stop the graph at each layer, read the router's selection back to the host, correct residency,
+upload a slot table.
 
-It measured **0.80x** - slower than the baseline, and slower than the same model with a smaller
-cache.
+Then I instrumented it, which I should have done before writing the claim down.
 
-If the design loses while moving no data, the residual cost is not the cache policy. It is
-structural: for every layer, the graph stops, the router's selection is read back to the host,
-residency is corrected, and a slot table is uploaded. Thirty-two of those per token for Mixtral,
-ninety-four for the 235B.
+Per layer-call on Qwen3-30B-A3B at 17 slots, 60.7% hit:
 
-No hit rate, slot count or eviction policy touches that. It is the ceiling on this entire
-approach. Lifting it means keeping residency correction on-device instead of round-tripping
-through the host - a different design, not a tuning parameter.
+| | time | share |
+|---|---|---|
+| readback (device -> host sync) | 167.1 us | 11% |
+| **copy (host -> device experts)** | **1356.3 us** | **87%** |
+| upload (slot table) | 28.7 us | 2% |
+
+Across 48 layers that is **74.5 ms of a 90.84 ms decode** - 82% of decode time inside the
+callback, almost entirely transfers. The run moved 164.96 GiB. The round trip I had promoted to
+"the ceiling" is 13% of the callback.
+
+The correct version is duller and more useful: **the copies are the cost, so the hit rate has
+to be high enough that misses are rare, which needs a large cache, which needs VRAM.** That one
+mechanism explains most of the results - Qwen3-Next wins at 91% hit, and everything sitting near
+60% hit does not.
+
+It does *not* explain Mixtral at 100% hit still losing. That anomaly is still open, and my
+timers cannot see it, because they only measure work inside the callback. The graph split forced
+at every MoE layer costs kernel pipelining, and the cache occupies VRAM whether used or not -
+both plausible, neither measured. So I have a sixth dead hypothesis and one unexplained result,
+which is roughly the state this project has been in from the beginning.
 
 Related, and equally counterintuitive: **hit rate and speed are anti-correlated** as often as
 not. GPT-OSS got *slower* as its hit rate rose from 61.1% to 74.2%. A token-id predictor that
@@ -231,6 +273,12 @@ the predictor. The project is named after it.
 - **Distrust proxy metrics.** Hit rate is not speed. Cache ratio is not speedup.
 - **A tool that warns and proceeds is a tool that does nothing.** Mine printed "poor fit,
   expect a slowdown" and enabled itself anyway. Nobody reads startup lines. It refuses now.
+- **Vary one variable.** Five hypotheses died over months of comparing uncontrolled pairs. One
+  experiment changing only the core count settled the question in twenty minutes. If you find
+  yourself proposing a new explanation for every new data point, stop theorising and go build
+  a sweep.
+- **Question whether your headline metric is a property of your system.** Mine was a ratio, and
+  half of that ratio was somebody else's CPU.
 
 The code is MIT and the measurements are reproducible. Whether the technique helps *your* model
 on *your* hardware is not something I can predict - four attempts to build that predictor all

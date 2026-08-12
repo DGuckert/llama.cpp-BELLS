@@ -229,6 +229,20 @@ public:
     uint64_t n_copied()    const { return n_copied_;       }
     uint64_t bytes_moved() const { return n_copied_*(uint64_t) tensors_.bytes_per_expert(); }
 
+    // Cost accounting for the per-layer host round trip, in microseconds.
+    //
+    // Mixtral holding every expert in VRAM - 100% hit, zero copies - still measured 0.80x, so
+    // something other than transfers bounds this design. These separate the three candidates:
+    // reading the router's ids back to the host, copying missing experts in, and uploading the
+    // slot table. Only the copies scale with miss rate; the other two are paid every layer of
+    // every token no matter how good the cache is.
+    void add_readback_us(uint64_t us) { us_readback_ += us; }
+
+    uint64_t us_readback() const { return us_readback_; }
+    uint64_t us_copy()     const { return us_copy_;     }
+    uint64_t us_upload()   const { return us_upload_;   }
+    uint64_t n_layer_calls() const { return n_layer_calls_; }
+
 private:
     bells_params  params_;
     bells_cache   cache_;
@@ -239,4 +253,9 @@ private:
     bool     ready_      = false;
     bool     active_now_ = false;
     uint64_t n_copied_   = 0;
+
+    uint64_t us_readback_   = 0;
+    uint64_t us_copy_       = 0;
+    uint64_t us_upload_     = 0;
+    uint64_t n_layer_calls_ = 0;
 };

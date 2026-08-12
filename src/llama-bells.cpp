@@ -1,6 +1,7 @@
 #include "llama-bells.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -460,6 +461,19 @@ void bells_runtime::free() {
                 (unsigned long long) n_copied_, bytes_moved()/1024.0/1024.0/1024.0);
     }
 
+    // Where the per-layer cost actually goes. readback and upload are paid on every layer of
+    // every token regardless of hit rate; only copy scales with misses. If readback+upload
+    // dominates, no amount of cache tuning helps and the design needs to stop round-tripping
+    // through the host.
+    if (n_layer_calls_ > 0) {
+        const double per = 1.0/(double) n_layer_calls_;
+        fprintf(stderr, "%s: per layer-call: readback %.1f us, copy %.1f us, upload %.1f us "
+                        "(%llu calls, %.1f ms total)\n",
+                __func__, us_readback_*per, us_copy_*per, us_upload_*per,
+                (unsigned long long) n_layer_calls_,
+                (us_readback_ + us_copy_ + us_upload_)/1000.0);
+    }
+
     tensors_.free();
     cache_.reset();
 
@@ -477,12 +491,16 @@ bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
         return true;
     }
 
+    n_layer_calls_++;
+
     // Every expert this layer asked for must be resident before the matmul reads the slot
     // table, so this is a demand fetch with no lead time to hide it behind.
     copies_.clear();
     if (!cache_.ensure(il, experts, n, copies_)) {
         return false;
     }
+
+    const auto t_copy0 = std::chrono::steady_clock::now();
 
     // No parallel prefault here, though it is tempting. It belonged to the prefetch path, where
     // one call covered every layer's admissions for the whole token. On the demand path it
@@ -495,7 +513,14 @@ bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
     }
     n_copied_ += copies_.size();
 
+    const auto t_copy1 = std::chrono::steady_clock::now();
+
     tensors_.upload_slots(il, cache_.slot_table(il));
+
+    const auto t_up1 = std::chrono::steady_clock::now();
+
+    us_copy_   += std::chrono::duration_cast<std::chrono::microseconds>(t_copy1 - t_copy0).count();
+    us_upload_ += std::chrono::duration_cast<std::chrono::microseconds>(t_up1  - t_copy1).count();
 
     return true;
 }

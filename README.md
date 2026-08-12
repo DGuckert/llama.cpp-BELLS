@@ -41,6 +41,27 @@ No property in that table orders the results. Expert size fails (18 MB beats 12.
 ratio fails (GPT-OSS was rated a 7.8x "good fit"), active parameters fail (14 B wins, 13 B does
 not), and hit rate fails in both directions.
 
+### The ratio is not a property of BELLS
+
+Varying **only** the core count, same GPU, same model, same 192 slots:
+
+| vCPU | `--cpu-moe` | BELLS | ratio |
+|---|---|---|---|
+| 4 | 7.57 | **44.02** | 5.82x |
+| 8 | 15.35 | **42.25** | 2.75x |
+| 16 | 19.62 | **40.28** | 2.05x |
+| 32 | 16.11 | **38.81** | 2.41x |
+
+BELLS moves 13% across an 8x change in cores. The baseline moves 2.6x. Once experts are
+resident the work is on the GPU, so **every speedup ratio here is really a measurement of the
+baseline's CPU.** Which gives the one rule in this project that survived a controlled test:
+
+> **BELLS converges on a CPU-independent throughput. Measure your `--cpu-moe` baseline - if it
+> is below that number, BELLS wins by the difference; if above, it loses.**
+
+That is why Mixtral's headline 5.88x collapsed to 1.06x on a better CPU, and why GPT-OSS-120B
+loses: its baseline of 13.21 tok/s is already faster than BELLS manages on it.
+
 **Cache size has a per-model optimum and guessing high can be expensive.** The 235B peaks at 28
 slots and falls to 0.73x at 36; Mixtral peaks at 4 and drops to 0.80x at 8; Qwen3-Next reaches
 a knee at 128 and then simply stops improving. Start with `--bells-slots -1` and sweep.
@@ -179,17 +200,28 @@ qwen3-next-80b, qwen3-235b-a22b, mixtral-8x7b and gpt-oss-120b on a 24 GB A10G. 
 expert sizes land within 1% of what the runtime reports, so the *arithmetic* is sound - it is
 the inference from arithmetic to speedup that fails.
 
-### The one hard floor
+### Where the time actually goes
 
-Mixtral with 8 slots holds **every** expert in VRAM - 100% hit rate, zero copies, no PCIe
-traffic during decode - and still measured 0.80x. If the design loses while moving no data at
-all, the residual cost is structural: every layer stops the graph, reads the router's selection
-back to the host, corrects residency and uploads a slot table. 32 of those per token for
-Mixtral, 94 for the 235B. No slot count or cache policy touches it.
+Instrumented per layer-call on Qwen3-30B-A3B at 17 slots (60.7% hit):
 
-That fixed per-layer round trip is the ceiling on this approach, and removing it means keeping
-the correction on-device instead of going through the host - a different design, not a tuning
-knob.
+| | time | share |
+|---|---|---|
+| readback (device -> host sync) | 167.1 us | 11% |
+| **copy (host -> device experts)** | **1356.3 us** | **87%** |
+| upload (slot table) | 28.7 us | 2% |
+
+Across 48 layers that is **74.5 ms of a 90.84 ms decode**. The transfers are the cost, so the
+hit rate has to be high enough that misses are rare - which needs a large cache, which needs
+VRAM. Qwen3-Next wins at 91% hit; everything at ~60% hit does not.
+
+An earlier version of this file claimed the per-layer host round trip was the ceiling. It is
+about 13% of the callback, and that claim was inferred rather than measured.
+
+**One thing this does not explain.** Mixtral at 8 slots holds every expert, hits 100%, copies
+nothing, and still measured 0.80x. The timers above only see work inside the callback, so two
+candidates remain unmeasured: the graph split forced at every MoE layer costs kernel
+pipelining, and the cache squeezes the compute buffers whether or not it is used. The 6 GB
+result supports the second - it was ~5% slower even where BELLS bypassed itself entirely.
 
 Three further conditions:
 

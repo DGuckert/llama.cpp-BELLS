@@ -11,6 +11,7 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -1256,9 +1257,17 @@ bool llama_context::bells_eval(ggml_tensor * t, bool ask) {
         const int64_t rows = ggml_nrows(t);
 
         std::vector<int32_t> ids((size_t) k*rows);
+
+        // This is the device->host sync that splits the graph at every MoE layer. Timed
+        // separately from the copies because it is paid whether or not anything misses.
+        const auto t_rb0 = std::chrono::steady_clock::now();
         for (int64_t i = 0; i < rows; ++i) {
             ggml_backend_tensor_get(t, ids.data() + i*k, i*t->nb[1], k*sizeof(int32_t));
         }
+        const auto t_rb1 = std::chrono::steady_clock::now();
+
+        bells->add_readback_us(
+            std::chrono::duration_cast<std::chrono::microseconds>(t_rb1 - t_rb0).count());
 
         if (!bells->on_routing(il, ids.data(), ids.size())) {
             LLAMA_LOG_ERROR("%s: layer %d needs more experts than the cache holds, "

@@ -295,7 +295,38 @@ cache never got large in absolute terms and it still degraded, which is not expl
 the card, the penalty for guessing high can be severe, and the auto-sizer's "one third of free
 VRAM" happens to land near the knee on a 6 GB card by coincidence rather than design.
 
-### There is no working predictor, and this is the main negative result
+### Confirmed: BELLS throughput is CPU-independent, and that is the predictor
+
+The one hypothesis that survived a controlled test. Same A10G, same Qwen3-Next-80B, same 192
+slots, same image - only `cpu=` changes:
+
+| vCPU | `--cpu-moe` baseline | BELLS | ratio |
+|---|---|---|---|
+| 4 | 7.57 | **44.02** | 5.82x |
+| 8 | 15.35 | **42.25** | 2.75x |
+| 16 | 19.62 | **40.28** | 2.05x |
+| 32 | 16.11 | **38.81** | 2.41x |
+
+**BELLS moves 44.0 -> 38.8 tok/s across an 8x change in core count. The baseline moves 2.6x.**
+Once the experts are resident the work is on the GPU, so the CPU stops mattering - and every
+speedup ratio in this file is therefore a statement about the baseline's CPU, not about BELLS.
+
+This is the useful form of the predictor that four earlier attempts failed to find. It does not
+predict the *ratio*, which is not a property of BELLS at all. It predicts the *absolute number*:
+
+> BELLS converges on a CPU-independent throughput. Measure your `--cpu-moe` baseline; if it
+> sits below that number, BELLS wins by the difference, and if it sits above, BELLS loses.
+
+It retro-explains the rest of the table. Mixtral's 5.88x evaporated because an 8-core baseline
+was pathological for 13 B active parameters. GPT-OSS-120B loses because its baseline is already
+13.21 tok/s, above what BELLS reaches on it. The 6 GB card gains nothing because a desktop CPU
+gives a decent baseline while 6 GB caps what BELLS can reach.
+
+Two caveats. This is one model on one GPU, and it should be replicated. And the 32-core baseline
+(16.11) came in *below* the 16-core one (19.62), which is probably thread contention or NUMA but
+is not explained.
+
+### The four predictors that did not work
 
 Four hypotheses were advanced in this file, each from the data available at the time, and each
 falsified by the next measurement:
@@ -307,17 +338,18 @@ falsified by the next measurement:
    artifact - at 16 cores Mixtral is 1.06x and the hypothesis dies with it.
 4. **Expert size** decides it. Falsified within one table: Mixtral's 18 MB experts score 1.06x
    while GPT-OSS's 12.6 MB score 0.16x.
-5. **BELLS is CPU-independent**, so the ratio only measures how weak the baseline's CPU is.
-   This one is half-supported and stated here as a hypothesis, not a finding. Qwen3-Next backs
-   it exactly - 39.9 tok/s at 8 vCPU and 41.3 at 16, while its baseline moved 14.3 to 19.84.
-   Mixtral contradicts it, going 4.73 down to 3.93 at the same slot count with twice the cores,
-   which is most likely cold-volume variance but is not demonstrated to be.
+5. **It works on the card it was built on.** The flagship 1.52x came from `llama-bells-profile`
+   at `-c 512`. Falsified by running the same model through `llama-server` at a usable context:
+   0.94-0.97x, consistently slower. See the 6 GB section above.
 
-Five hypotheses, each reasonable on the data available when it was written, four of them dead.
+Five hypotheses, each reasonable on the data available when it was written, all five dead. The
+sixth - CPU-independence - is the one that survived, and it works because it predicts an
+absolute throughput rather than a ratio. Ratios were never a property of BELLS.
+
 With four models and infrastructure noisy enough to move a baseline 47%, almost any rule will
 fit the points in hand and break on the next one. The discipline that actually worked was not
-better theorising: it was pairing every comparison inside one run and re-measuring anything
-that looked interesting.
+better theorising: it was pairing every comparison inside one run, controlling one variable at a
+time, and re-measuring anything that looked interesting.
 
 Hit rate does not work either, in either direction: GPT-OSS got *slower* as its hit rate rose
 (61.1% -> 74.2%, 460 -> 577 ms), while Qwen3-Next got faster (53.1% -> 73.6%). Any two of these
@@ -333,7 +365,41 @@ squeezing the compute buffers - accounts for the rest, and it is not characteris
 help". Ten minutes with `llama-bells-profile` on your own model and hardware is the only
 reliable answer, and the tool exists for that.
 
-### The per-layer round trip is a floor
+### Measured: copies dominate, not the round trip
+
+The section below claimed the per-layer host round trip was the ceiling on this design. That
+was inferred from the Mixtral result, not measured. Instrumented properly - separate timers for
+reading the router's ids back to the host, copying missing experts in, and uploading the slot
+table - on Qwen3-30B-A3B at 17 slots, 60.7% hit rate:
+
+| per layer-call | time | share |
+|---|---|---|
+| readback (device -> host sync) | 167.1 us | 11% |
+| **copy (host -> device experts)** | **1356.3 us** | **87%** |
+| upload (slot table) | 28.7 us | 2% |
+
+48 layers per token makes that **74.5 ms of a 90.84 ms decode - 82% of decode time spent inside
+the BELLS callback**, overwhelmingly in transfers. The run moved 164.96 GiB.
+
+So the round trip is real but small: readback plus upload is ~196 us per layer, about 13% of
+the callback. **The cost is the copies**, which means the hit rate has to be high enough that
+misses are rare, which needs a large cache, which needs VRAM. That single mechanism explains
+most of the table:
+
+| model / slots | hit rate | expert | bytes/token | result |
+|---|---|---|---|---|
+| Qwen3-Next-80B, 192 | 91.0% | 1.09 MB | ~47 MB | 2.08x |
+| Qwen3-30B-A3B, 17 | 60.7% | 2.92 MB | ~550 MB | ~1.0x |
+| GPT-OSS-120B, 16 | 61.1% | 12.6 MB | ~706 MB | 0.16x |
+
+**The anomaly that survives:** Mixtral at 8 slots holds every expert, hits 100%, copies nothing
+- and still measured 0.80x. These timers cannot see that, because they only measure work inside
+the callback. Two candidates remain, both unmeasured: the graph split forced at every MoE layer
+costs kernel pipelining, and a 4.6 GB cache squeezes the compute buffers. The 6 GB server
+result points at the second - it was ~5% slower even at concurrencies where BELLS bypassed
+itself entirely and did no work at all.
+
+### Superseded reasoning: the per-layer round trip as a floor
 
 Mixtral with 8 slots holds **every** expert in VRAM: 100% hit rate, zero copies, no PCIe
 traffic during decode. It still measured 0.80x, slower than 4 slots and slower than the

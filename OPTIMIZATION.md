@@ -17,12 +17,14 @@ There are only three ways to make transfers cost less:
 1. miss less often - **tested, dead end.** Seven policies, two architectures, nothing beats LRU.
 2. transfer more cheaply - **staging tried and reverted, 37% slower.** One route remains
    (registering the model's pages), with a real hazard attached.
-3. stop transferring on a miss at all - the largest prize and the largest unknown; a design
-   sketch, not a result.
+3. skip the low-value transfers - **tested, dead end.** The router's weights are nearly flat, so
+   no threshold saves transfers without discarding real probability mass.
+4. stop transferring on a miss at all - the only avenue still open, and the least verified.
 
-Two of the three are now closed by measurement rather than argument. Both were things I expected
-to work: the eviction policies looked free, and the pinned staging had a 1.73x bandwidth gap
-apparently sitting there for the taking. Neither survived contact with a paired A/B.
+Three of the four are now closed by measurement rather than argument, and **all three were things
+I expected to work**: eviction looked free, pinned staging had a 1.73x bandwidth gap apparently
+sitting there, and low-weight experts looked obviously skippable. None survived a paired
+measurement. That ratio is the honest prior for anything in section 3.
 
 ---
 
@@ -143,6 +145,50 @@ x16 (`LnkSta: Width x4 (downgraded)`). This optimization helps the machines wher
 wins and does nothing for the ones where it loses.
 
 ---
+
+## 2b. Skipping low-weight experts: no threshold works
+
+If misses cannot be reduced and transfers cannot be sped up, the next idea is to not transfer on
+*some* misses. A missing expert must be copied before its matmul can run, but an expert the
+router weighted at 0.02 contributes almost nothing - drop it from the sum, renormalise the rest,
+and the copy disappears. There was even a reason to expect the trade to be favourable: rarely
+chosen experts should also be the ones the cache is least likely to hold, so the experts worth
+skipping and the experts that cost a transfer would be the same experts.
+
+Measured instead of assumed. `llama-bells-profile` now records the normalised router weights
+beside the trace, and `bells_weights.py` replays LRU and asks what each threshold buys.
+
+**The weight distribution is nearly flat.** Qwen3-30B-A3B, mean weight by rank:
+
+```
+r0 0.229   r1 0.170   r2 0.139   r3 0.118   r4 0.102   r5 0.089   r6 0.080   r7 0.073
+```
+
+Rank 7 carries **7.3%**, not the 1-2% the idea assumed - only 3.1x below the router's first
+choice. There is no negligible tail. Some of that is structural: selecting top-k and *then*
+renormalising forces the survivors to sum to 1, which compresses the range.
+
+**And the correlation barely exists.** Mean weight of a hit 0.1300, of a miss 0.1186 - misses
+carry 0.91x the weight of hits, not the 0.5x that would have made this work.
+
+**So every threshold is a bad deal** (16 slots, 2x ratio, 44% miss rate):
+
+| threshold | copies saved | probability mass dropped |
+|---|---|---|
+| 0.03 | 0.4% | 0.02% |
+| 0.05 | 1.8% | 0.23% |
+| 0.08 | **23.0%** | **5.33%** |
+| 0.12 | 62.3% | 18.91% |
+
+Saving a fifth of the transfers means discarding 5% of the router's probability mass *in every
+layer*, and that compounds across 48 of them. For scale, `drop_missing` discarded all
+non-resident experts and scored perplexity 52.97 against a baseline of 2.03. This is gentler and
+still nowhere near free, and the 1.8% saving that is genuinely cheap is not worth any accuracy
+at all.
+
+Recorded because the flat weight distribution is the interesting part, and it kills a family of
+ideas rather than one: any scheme that leans on "most experts barely matter" is working from a
+false premise on this architecture.
 
 ## 3. The idea worth trying: do not transfer on a miss
 

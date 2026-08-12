@@ -49,10 +49,28 @@ struct bells_source {
 struct bells_layer {
     bells_source topk;
     bells_source argsort;
+
+    // Router weight for each selected expert, appended in lockstep with topk.trace.
+    //
+    // Recorded because it is the one signal that might let BELLS move fewer bytes. A missing
+    // expert has to be copied before its matmul can run, but an expert the router weighted at
+    // 0.02 contributes almost nothing to the layer output. Skipping the copy for those - and
+    // renormalising the rest - trades a little accuracy for fewer transfers, and transfers are
+    // 87% of the cost. Whether that trade is worth taking is an empirical question, and this
+    // is the data needed to answer it.
+    std::vector<float> weights;
 };
 
 struct bells_profiler {
     std::map<int, bells_layer> layers;
+
+    // Tallying is switched off for decodes that do not record a token id, otherwise the trace
+    // and the token records drift apart. The perplexity pass is one: it decodes n_ctx/2 seed
+    // tokens plus the scored ones - 512 with the default settings - and pushes no ids, which
+    // left every layer 512 records long and made bells_write_trace discard all of them with
+    // "nothing to write". It failed safe, but it meant no trace could be written at all
+    // whenever perplexity ran.
+    bool enabled = true;
 
     int64_t n_expert           = 0;
     int64_t n_expert_used_hint = 0;
@@ -136,6 +154,20 @@ static void bells_tally(const ggml_tensor * t, int64_t k, int64_t n_expert,
     src.n_ubatch++;
 }
 
+// Router weights for one ubatch, appended so they line up with topk.trace entry for entry.
+static void bells_tally_weights(const ggml_tensor * t, std::vector<float> & out) {
+    const int64_t k      = t->ne[0];
+    const int64_t n_rows = ggml_nrows(t);
+
+    const size_t base = out.size();
+    out.resize(base + (size_t) k*n_rows);
+
+    for (int64_t i = 0; i < n_rows; ++i) {
+        ggml_backend_tensor_get(const_cast<ggml_tensor *>(t), out.data() + base + i*k,
+                                i*t->nb[1], k*sizeof(float));
+    }
+}
+
 static bool bells_cb_eval(ggml_tensor * t, bool ask, void * user_data) {
     auto * prof = (bells_profiler *) user_data;
 
@@ -144,8 +176,27 @@ static bool bells_cb_eval(ggml_tensor * t, bool ask, void * user_data) {
     const bool is_topk    = bells_parse_tagged(t->name, "ffn_moe_topk-", il);
     const bool is_argsort = !is_topk && bells_parse_tagged(t->name, "ffn_moe_argsort-", il);
 
+    // The normalised weights are what actually scale the expert outputs, and they are built
+    // before the BELLS block, so reading them costs nothing beyond the sync already paid for
+    // the topk ids.
+    const bool is_weight  = !is_topk && !is_argsort &&
+                            bells_parse_tagged(t->name, "ffn_moe_weights_norm-", il);
+
     if (ask) {
-        return (is_topk || is_argsort) && t->type == GGML_TYPE_I32;
+        return prof->enabled &&
+               (((is_topk || is_argsort) && t->type == GGML_TYPE_I32) ||
+                (is_weight && t->type == GGML_TYPE_F32));
+    }
+
+    if (!prof->enabled) {
+        return true;
+    }
+
+    if (is_weight) {
+        if (t->type == GGML_TYPE_F32) {
+            bells_tally_weights(t, prof->layers[il].weights);
+        }
+        return true;
     }
 
     if (!is_topk && !is_argsort) {
@@ -264,6 +315,65 @@ static double bells_sim_opt(const std::vector<int32_t> & trace, int64_t n_expert
     }
 
     return (double) n_hit/(double) trace.size();
+}
+
+// Router weights, written beside the trace rather than inside it so every existing reader keeps
+// working. Same record order and same shape as the expert ids, one f32 per id.
+//
+//   magic "BELLSWT1", u32 version, u32 n_layer_moe, u32 n_expert_used, u64 n_records,
+//   u32 layer_ids[n_layer_moe], then f32 weights[n_records*n_layer_moe*n_expert_used]
+static bool bells_write_weights(const std::string & path, const bells_profiler & prof,
+                                int32_t n_expert_used) {
+    std::vector<int>                  layer_ids;
+    std::vector<const std::vector<float> *> ws;
+
+    const size_t n_records = prof.tok_id.size();
+    const size_t want      = n_records*(size_t) n_expert_used;
+
+    for (const auto & kv : prof.layers) {
+        const std::vector<float> & w = kv.second.weights;
+        if (w.size() != want || want == 0) {
+            continue;
+        }
+        layer_ids.push_back(kv.first);
+        ws.push_back(&w);
+    }
+
+    if (layer_ids.empty()) {
+        LOG_INF("%s: no router weights captured (model may not normalise them)\n", __func__);
+        return false;
+    }
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        return false;
+    }
+
+    const uint32_t version     = 1;
+    const uint32_t n_layer_moe = (uint32_t) layer_ids.size();
+    const uint32_t nu          = (uint32_t) n_expert_used;
+    const uint64_t nrec        = (uint64_t) n_records;
+
+    f.write("BELLSWT1", 8);
+    f.write((const char *) &version,     sizeof(version));
+    f.write((const char *) &n_layer_moe, sizeof(n_layer_moe));
+    f.write((const char *) &nu,          sizeof(nu));
+    f.write((const char *) &nrec,        sizeof(nrec));
+
+    for (int id : layer_ids) {
+        const uint32_t v = (uint32_t) id;
+        f.write((const char *) &v, sizeof(v));
+    }
+
+    for (size_t r = 0; r < n_records; ++r) {
+        for (size_t l = 0; l < ws.size(); ++l) {
+            f.write((const char *) (ws[l]->data() + r*nu), nu*sizeof(float));
+        }
+    }
+
+    LOG_INF("%s: wrote %s (%u layers, %zu records)\n", __func__, path.c_str(),
+            n_layer_moe, n_records);
+    return (bool) f;
 }
 
 // Writes the training set: one record per token, holding the token id and the experts every MoE
@@ -588,6 +698,10 @@ int main(int argc, char ** argv) {
 
         LOG_INF("%s: scoring %d tokens one at a time for perplexity\n", __func__, n_score);
 
+        // These decodes record no token ids, so they must not reach the trace. Left on, they
+        // added n_seed + n_score entries per layer and the whole dump was discarded.
+        prof.enabled = false;
+
         llama_memory_clear(llama_get_memory(ctx), true);
 
         common_batch_clear(batch);
@@ -773,6 +887,12 @@ int main(int argc, char ** argv) {
 
         bells_write_trace(trace_path, prof, n_expert, n_expert_used,
                           llama_vocab_n_tokens(llama_model_get_vocab(model)));
+
+        std::string w_path = trace_path;
+        w_path.erase(w_path.size() - strlen(".trace.bin"));
+        w_path += ".weights.bin";
+
+        bells_write_weights(w_path, prof, n_expert_used);
     }
 
     llama_backend_free();

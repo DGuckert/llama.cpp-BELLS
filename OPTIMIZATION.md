@@ -231,9 +231,39 @@ highest miss rates, so they consume a disproportionate share of the PCIe traffic
 the least of it. At 4x only 2 of 48 do - which is consistent with the measured results, where
 generous caches win and tight ones do not.
 
+### Measured: 1.14x, and it turns a loss into a win
+
+Tested with a `BELLS_SKIP_LAYERS=N` knob that leaves the first N MoE layers uncached, so they
+run as plain `--cpu-moe`. Static rather than adaptive, but enough to test the claim.
+Qwen3-30B-A3B at 17 slots, five paired passes alternating in one session:
+
+| | mean | sd | vs baseline |
+|---|---|---|---|
+| `--cpu-moe` baseline | 89.95 ms | 3.95 (4.4%) | 1.000x |
+| BELLS, all layers cached | 95.26 ms | 3.85 (4.0%) | **0.944x** |
+| BELLS, first 8 layers skipped | 83.29 ms | 3.10 (3.7%) | **1.080x** |
+
+Per-pass ratio of skip-8 to cache-all, which cancels session drift:
+
+```
+1.188  1.123  1.184  1.099  1.126      mean 1.144x, sd 0.035
+```
+
+**A consistent 1.14x**, above 1.09 in every pass. The headline is not the ratio though - it is
+that cache-all measures **0.944x**, an outright loss, and gating turns the same configuration
+into a **1.080x** win. This is a setting where the honest advice today is "do not use BELLS",
+and gating reverses that.
+
+Two cautions. A single early pass suggested 1.22x; five passes say 1.144x, and the difference is
+exactly the single-pass optimism this project has been caught by repeatedly. And run-to-run noise
+on the absolute numbers is ~4%, comparable to the effect, which is why only the paired ratio is
+quoted as the result.
+
 **The proposal: gate the cache per layer.** Measure each layer's hit rate over a warmup window
 and, for layers below break-even, fall back to plain `--cpu-moe` for that layer alone. Their
-slots are then free for layers that do pay, so the benefit compounds.
+slots are then free for layers that do pay, so the benefit compounds. The measurement above uses
+a fixed "skip the first N", which works because the early layers happen to be the bad ones on
+this model; the adaptive version would not depend on that holding elsewhere.
 
 Why this is more attractive than anything else left here:
 

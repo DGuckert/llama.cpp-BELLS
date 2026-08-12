@@ -1,4 +1,4 @@
-#include "llama-context.h"
+﻿#include "llama-context.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -369,11 +370,31 @@ llama_context::llama_context(
     if (params.bells_enabled) {
         std::vector<bells_tensors::layer_src> srcs;
 
+        // BELLS_SKIP_LAYERS=N leaves the first N MoE layers uncached, so they run as plain
+        // --cpu-moe. Research knob for one question: caching a layer only pays if moving its
+        // missing experts beats the CPU work it replaces, and measured per-layer hit rates vary
+        // enormously - 23% on layer 0 against 82% on layer 30 for Qwen3-Next, with the early
+        // layers consistently worst. A third of layers sit below break-even at a 2x ratio while
+        // consuming the most PCIe traffic, so skipping them should help rather than hurt.
+        //
+        // Env var rather than a context param because that would mean touching the public
+        // header and rebuilding the world for an experiment.
+        uint32_t skip = 0;
+        if (const char * s = getenv("BELLS_SKIP_LAYERS")) {
+            skip = (uint32_t) atoi(s);
+        }
+
+        uint32_t n_moe_seen = 0;
+
         for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
             const auto & layer = model.layers[il];
 
             if (!layer.ffn_gate_exps && !layer.ffn_up_exps && !layer.ffn_gate_up_exps) {
                 continue; // dense layer
+            }
+
+            if (n_moe_seen++ < skip) {
+                continue; // deliberately uncached
             }
 
             bells_tensors::layer_src s;
@@ -384,6 +405,11 @@ llama_context::llama_context(
             s.gate_up = layer.ffn_gate_up_exps;
 
             srcs.push_back(s);
+        }
+
+        if (skip > 0) {
+            LLAMA_LOG_INFO("%s: BELLS skipping the first %u MoE layers, caching %zu\n",
+                           __func__, skip, srcs.size());
         }
 
         if (srcs.empty()) {

@@ -559,13 +559,20 @@ bool bells_runtime::init(const bells_params & params,
     }
     params_.n_prefetch = std::min(params_.n_prefetch, n_slot);
 
+    if (params_.max_tokens == 0) {
+        // n tokens may request up to n * n_expert_used distinct experts; anything beyond what
+        // the cache holds could fail ensure() mid-graph, where there is no way to recover.
+        params_.max_tokens = std::max(1u, n_slot/std::max(1u, n_expert_used));
+    }
+
     params_.n_slot = n_slot;
     ready_         = true;
     n_copied_      = 0;
 
-    fprintf(stderr, "%s: %u slots/layer of %u experts, %.1f MiB VRAM, predictor %s\n",
+    fprintf(stderr, "%s: %u slots/layer of %u experts, %.1f MiB VRAM, serves ubatch <= %u, "
+                    "predictor %s\n",
             __func__, n_slot, n_expert, tensors_.vram_bytes()/1024.0/1024.0,
-            predictor_.enabled() ? "on" : "off");
+            params_.max_tokens, predictor_.enabled() ? "on" : "off");
 
     return true;
 }

@@ -199,10 +199,16 @@ struct bells_params {
     bool        enabled    = false;
     uint32_t    n_slot     = 0;   // experts resident per layer
     uint32_t    n_prefetch = 0;   // per-layer prefetch budget, 0 = n_slot/2
-    // Bypass BELLS for larger ubatches. Default 1 so only pure decode uses the cache: with
-    // more tokens the union of their experts can exceed n_slot, and a graph already under
-    // way has no way to fall back.
-    uint32_t    max_tokens = 1;
+    // Largest ubatch BELLS will serve. 0 means derive it from the cache size.
+    //
+    // n tokens can request up to n * n_expert_used distinct experts, and a graph already under
+    // way cannot fall back if they do not fit, so the safe bound is n_slot / n_expert_used.
+    // Prefill batches are far larger than that and bypass the cache, which is correct: a
+    // 512-token batch touches nearly every expert and there is no hot set to exploit.
+    //
+    // This matters for llama-server, which defaults to n_parallel 4. With max_tokens pinned
+    // at 1, BELLS silently did nothing as soon as two requests decoded together.
+    uint32_t    max_tokens = 0;
 
     // When true, an expert that is not resident contributes nothing instead of being fetched
     // on demand. This removes the per-layer host round-trip entirely, which measurements show

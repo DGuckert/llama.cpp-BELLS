@@ -381,7 +381,14 @@ terms matter and four models cannot fit two parameters. The practical advice is 
 13.21 tok/s on stock `--cpu-moe`, with BELLS switched off. That is a perfectly usable speed for
 a 120B model on one consumer GPU, and it needs nothing from this repository.
 
-## Correction: active parameters matter more than sparsity
+## SUPERSEDED: active parameters matter more than sparsity
+
+> **This section is wrong and is kept as a record of how.** Every number in it was measured at
+> 8 vCPU. Re-run at 16 vCPU, Mixtral's baseline alone improves from 0.80 to 3.70 tok/s and the
+> 5.88x becomes **1.06x**. The reasoning below was sound given the data available; the data was
+> taken against a baseline crippled in exactly the dimension being argued about, which is the
+> one thing that could have manufactured this conclusion out of nothing. See
+> [the comparable set](#the-comparable-set-one-gpu-one-cpu-count-four-models).
 
 An earlier version of this file, and of the README, said Mixtral-style models (2 of 8 experts)
 were a poor fit and that high sparsity was what made BELLS work. Measured on an A10G 24 GB

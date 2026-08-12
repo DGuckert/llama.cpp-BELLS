@@ -38,29 +38,28 @@ cache_ratio = usable_VRAM / working_set
 `usable_VRAM` is your card minus attention weights, context and compute buffers. On a 6 GB
 card running a 27 GB model that came to about 2.4 GB, not 6.
 
-Measured outcomes, same machine, paired runs:
+**The ratio does not predict the outcome.** It is worth computing only to check a cache is
+physically possible - below ~1.5x nothing can help, because the cache cannot hold even one
+token's experts. Above that it tells you nothing:
 
 | cache ratio | model | result |
 |---|---|---|
-| 1.0x | GPT-OSS-120B | **1.59x slower** |
-| 2.2x | Qwen3-30B-A3B | **1.52x faster** |
-| 4.7x | Qwen3-Next-80B | **1.18x faster** |
-| ~25x | Qwen3-Next-80B on a 24 GB card | **2.80x faster** |
+| 7.8x | GPT-OSS-120B, 24 GB card | **6.1x slower** |
+| 2.2x | Qwen3-30B-A3B, 6 GB card | **1.52x faster** |
 
-**Below ~1.5x it loses. Above ~2x it wins. More VRAM keeps helping.**
-
-Note that ratio is a screen, not a formula: 2.2x beat 4.7x here. Qwen3-30B has a slower CPU
-baseline (86 ms vs 64 ms), so there was more CPU work for the GPU to take away. BELLS saves
-most where the CPU path is most expensive, not simply where the cache is largest.
+The calculator rated that first row a "good fit". It is the worst result in the project. Four
+separate rules for predicting which models benefit - sparsity, cache ratio, active parameters,
+expert size - were each proposed from real data and each falsified by the next measurement.
+Measure your own model; `llama-bells-profile` takes ten minutes.
 
 ## Strengths
 
 **1. It runs models that otherwise cannot run.**
 
-On a 24 GB card, Qwen3-Next-80B is 27 GB. Plain `-ngl` fails outright - the model does not
-fit. BELLS runs it at 39.9 tok/s. This is the strongest single argument for the technique:
-not that it is faster, but that layer-level offload has no answer at all here while
-expert-level caching does.
+On a 24 GB card, Qwen3-Next-80B is 27 GB and Qwen3-235B-A22B is 86 GB. Plain `-ngl` fails
+outright on both. BELLS runs them at **41.3 and 5.6 tok/s**. This is the strongest single
+argument for the technique: not that it is faster, but that layer-level offload has no answer
+at all here while expert-level caching does.
 
 **2. Quality is free.**
 

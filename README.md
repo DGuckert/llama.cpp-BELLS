@@ -53,31 +53,26 @@ Across three models on the 6 GB card:
 | Qwen3-Next-80B (Q2_K) | 4.7x | 15.5 tok/s | 18.4 tok/s | **1.18x** |
 | GPT-OSS-120B (MXFP4) | 1.0x | 1.82 tok/s | 1.15 tok/s | **0.63x - slower** |
 
-And on a 24 GB A10G with only 8 vCPU, where a weak CPU makes the baseline easier to beat:
+### Superseded: the same models at 8 vCPU
 
-| Model | cache ratio | baseline | BELLS | result |
+An earlier version of this file led with these, from the same GPU on Modal's default 8 vCPU:
+
+| Model | baseline | BELLS | claimed | actual, at 16 vCPU |
 |---|---|---|---|---|
-| Mixtral-8x7B (Q4_K_M) | 2.0x | 0.80 tok/s | 4.73 tok/s | **5.88x** |
-| Qwen3-Next-80B (Q2_K) | 25x | 14.3 tok/s | 39.9 tok/s | **2.80x** |
+| Mixtral-8x7B (Q4_K_M) | 0.80 tok/s | 4.73 tok/s | ~~5.88x~~ | **1.06x** |
+| Qwen3-Next-80B (Q2_K) | 14.3 tok/s | 39.9 tok/s | ~~2.80x~~ | **2.08x** |
 
-**Those two rows are inflated.** 8 vCPU is a crippled baseline in exactly the dimension BELLS
-exploits - it wins by moving work off the CPU - and a 24 GB card normally sits next to a real
-desktop CPU. Re-run at **16 vCPU with 128 GB RAM**, same GPU and same model files:
+8 vCPU cripples the baseline in exactly the dimension BELLS exploits, and a 24 GB card normally
+sits beside a real desktop CPU. Mixtral is the cautionary one: its baseline alone went from
+0.80 to 3.70 tok/s on twice the cores, because ~13 B active parameters on 8 cores was
+pathological. Almost the whole "5.88x" was that. Note that BELLS's own throughput barely moved
+in either case - it is the baseline that changed.
 
-| Model | baseline | BELLS | result | was (8 vCPU) |
-|---|---|---|---|---|
-| Qwen3-Next-80B (Q2_K), 48 slots | 18.56 tok/s | 30.19 tok/s | **1.63x** | 2.80x |
-| GPT-OSS-120B (MXFP4), 16 slots | 13.21 tok/s | 2.17 tok/s | **6.1x slower** | 0.63x slower |
-| GPT-OSS-120B (MXFP4), 28 slots | 13.21 tok/s | 1.73 tok/s | **7.6x slower** | - |
-
-Qwen3-Next keeps a real 1.63x - on a model plain `-ngl` cannot load at all - and that is the
-number to believe if you have a 24 GB card.
-
-GPT-OSS-120B goes the other way, and the 6 GB card's 0.63x had the wrong explanation attached.
-It was blamed on the model exceeding RAM. Given 128 GB it fits entirely, the baseline reaches
-13.21 tok/s, and BELLS falls *further* behind: the problem was never disk, it is that 12.6 MB
-experts move too many bytes per token. Note also that the larger cache scored a **better** hit
-rate (74.2% vs 61.1%) and was **slower**.
+GPT-OSS-120B moved the other way, and its 6 GB result had the wrong explanation attached. It was
+blamed on the model exceeding RAM. Given 128 GB it fits entirely, the baseline reaches 13.21
+tok/s, and BELLS falls *further* behind: the problem was never disk, it is that 12.6 MB experts
+move too many bytes per token. The larger cache also scored a **better** hit rate (74.2% vs
+61.1%) and was **slower**.
 
 **Quality is unaffected.** Teacher-forced perplexity, scored one token at a time so the cache
 is actually exercised: **2.0276 with BELLS, 2.0296 without.**
@@ -177,11 +172,13 @@ Three further conditions:
 
 - **The model must fit in RAM.** Once it does not, BELLS reads cold experts from the same
   mmap the baseline does, so a miss costs the same disk read *plus* a PCIe copy. Strictly worse.
-- **Plenty of active expert parameters helps most.** That is the CPU work being moved to the
-  GPU. Mixtral-8x7B offloads ~11B per token and gained 5.88x; Qwen3-Next offloads ~1.5B and
-  gained 1.18x. Small experts keep transfer cheap, but they also mean less compute to save.
 - **Helps decode, not prefill.** A 512-token prompt touches 57-64 of 64 experts, so there is
   no hot set to exploit. Long prompts pay full price.
+- **The weaker your CPU, the more this helps** - possibly the whole of the effect. BELLS moves
+  expert compute onto the GPU, so its own throughput barely responds to core count while the
+  `--cpu-moe` baseline does. Doubling cores left Qwen3-Next's BELLS number at 39.9 -> 41.3
+  tok/s while its baseline went 14.3 -> 19.8. Stated as a hypothesis, not a finding: Mixtral
+  contradicts it and the infrastructure noise is large enough to matter.
 
 ---
 

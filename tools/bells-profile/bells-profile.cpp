@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>     // exp/log in the perplexity path; MSVC pulls these in transitively, gcc does not
 #include <cstring>
 #include <fstream>
 #include <map>

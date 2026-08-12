@@ -19,12 +19,16 @@ There are only three ways to make transfers cost less:
    (registering the model's pages), with a real hazard attached.
 3. skip the low-value transfers - **tested, dead end.** The router's weights are nearly flat, so
    no threshold saves transfers without discarding real probability mass.
-4. stop transferring on a miss at all - the only avenue still open, and the least verified.
+4. **cache only the layers where caching pays** - the most promising thing here, and the
+   cheapest to build: a third of layers sit below break-even at a 2x ratio, and the graph
+   already gates per layer.
+5. stop transferring on a miss at all - the largest prize, mechanism verified, design untested.
 
-Three of the four are now closed by measurement rather than argument, and **all three were things
-I expected to work**: eviction looked free, pinned staging had a 1.73x bandwidth gap apparently
-sitting there, and low-weight experts looked obviously skippable. None survived a paired
-measurement. That ratio is the honest prior for anything in section 3.
+Four of the six things tried are closed by measurement rather than argument, and **all four were
+things I expected to work**: eviction looked free, pinned staging had a 1.73x bandwidth gap
+apparently sitting there, low-weight experts looked obviously skippable, and uneven slot
+allocation looked certain given a 58-point spread between layers. None survived a paired
+measurement. That ratio is the honest prior for (4) and (5) too.
 
 ---
 
@@ -189,6 +193,64 @@ at all.
 Recorded because the flat weight distribution is the interesting part, and it kills a family of
 ideas rather than one: any scheme that leans on "most experts barely matter" is working from a
 false premise on this architecture.
+
+## 2c. Layers are wildly unequal, and a third of them are cached at a loss
+
+Two questions here. The first - should slots be shared out unevenly between layers? - is a dead
+end. The second, which the first exposed, looks like the best remaining idea in these notes.
+
+**Uneven allocation does not help.** `bells_alloc.py` measures each layer's hit-rate curve and
+hands slots out greedily to whichever layer gains most, against the same total VRAM. On
+Qwen3-Next it is worth **+0.26 points**, about 1% fewer misses. The reason is that the curves are
+*parallel*: every layer gains roughly 5-6 points per 4 extra slots regardless of where it starts,
+and equal marginal value is exactly the condition under which uniform allocation is already
+optimal.
+
+**But the levels are not remotely equal**, which is the interesting part:
+
+```
+16 slots (2x):  mean 63.7%   min 23.2% (L0)   max 81.8% (L30)   spread 58 points
+32 slots (4x):  mean 80.7%   min 42.5% (L0)   max 93.8% (L30)
+```
+
+The worst layers are the **early** ones - L0 23%, L1 43%, L2 48%, L3 49% - plus the final layer.
+Early-layer routing is diffuse and input-dependent; deeper layers settle into stable expert
+specialisation. That is structural rather than noise, and it makes the problem addressable.
+
+**There is a break-even, and a third of the layers are the wrong side of it.** Caching a layer
+only pays if moving the missing experts costs less than the CPU work it replaces. Both scale
+with the same bytes, so the bytes cancel:
+
+```
+miss_rate x (bytes / pcie_bw)  <  bytes / cpu_bw
+miss_rate  <  pcie_bw / cpu_bw  ~  7.09 / 18  ~  0.39      i.e. hit rate above ~61%
+```
+
+At a 2x ratio **15 of 48 layers sit below that line**, and they are the same layers with the
+highest miss rates, so they consume a disproportionate share of the PCIe traffic while returning
+the least of it. At 4x only 2 of 48 do - which is consistent with the measured results, where
+generous caches win and tight ones do not.
+
+**The proposal: gate the cache per layer.** Measure each layer's hit rate over a warmup window
+and, for layers below break-even, fall back to plain `--cpu-moe` for that layer alone. Their
+slots are then free for layers that do pay, so the benefit compounds.
+
+Why this is more attractive than anything else left here:
+
+- **The graph already supports it.** `build_moe_ffn` gates on `bells->tensors().has(il)`, which
+  is per-layer today. Turning a layer off is a flag, not a redesign.
+- **It targets the configurations that currently lose.** The 17-slot Qwen3-30B setup measured
+  60.7% hit overall - sitting exactly on the break-even, which is precisely why it benchmarked
+  at ~1.0x. Removing the layers dragging that average down is the difference between "no better
+  than `--cpu-moe`" and a win.
+- **It degrades safely.** A layer that is gated off is just `--cpu-moe`, the baseline.
+
+**Where the reasoning is incomplete, stated plainly.** The break-even assumes the CPU expert path
+is memory-bound, so its time scales with bytes read. That holds for K-quants. It does not
+obviously hold for GPT-OSS-120B's MXFP4, which needs dequantisation work per element and may be
+compute-bound - and GPT-OSS is the model where BELLS loses worst (0.16x), so the case most in
+need of explanation is the one this model fits least. The threshold should be measured per
+machine, not taken from the 0.39 above.
 
 ## 3. The idea worth trying: do not transfer on a miss
 

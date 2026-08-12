@@ -188,6 +188,15 @@ struct bells_params {
     // at 1, BELLS silently did nothing as soon as two requests decoded together.
     uint32_t    max_tokens = 0;
 
+    // Research only. Allocate the cache and keep taking the per-layer graph split and id
+    // readback, but leave the matmuls pointing at the full expert stack and copy nothing.
+    //
+    // Exists to decompose a result nothing else explains: Mixtral with every expert resident
+    // hits 100%, copies nothing, and still measures 0.80x. Passive isolates what that costs -
+    // VRAM occupancy plus the graph split plus the readback - from anything the cache does.
+    //   baseline vs passive = the fixed price of the mechanism
+    //   passive vs BELLS    = what the cache is actually worth
+    bool        passive = false;
 };
 
 // Ties the pieces together for the inference path.
@@ -211,9 +220,14 @@ public:
 
     // BELLS only serves decode. A prefill ubatch touches nearly every expert, so there is no
     // hot set to exploit and a cache would only thrash.
+    //
+    // False in passive mode, so the graph keeps using the full expert stack while everything
+    // else - the allocation, the split, the readback - still happens.
     bool active(int64_t n_tokens) const {
-        return ready_ && n_tokens <= (int64_t) params_.max_tokens;
+        return ready_ && !params_.passive && n_tokens <= (int64_t) params_.max_tokens;
     }
+
+    bool passive() const { return params_.passive; }
 
     const bells_tensors & tensors() const { return tensors_; }
 

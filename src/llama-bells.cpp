@@ -445,9 +445,10 @@ bool bells_runtime::init(const bells_params & params,
     ready_         = true;
     n_copied_      = 0;
 
-    fprintf(stderr, "%s: %u slots/layer of %u experts, %.1f MiB VRAM, serves ubatch <= %u\n",
+    fprintf(stderr, "%s: %u slots/layer of %u experts, %.1f MiB VRAM, serves ubatch <= %u%s\n",
             __func__, n_slot, n_expert, tensors_.vram_bytes()/1024.0/1024.0,
-            params_.max_tokens);
+            params_.max_tokens,
+            params_.passive ? "  [PASSIVE: cache allocated but unused, research mode]" : "");
 
     return true;
 }

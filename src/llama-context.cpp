@@ -392,6 +392,7 @@ llama_context::llama_context(
             bells_params bp;
             bp.enabled      = true;
             bp.n_slot       = params.bells_n_slot;
+            bp.passive      = params.bells_passive;
 
             // the cache lives wherever the graph runs, i.e. next to the rest of the offload
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends.front().get());
@@ -3052,6 +3053,7 @@ llama_context_params llama_context_default_params() {
         /*.abort_callback_data         =*/ nullptr,
         /*.bells_enabled               =*/ false,
         /*.bells_n_slot                =*/ 0,
+        /*.bells_passive               =*/ false,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,

@@ -367,6 +367,7 @@ extern "C" {
         // Requires the expert tensors to stay host resident, i.e. use together with --cpu-moe.
         bool         bells_enabled; // enable the BELLS expert cache
         uint32_t     bells_n_slot;  // resident experts per layer, 0 = size from free VRAM
+        bool         bells_passive; // research: allocate and split, but do not use the cache
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)

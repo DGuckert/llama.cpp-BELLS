@@ -529,6 +529,7 @@ struct common_params {
     bool no_kv_offload     = false; // disable KV offloading
     bool        bells_enabled = false; // BELLS on at all
     uint32_t    bells_n_slot = 0;   // MoE experts resident per layer, 0 = size from free VRAM
+    bool        bells_passive = false; // research: allocate and split, but do not use the cache
 
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data

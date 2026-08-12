@@ -2322,6 +2322,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_BELLS_SLOTS"));
     add_opt(common_arg(
+        {"--bells-passive"},
+        "BELLS: research only. Allocate the cache and keep taking the per-layer graph split, but "
+        "leave the matmuls on the full expert stack and copy nothing. Measures what the mechanism "
+        "costs before the cache does any work",
+        [](common_params & params) {
+            params.bells_passive = true;
+        }
+    ).set_env("LLAMA_ARG_BELLS_PASSIVE"));
+    add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
         [](common_params & params, int value) {

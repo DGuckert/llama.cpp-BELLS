@@ -594,7 +594,10 @@ bool bells_runtime::init(const bells_params & params,
                 conf_thresh_ = (float) atof(ct);
             }
             if (conf_.load(tp)) {
-                fprintf(stderr, "%s: confidence prefetch on, table %s, threshold %.2f\n",
+                pf_pending_.assign(n_layer, 0);
+                pf_start();
+                fprintf(stderr, "%s: confidence prefetch on, table %s, threshold %.2f, "
+                                "copies on a background thread\n",
                         __func__, tp, conf_thresh_);
             } else {
                 fprintf(stderr, "%s: could not load confidence table '%s', prefetch off\n",
@@ -632,6 +635,8 @@ bool bells_runtime::init(const bells_params & params,
 }
 
 void bells_runtime::free() {
+    pf_stop();
+
     const uint64_t tot = cache_.n_hit() + cache_.n_miss();
     if (tot > 0) {
         fprintf(stderr, "%s: hit %.1f%% (%llu of %llu), %llu experts copied, %.2f GiB moved\n",
@@ -664,6 +669,77 @@ void bells_runtime::free() {
 
     ready_    = false;
     n_copied_ = 0;
+}
+
+void bells_runtime::pf_start() {
+    if (pf_enabled_) {
+        return;
+    }
+
+    pf_quit_    = false;
+    pf_enabled_ = true;
+
+    pf_thread_ = std::thread([this]() {
+        for (;;) {
+            pf_job job;
+            {
+                std::unique_lock<std::mutex> lk(pf_mutex_);
+                pf_cv_.wait(lk, [this]() { return pf_quit_ || !pf_queue_.empty(); });
+                if (pf_quit_ && pf_queue_.empty()) {
+                    return;
+                }
+                job = pf_queue_.front();
+                pf_queue_.erase(pf_queue_.begin());
+            }
+
+            // The only work handed to this thread. Cache bookkeeping already happened on the
+            // main thread, so this touches nothing bells_cache owns.
+            tensors_.copy_expert(job.il, job.copy.expert, job.copy.slot);
+
+            {
+                std::lock_guard<std::mutex> lk(pf_mutex_);
+                if (job.il < pf_pending_.size() && pf_pending_[job.il] > 0) {
+                    pf_pending_[job.il]--;
+                }
+            }
+            pf_done_.notify_all();
+        }
+    });
+}
+
+void bells_runtime::pf_stop() {
+    if (!pf_enabled_) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(pf_mutex_);
+        pf_quit_ = true;
+    }
+    pf_cv_.notify_all();
+    if (pf_thread_.joinable()) {
+        pf_thread_.join();
+    }
+    pf_enabled_ = false;
+    pf_queue_.clear();
+}
+
+void bells_runtime::pf_submit(uint32_t il, const bells_copy & c) {
+    {
+        std::lock_guard<std::mutex> lk(pf_mutex_);
+        if (il >= pf_pending_.size()) {
+            pf_pending_.resize(il + 1, 0);
+        }
+        pf_pending_[il]++;
+        pf_queue_.push_back({ il, c });
+    }
+    pf_cv_.notify_one();
+}
+
+void bells_runtime::pf_drain(uint32_t il) {
+    std::unique_lock<std::mutex> lk(pf_mutex_);
+    pf_done_.wait(lk, [this, il]() {
+        return il >= pf_pending_.size() || pf_pending_[il] == 0;
+    });
 }
 
 void bells_runtime::begin_ubatch(int32_t token, int64_t n_tokens) {
@@ -706,8 +782,11 @@ void bells_runtime::begin_ubatch(int32_t token, int64_t n_tokens) {
         copies_.clear();
         cache_.prefetch((uint32_t) il, cand, n, copies_);
 
+        // Hand the bytes to the worker and move on. Doing this inline is what made prefetch a
+        // serial prologue: a copy from pageable memory blocks the caller while the driver
+        // stages it, so the token could not start until every layer's guesses had landed.
         for (const auto & c : copies_) {
-            tensors_.copy_expert((uint32_t) il, c.expert, c.slot);
+            pf_submit((uint32_t) il, c);
         }
 
         n_copied_     += copies_.size();
@@ -722,6 +801,13 @@ bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
     }
 
     n_layer_calls_++;
+
+    // Any speculative copy into this layer must have landed before we reuse its slots or read
+    // them. This is the only synchronisation the background copier needs, and it is why cache
+    // bookkeeping was kept on this thread.
+    if (pf_enabled_) {
+        pf_drain(il);
+    }
 
     // Every expert this layer asked for must be resident before the matmul reads the slot
     // table, so this is a demand fetch with no lead time to hide it behind.

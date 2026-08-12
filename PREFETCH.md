@@ -110,6 +110,50 @@ So: **correct and unbuildable on the current transfer path.** Not refuted, block
 more useful state than the "prediction does not work" this project believed before, and it names
 the one change that would unblock it.
 
+## The root cause: transfers cannot overlap compute at all
+
+The obvious response to "prefetch is a serial prologue" is to move the copies to a background
+thread, so the main thread never waits. Built that too - a worker thread taking the copies while
+cache bookkeeping stays on the main thread, with a per-layer gate so nothing reads a slot being
+written. Correct (perplexity still 13.8380) and **marginally worse**:
+
+| | synchronous | background thread |
+|---|---|---|
+| no prefetch | 118.3 ms | 121.7 ms |
+| prefetch 0.90 | 133.9 ms | 143.9 ms |
+| prefetch 0.70 | 127.7 ms | 138.0 ms |
+
+The reason is in ggml, at `ggml-cuda.cu:2991`:
+
+```c
+static void ggml_backend_cuda_set_tensor_async(...) {
+    CUDA_CHECK(cudaMemcpyAsync(..., cudaMemcpyHostToDevice, cuda_ctx->stream()));
+}
+```
+
+**Host-to-device copies are issued on the same CUDA stream as the compute graph.** Streams are
+strictly ordered, so a copy cannot execute alongside a kernel - it waits for the one in front of
+it. Which CPU thread enqueued it is irrelevant; they all feed one ordered queue.
+
+That single fact explains every failure in these notes and in OPTIMIZATION.md:
+
+| attempt | outcome | explanation |
+|---|---|---|
+| pinned staging ring | 37% slower | extra work, still serialised |
+| prefetch, synchronous | slower | serial prologue in front of the token |
+| prefetch, background thread | slower | same stream regardless of thread |
+| copies are 87% of layer cost | - | never hidden behind anything |
+
+**The prerequisite for any of this is a second stream.** A second `ggml_backend_cuda_init` on
+the same device gets its own stream; copies go there, and `ggml_backend_event_record` /
+`ggml_backend_event_wait` order them against compute only where they must be. Until that exists,
+no prefetching scheme can pay, because there is nothing for the transfer to overlap with.
+
+Worth one caution against over-claiming: on the configuration measured here, transfers (74.5 ms
+per token) exceed GPU compute (~16 ms), so perfect overlap would still leave transfers dominant.
+A second stream helps most where the hit rate is high and transfers are small - which is the same
+regime this whole document is about.
+
 ## Before anyone builds this
 
 - The 8% is an estimate, and this project's estimates have a poor record. Four of five

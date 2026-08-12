@@ -3,8 +3,11 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 // BELLS: a per-layer VRAM expert cache.
@@ -314,6 +317,37 @@ private:
     float    conf_thresh_ = 0.9f;
     uint64_t n_prefetched_ = 0;
     uint64_t n_pf_used_    = 0;
+
+    // Background copier.
+    //
+    // Prefetching synchronously made things slower: a copy from the model's pageable mmap
+    // blocks the calling thread while the driver stages it, so issuing every layer's prefetch
+    // up front is a serial prologue in front of each token rather than overlapped work. The
+    // transfer was never the problem - waiting for it on the critical path was.
+    //
+    // So the copies move to a worker thread. All cache bookkeeping stays on the main thread,
+    // and only the byte-moving is handed over, which keeps bells_cache single-threaded and
+    // leaves just one thing to get right: nothing may read a slot while it is being written.
+    // pending_ is that gate - on_routing waits for a layer to drain before ensure() can reuse
+    // any of its slots.
+    struct pf_job {
+        uint32_t   il;
+        bells_copy copy;
+    };
+
+    void pf_start();
+    void pf_stop();
+    void pf_submit(uint32_t il, const bells_copy & c);
+    void pf_drain(uint32_t il);
+
+    std::thread             pf_thread_;
+    std::mutex              pf_mutex_;
+    std::condition_variable pf_cv_;
+    std::condition_variable pf_done_;
+    std::vector<pf_job>     pf_queue_;
+    std::vector<uint32_t>   pf_pending_;   // per model layer
+    bool                    pf_quit_    = false;
+    bool                    pf_enabled_ = false;
 
     std::vector<bells_copy> copies_;
 

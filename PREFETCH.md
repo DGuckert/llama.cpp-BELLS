@@ -231,6 +231,45 @@ tokens rather than 605) raises in-distribution precision to 82.2%, but the numbe
 generalises is 67.9% - **below** the figure the earlier sections were built on. A bigger table
 buys accuracy within a domain and does not buy it across domains.
 
+### And on genuinely unfamiliar text it collapses
+
+The section above called llama.cpp docs to C++ a mild shift and said fiction and non-English
+text would be the real test. That test has now been run: 185325 tokens of Pride and Prejudice,
+Moby Dick, Romeo and Juliet, The Republic, Origin of Species, Don Quijote (Spanish), Madame
+Bovary (French) and Faust (German), appended after the same markdown prefix so the same
+prose-trained table is scored against all three domains.
+
+| eval text | precision @0.90 | traffic removed | baseline demand |
+|---|---|---|---|
+| held-out markdown *(in-distribution)* | **82.2%** | 30.1% | 119.4 MB/token |
+| C++ *(mild shift)* | 67.9% | 22.2% | 65.9 MB/token |
+| **fiction + 3 languages** *(real shift)* | **49.5%** | 14.5% | 63.8 MB/token |
+
+**Precision falls 32.7 points.** At 49.5% barely half of what would be prefetched is used, and
+the traffic saving drops from 30.1% to 14.5%.
+
+The threshold sweep is worse than the headline. On out-of-domain text, `misses saved` turns
+**negative** below 0.50 - `-5.4%` at 0.30 and `-28.7%` at 0.15. Prefetching there *increases*
+demand traffic, because wrong guesses evict experts that were about to be wanted. That is the
+exact failure this document opened by re-examining, reproduced under control.
+
+The in-distribution figure replicated across two independently collected traces (82.2% and
+30.1% against 82.2% and 30.0%), so the comparison is sound and the gap is not noise.
+
+**What this means for the argument.** The ~8% estimated speedup in this document assumed 73.3%
+precision. At 49.5%, with negative returns at loose thresholds, a *static* shipped table is not
+worth unblocking - the win is small, corpus-dependent, and turns into a loss if the threshold is
+mistuned for the user's content. Token-id routing statistics are real, but they are far more
+corpus-specific than this document assumed.
+
+The design that survives is a table built **online from the user's own traffic** rather than
+shipped. That is a different feature with different costs, and nothing here measures it.
+
+**This caveat also applies to lookahead eviction**, which reads the same table. Its measured
+gain - roughly 8% fewer bytes and 1-3% end to end - was collected on `README.md`, which is
+*inside* the corpus its table was counted from. That number is in-distribution and should be
+expected to shrink on unfamiliar text. It has not been re-measured out of domain.
+
 ## Before anyone builds this
 
 - The 8% is an estimate, and this project's estimates have a poor record. Four of five

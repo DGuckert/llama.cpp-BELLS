@@ -14,16 +14,15 @@ that does not reduce bytes moved, or make a miss stop requiring a transfer, is r
 
 There are only three ways to make transfers cost less:
 
-1. miss less often - **tested below, dead end.** Seven policies, two architectures, nothing
-   beats LRU.
-2. **transfer more cheaply - a projected 1.43x, and the clearest next task.** The copies run at
-   7.09 GB/s against a 12.25 GB/s pinned benchmark on the same machine.
+1. miss less often - **tested, dead end.** Seven policies, two architectures, nothing beats LRU.
+2. transfer more cheaply - **staging tried and reverted, 37% slower.** One route remains
+   (registering the model's pages), with a real hazard attached.
 3. stop transferring on a miss at all - the largest prize and the largest unknown; a design
    sketch, not a result.
 
-Ordered by expected value: **do (2) first.** It is a bounded change to one function with a
-measured gap behind it. (3) rewrites how the MoE graph is built and rests on an assumption
-about `mul_mat_id` that has not been checked.
+Two of the three are now closed by measurement rather than argument. Both were things I expected
+to work: the eviction policies looked free, and the pinned staging had a 1.73x bandwidth gap
+apparently sitting there for the taking. Neither survived contact with a paired A/B.
 
 ---
 
@@ -105,22 +104,38 @@ memory. `cudaMemcpyAsync` from pageable memory is not truly asynchronous - the d
 internally and the call blocks - so BELLS pays both the slower path and a stall it did not ask
 for. `ggml_backend_tensor_set_async` cannot fix that; the memory has to be pinned.
 
-**Two ways to get it, with different risk:**
+### Staging through a pinned ring: built, measured, 37% slower
 
-*Register the expert tensors in place* (`cudaHostRegister`). No staging copy at all, and the
-existing code path is otherwise unchanged. The hazard is that pinned pages cannot be swapped:
-pinning a 27 GB model on a 32 GB machine is asking for trouble, and registration of a large
-file-backed mapping can itself be slow. Viable where RAM is plentiful (the 128 GB configurations
-this technique actually wins on), reckless on a laptop.
+Implemented and tested rather than argued: a pinned staging ring allocated through
+`ggml_backend_dev_host_buffer_type`, `mmap -> pinned` memcpy then async DMA out of the ring,
+sized so wrapping is rare. Correctness held (bit-identical). Performance did not. Alternating
+staged and unstaged in one session, same model and slot count:
 
-*Double-buffered pinned staging.* Bounded memory, no swap hazard, works everywhere. `mmap ->
-pinned` memcpy runs at ~20 GB/s and `pinned -> device` at 12.25, so overlapping expert *n+1*'s
-memcpy with expert *n*'s DMA converges on 12.25 rather than the serial
-`1/(1/20 + 1/12.25)` = 7.6 GB/s, which would be *worse* than today. The overlap is the entire
-point - a naive staging buffer is a regression.
+| pass | config | copy/layer | decode | tok/s |
+|---|---|---|---|---|
+| 1 | staged | 2099 us | 133.55 ms | 7.49 |
+| 1 | **unstaged** | **1497 us** | **100.29 ms** | **9.97** |
+| 2 | staged | 2171 us | 137.92 ms | 7.25 |
+| 2 | **unstaged** | **1433 us** | **97.03 ms** | **10.31** |
 
-Numbers above are projections from measured rates, not results. The falsification test is
-direct: pin the source, re-run the same profile, and check whether copy/layer approaches 784 us.
+Reproducible, and `readback` stayed at 192-196 us across all four runs, so the machine was not
+drifting. A first attempt with an 8-slot ring was also worse; enlarging it to 256 made it worse
+still, which falsified the obvious explanation that synchronisation frequency was to blame.
+
+**The reasoning error is worth keeping.** "Copies run at 7.09 GB/s, pinned benchmarks at 12.25,
+therefore pinning wins" assumes the pageable path is a slow DMA that pinning replaces. It is
+not. `cudaMemcpy` from pageable memory **already stages through an internal pinned buffer**, so
+adding a staging copy does not replace that work - it duplicates it. Pageable DMA at ~7 GB/s and
+a host memcpy at ~8 GB/s are the same operation priced twice, which is exactly the ~2x seen.
+
+The code was reverted. It is in the branch history if anyone wants it.
+
+**What that leaves.** The 12.25 GB/s number is only reachable if the DMA reads the model's pages
+*directly*, which means registering them (`cudaHostRegister`) rather than copying them. That
+removes the duplicated work instead of adding to it. The hazard is real though: pinned pages
+cannot be swapped, so registering the expert tensors of a 27 GB model on a 32 GB machine risks
+destabilising the box. It is plausible on the 128 GB configurations where this technique
+actually wins, and should be tried there first, on a machine nobody is relying on.
 
 **PCIe width still dominates all of it.** On a laptop dGPU the same benchmark gives 3.11 GB/s
 pageable and 3.14 pinned - pinning buys *nothing* there, because the card is wired x4 instead of

@@ -79,20 +79,29 @@ public class Nvme {
         Stopwatch sw = Stopwatch.StartNew();
         long done = 0;
 
+        // OVERLAPPED on x64 is Internal(0) InternalHigh(8) Offset(16) hEvent(24), 32 bytes.
+        // Writing the offset at 8 and the event at 16 puts the handle in the Offset field and
+        // leaves hEvent as whatever AllocHGlobal returned, so nothing ever signals and the wait
+        // blocks forever. Cost me one hung probe.
         Action<int> issue = delegate(int i) {
             long off = (long)(rnd.NextDouble() * maxBlk) * block;   // block-aligned, required
-            Marshal.WriteInt64(ovs[i], 0, 0);
-            Marshal.WriteInt64(ovs[i], 8, off);
-            Marshal.WriteIntPtr(ovs[i], 16, evs[i]);
-            ReadFile(h, bufs[i], (uint)block, IntPtr.Zero, ovs[i]);
+            Marshal.WriteInt64(ovs[i], 0, 0);          // Internal
+            Marshal.WriteInt64(ovs[i], 8, 0);          // InternalHigh
+            Marshal.WriteInt64(ovs[i], 16, off);       // Offset / OffsetHigh as one 64-bit
+            Marshal.WriteIntPtr(ovs[i], 24, evs[i]);   // hEvent
+            if (!ReadFile(h, bufs[i], (uint)block, IntPtr.Zero, ovs[i])) {
+                int e = Marshal.GetLastWin32Error();
+                if (e != 997)                           // 997 = ERROR_IO_PENDING, expected
+                    throw new Exception("ReadFile failed " + e + " (block " + block + ")");
+            }
         };
 
         for (int i = 0; i < qd; i++) issue(i);
 
         while (sw.Elapsed.TotalSeconds < seconds) {
-            uint idx = WaitForMultipleObjects((uint)qd, evs, false, INFINITE);
+            uint idx = WaitForMultipleObjects((uint)qd, evs, false, 10000);
+            if (idx >= (uint)qd) throw new Exception("wait failed/timed out: " + idx);
             int i = (int)idx;
-            if (i < 0 || i >= qd) break;
             uint got;
             GetOverlappedResult(h, ovs[i], out got, true);
             done += got;
@@ -119,9 +128,12 @@ Write-Output ""
 Write-Output ("{0,-14} {1,10} {2,10} {3,10} {4,10}   {5}" -f "block", "QD1", "QD4", "QD16", "QD32", "QD32/QD1")
 Write-Output ("-"*70)
 
-# 1.09 MB = Qwen3-Next expert, 2.92 MB = Qwen3-30B expert, 11.3 MB = Qwen3-235B expert
+# 1.09 MB = Qwen3-Next expert, 2.92 MB = Qwen3-30B expert, 11.3 MB = Qwen3-235B expert.
+# NO_BUFFERING requires the length and the offset to be sector multiples, so every size is
+# rounded down to a 4096 boundary - 2990 KB and 11571 KB are not, and an unaligned ReadFile
+# fails rather than reading short.
 foreach ($kb in @(64, 1116, 2990, 11571)) {
-    $block = $kb * 1024
+    $block = [int]([math]::Floor($kb*1024/4096)*4096)
     $r = @()
     foreach ($qd in @(1, 4, 16, 32)) {
         $r += [Nvme]::Run($file.FullName, $block, $qd, $Seconds)

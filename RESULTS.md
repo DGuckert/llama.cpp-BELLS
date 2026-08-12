@@ -212,6 +212,136 @@ Two caveats:
 Note also that `-ngl` is not merely slower here, it cannot run the model at all. Expert-level
 caching lets a 27 GB model run on a 24 GB card; layer-level offload does not.
 
+## The comparable set: one GPU, one CPU count, four models
+
+Everything below was measured on the same A10G 24 GB with **16 vCPU and 128 GB RAM**, same
+build, 128 generated tokens, best slot count for each model. This is the table to trust; the
+older 8 vCPU numbers elsewhere in this file are superseded and marked as such.
+
+| Model | expert | active | baseline | BELLS | result |
+|---|---|---|---|---|---|
+| Qwen3-Next-80B (Q2_K) | 1.09 MB | 3 B | 18.56 | **30.19** | **1.63x** |
+| Qwen3-235B-A22B (Q2_K) | 6.61 MB | 14 B | 2.37 | **3.55** | **1.50x** |
+| Mixtral-8x7B (Q4_K_M) | 18 MB | 13 B | 3.70 | 3.93 | 1.06x |
+| GPT-OSS-120B (MXFP4) | 12.6 MB | 5 B | 13.21 | 2.17 | **0.16x** |
+
+Plain `-ngl` failed to load every one of these on a 24 GB card, so `--cpu-moe` is the only
+honest baseline.
+
+### There is no working predictor, and this is the main negative result
+
+Four hypotheses were advanced in this file, each from the data available at the time, and each
+falsified by the next measurement:
+
+1. **Sparsity** decides it. Falsified by Mixtral, which is dense-ish and once measured 5.88x.
+2. **Cache ratio** decides it, threshold ~2x. Falsified by GPT-OSS-120B: rated 7.8x "good fit",
+   measured the worst result in the project.
+3. **Active parameters** decide it. Rested entirely on Mixtral's 5.88x, which was an 8-core
+   artifact - at 16 cores Mixtral is 1.06x and the hypothesis dies with it.
+4. **Expert size** decides it. Falsified within one table: Mixtral's 18 MB experts score 1.06x
+   while GPT-OSS's 12.6 MB score 0.16x.
+
+Hit rate does not work either, in either direction: GPT-OSS got *slower* as its hit rate rose
+(61.1% -> 74.2%, 460 -> 577 ms), while Qwen3-Next got faster (53.1% -> 73.6%). Any two of these
+models can be used to argue any of the above rules, which is exactly the danger of a
+three-model sample.
+
+GPT-OSS also loses by much more than transfer volume explains. At a 61.1% hit rate it moves
+roughly 706 MB per token, about 59 ms of PCIe at measured bandwidth, against a 385 ms
+regression. Something specific to it - MXFP4 copy cost, or VRAM pressure from a 7-12 GB cache
+squeezing the compute buffers - accounts for the rest, and it is not characterised.
+
+**The practical consequence:** `bells_calc.py` answers "can this possibly fit", not "will this
+help". Ten minutes with `llama-bells-profile` on your own model and hardware is the only
+reliable answer, and the tool exists for that.
+
+### The per-layer round trip is a floor
+
+Mixtral with 8 slots holds **every** expert in VRAM: 100% hit rate, zero copies, no PCIe
+traffic during decode. It still measured 0.80x, slower than 4 slots and slower than the
+baseline.
+
+If the design loses while moving no data at all, the residual cost is structural: for every
+layer, the graph stops, the router's selection is read back to the host, residency is corrected
+and a slot table is uploaded. Thirty-two of those per token for Mixtral, ninety-four for the
+235B. No cache policy, hit rate or slot count touches it. That fixed cost is the ceiling on
+this whole approach, and removing it would mean keeping the correction on-device rather than
+round-tripping through the host - which is a different design, not a tuning parameter.
+
+## Correction: the A10G numbers were measured against a crippled baseline
+
+Every earlier A10G result in this file used `cpu=8.0`, a Modal default nobody chose. BELLS
+wins by moving work off the CPU, so an 8-core baseline flatters it in precisely the dimension
+being measured, and a 24 GB card in the real world sits next to a desktop CPU. Re-run at
+**16 vCPU**, 128 GB RAM, same GPU, same model file, 128 tokens:
+
+Qwen3-Next-80B-A3B Q2_K:
+
+| Config | ms/token | tok/s | vs baseline | cache hit |
+|---|---|---|---|---|
+| `--cpu-moe` baseline | 53.88 | 18.56 | 1.00x | - |
+| plain `-ngl` | OOM on a 24 GB card | | | |
+| BELLS, 16 slots | 49.63 | 20.15 | 1.09x | 53.1% |
+| BELLS, 32 slots | 37.92 | 26.37 | 1.42x | 67.0% |
+| **BELLS, 48 slots** | **33.12** | **30.19** | **1.63x** | 73.6% |
+
+**2.80x becomes 1.63x.** Doubling the cores lifted the baseline from 14.3 to 18.56 tok/s and
+dropped BELLS from 39.9 to 30.19. The remaining 1.63x is real and is the number a 3090 owner
+should expect, on a model plain `-ngl` cannot load at all.
+
+Two notes. 48 slots was the largest tried and the curve was still improving, so this is a lower
+bound rather than a tuned optimum. And the slot response here is the exact opposite of
+GPT-OSS-120B below, where more cache made things worse - small experts reward a large cache,
+large experts punish it.
+
+## Correction: GPT-OSS-120B is much worse than recorded, and the ratio heuristic failed
+
+This file previously recorded GPT-OSS-120B at 0.63x on a 6 GB RTX 2060 and attributed the loss
+to the model exceeding RAM: 59 GB of weights against 32 GB, so every miss paid a disk read plus
+a PCIe copy. The prediction that followed was that a machine with enough RAM would flip it to a
+win, since the calculator rated 24 GB VRAM / 128 GB RAM at a 7.8x cache ratio - comfortably
+inside "good fit".
+
+Measured on an A10G 24 GB with **16 vCPU and 128 GB RAM**, 128 tokens:
+
+| Config | ms/token | tok/s | vs baseline | cache hit |
+|---|---|---|---|---|
+| `--cpu-moe` baseline | 75.72 | **13.21** | 1.00x | - |
+| plain `-ngl` | OOM, 59 GB model on a 24 GB card | | | |
+| BELLS, 16 slots (4x ratio) | 460.37 | 2.17 | **6.1x slower** | 61.1% |
+| BELLS, 28 slots (7x ratio) | 576.63 | 1.73 | **7.6x slower** | 74.2% |
+
+The prediction was wrong, and wrong in the opposite direction. Removing the disk bottleneck
+did not help BELLS; it helped the *baseline*, which went from 1.82 tok/s on the 2060 to 13.21
+here. BELLS could not follow.
+
+Three things to take from this.
+
+**The cache ratio is not a reliable screen.** It rated this configuration 7.8x and it produced
+the worst result in the project. Every earlier statement in this file about a "~2x threshold"
+should be read as necessary but nowhere near sufficient.
+
+**More cache was slower.** 28 slots achieved a better hit rate than 16 (74.2% vs 61.1%) and ran
+25% slower. Hit rate and wall clock are anti-correlated again, exactly as they were for the
+predictor. Anyone tuning this by hit rate will tune it in the wrong direction.
+
+**Bytes per token is the thing that matters.** GPT-OSS has 12.6 MB experts against
+Qwen3-Next's 1.09 MB:
+
+| Model | expert | active x layers | bytes/token at measured hit rate | result |
+|---|---|---|---|---|
+| Qwen3-Next-80B | 1.09 MB | 10 x 48 | ~115 MB | 1.18x faster |
+| Qwen3-30B-A3B | 2.93 MB | 8 x 48 | ~250 MB | 1.52x faster |
+| GPT-OSS-120B | 12.6 MB | 4 x 36 | ~707 MB | 6.1x slower |
+
+Mixtral is the counter-case that stops this being a clean rule: 18 MB experts and still the
+largest speedup recorded, because ~11 B active parameters make its CPU baseline enormous. Both
+terms matter and four models cannot fit two parameters. The practical advice is to measure.
+
+**Useful side result for anyone with a 24 GB card and 128 GB of RAM:** GPT-OSS-120B runs at
+13.21 tok/s on stock `--cpu-moe`, with BELLS switched off. That is a perfectly usable speed for
+a 120B model on one consumer GPU, and it needs nothing from this repository.
+
 ## Correction: active parameters matter more than sparsity
 
 An earlier version of this file, and of the README, said Mixtral-style models (2 of 8 experts)

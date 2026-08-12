@@ -12,23 +12,34 @@ compute buffers. **Expert**: per-expert granularity, as opposed to the layer gra
 `-ngl`. **LRU**: plain least-recently-used, which beat the predictive scheme this project was
 originally built around.
 
-**An 80B model at 17.5 tok/s on a 6 GB RTX 2060.** On a 24 GB card, the same model runs at
-39.9 tok/s - a model that plain `-ngl` cannot load at all.
+**A 235B model on one 24 GB card at 3.55 tok/s, up from 2.37.** An 80B on the same card at
+30.19 tok/s, up from 18.56. Both are models plain `-ngl` cannot load at all.
 
-It does not help every model. It made one of the three models tested measurably slower. The
-tables below include the failures, because knowing which case you are in is most of the value.
+**It does not help every model, and there is no known way to predict which.** Of four models
+measured on identical hardware, two gain about 1.5x, one gains nothing, and one is six times
+*slower*. Four separate rules for telling them apart were proposed and each was falsified by
+the next measurement - see [there is no working
+predictor](RESULTS.md#there-is-no-working-predictor-and-this-is-the-main-negative-result).
+Measure your own model; the tool for it is in this repo and takes ten minutes.
 
 ---
 
 ## Measured results
 
-Qwen3-Next-80B-A3B (Q2_K, 27 GB), 128 generated tokens, paired back-to-back runs:
+Four models, one machine: A10G 24 GB (the same silicon as an RTX 3090), 16 vCPU, 128 GB RAM,
+128 generated tokens, best slot count each. Plain `-ngl` cannot load any of them on 24 GB, so
+`--cpu-moe` is the only honest baseline.
 
-| Config | RTX 2060 6 GB | A10G 24 GB |
-|---|---|---|
-| plain `-ngl` | 7.97 tok/s | cannot load the model |
-| `--cpu-moe` (best stock llama.cpp) | 15.5 tok/s | 14.3 tok/s |
-| **BELLS** | **18.4 tok/s** | **39.9 tok/s** |
+| Model | expert size | active params | `--cpu-moe` | BELLS | result |
+|---|---|---|---|---|---|
+| Qwen3-Next-80B (Q2_K) | 1.09 MB | 3 B | 18.56 tok/s | **30.19** | **1.63x** |
+| Qwen3-235B-A22B (Q2_K) | 6.61 MB | 14 B | 2.37 tok/s | **3.55** | **1.50x** |
+| Mixtral-8x7B (Q4_K_M) | 18 MB | 13 B | 3.70 tok/s | 3.93 | 1.06x |
+| GPT-OSS-120B (MXFP4) | 12.6 MB | 5 B | 13.21 tok/s | 2.17 | **0.16x** |
+
+No property in that table orders the results. Expert size fails (18 MB beats 12.6 MB), cache
+ratio fails (GPT-OSS was rated a 7.8x "good fit"), active parameters fail (14 B wins, 13 B does
+not), and hit rate fails in both directions.
 
 Across three models on the 6 GB card:
 
@@ -45,6 +56,25 @@ And on a 24 GB A10G with only 8 vCPU, where a weak CPU makes the baseline easier
 | Mixtral-8x7B (Q4_K_M) | 2.0x | 0.80 tok/s | 4.73 tok/s | **5.88x** |
 | Qwen3-Next-80B (Q2_K) | 25x | 14.3 tok/s | 39.9 tok/s | **2.80x** |
 
+**Those two rows are inflated.** 8 vCPU is a crippled baseline in exactly the dimension BELLS
+exploits - it wins by moving work off the CPU - and a 24 GB card normally sits next to a real
+desktop CPU. Re-run at **16 vCPU with 128 GB RAM**, same GPU and same model files:
+
+| Model | baseline | BELLS | result | was (8 vCPU) |
+|---|---|---|---|---|
+| Qwen3-Next-80B (Q2_K), 48 slots | 18.56 tok/s | 30.19 tok/s | **1.63x** | 2.80x |
+| GPT-OSS-120B (MXFP4), 16 slots | 13.21 tok/s | 2.17 tok/s | **6.1x slower** | 0.63x slower |
+| GPT-OSS-120B (MXFP4), 28 slots | 13.21 tok/s | 1.73 tok/s | **7.6x slower** | - |
+
+Qwen3-Next keeps a real 1.63x - on a model plain `-ngl` cannot load at all - and that is the
+number to believe if you have a 24 GB card.
+
+GPT-OSS-120B goes the other way, and the 6 GB card's 0.63x had the wrong explanation attached.
+It was blamed on the model exceeding RAM. Given 128 GB it fits entirely, the baseline reaches
+13.21 tok/s, and BELLS falls *further* behind: the problem was never disk, it is that 12.6 MB
+experts move too many bytes per token. Note also that the larger cache scored a **better** hit
+rate (74.2% vs 61.1%) and was **slower**.
+
 **Quality is unaffected.** Teacher-forced perplexity, scored one token at a time so the cache
 is actually exercised: **2.0276 with BELLS, 2.0296 without.**
 
@@ -52,14 +82,24 @@ is actually exercised: **2.0276 with BELLS, 2.0296 without.**
 
 ## Will it help my model?
 
-One number decides it:
+> **The cache ratio below is not reliable.** It rated GPT-OSS-120B on a 24 GB card with
+> 128 GB of RAM at **7.8x, "good fit"**. Measured, that configuration is **6.1x slower** than
+> `--cpu-moe` - the worst result in this project. A screening tool that green-lights the worst
+> case is worse than none, so treat what follows as a rough filter and **measure before you
+> trust it.** What actually predicts the outcome, as far as three models can tell, is bytes
+> moved per token against how much CPU work is displaced - see
+> [expert size is the discriminator](#expert-size-not-cache-ratio) below.
+
+The ratio is still the first thing to compute, because a cache smaller than one token's
+working set cannot help at all:
 
 ```
 working_set = n_layer x n_experts_active x expert_bytes
 cache_ratio = usable_VRAM / working_set
 ```
 
-**Above ~2x it wins. Below ~1.5x it loses.** There is a calculator:
+Below ~1.5x it reliably loses. Above that it *may* win, and the ratio does not tell you which.
+There is a calculator:
 
 ```
 $ python tools/bells-profile/bells_calc.py --vram 6 --ram 32 --preset qwen3-30b-a3b
@@ -100,24 +140,34 @@ kimi-k2                   RAM      RAM      RAM      RAM      RAM      RAM      
 mixtral-8x7b              RAM        .        .        .        .    ~1.0x     2.0x     2.0x     vram     vram
 mixtral-8x22b             RAM      RAM      RAM      RAM      RAM      RAM      RAM        .    ~1.0x     2.0x
 
-N.Nx = worth using    ~ = marginal, measure it    . = cache too small to help
-vram = model fits on the card, load it normally    RAM = model exceeds RAM
+N.Nx = the cache can hold this many working sets    . = cache too small to help anything
+vram = model fits on the card, load it normally     RAM = model exceeds RAM
 ```
 
-**This table is calculated, not measured.** Six cells have benchmarks behind them:
-qwen3-next-80b, qwen3-30b-a3b and gpt-oss-120b at 6/32; qwen3-next-80b and mixtral-8x7b on a
-24 GB A10G. The rest is arithmetic from each model's `config.json`, validated against those
-(predicted expert sizes land within 1% of what the runtime reports). Treat it as a screening
-tool.
+**Read the numbers as "can this possibly fit", not "will this help".** The ratio is calculated,
+not measured, and it does not predict the outcome: `gpt-oss-120b` at 24/128 is rated 7.8x and
+measures **6.1x slower** than the baseline, the worst result in this project. A high number
+here means a cache is physically possible, nothing more.
 
-**RAM is usually the binding constraint, not VRAM** - most cells that say no say `RAM`.
+**RAM is usually the binding constraint, not VRAM** - most cells that say no say `RAM`, and
+that part of the table is reliable.
 
-**Ratio screens candidates but does not rank them.** Mixtral-8x7B measured **5.88x faster** at
-a 2.0x ratio and **3.85x** at 1.0x, while Qwen3-Next-80B manages 1.18x at 4.7x. The difference
-is active parameters: Mixtral offloads ~11B of expert compute per token against Qwen3-Next's
-~1.5B, so there is far more CPU work to move to the GPU. An earlier version of this README
-called Mixtral hopeless on sparsity grounds; that was wrong, and the measurement is in
-[RESULTS.md](RESULTS.md).
+Ten cells have benchmarks behind them: qwen3-next-80b, qwen3-30b-a3b and gpt-oss-120b at 6/32;
+qwen3-next-80b, qwen3-235b-a22b, mixtral-8x7b and gpt-oss-120b on a 24 GB A10G. Predicted
+expert sizes land within 1% of what the runtime reports, so the *arithmetic* is sound - it is
+the inference from arithmetic to speedup that fails.
+
+### The one hard floor
+
+Mixtral with 8 slots holds **every** expert in VRAM - 100% hit rate, zero copies, no PCIe
+traffic during decode - and still measured 0.80x. If the design loses while moving no data at
+all, the residual cost is structural: every layer stops the graph, reads the router's selection
+back to the host, corrects residency and uploads a slot table. 32 of those per token for
+Mixtral, 94 for the 235B. No slot count or cache policy touches it.
+
+That fixed per-layer round trip is the ceiling on this approach, and removing it means keeping
+the correction on-device instead of going through the host - a different design, not a tuning
+knob.
 
 Three further conditions:
 

@@ -423,9 +423,31 @@ llama_context::llama_context(
             // the cache lives wherever the graph runs, i.e. next to the rest of the offload
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends.front().get());
 
+            // BELLS_COPY_STREAM=1 puts expert copies on a second backend, and therefore a second
+            // CUDA stream. ggml issues host-to-device copies on the compute stream
+            // (ggml-cuda.cu:2991), and streams are strictly ordered, so today a transfer can
+            // never overlap a kernel - which is why pinned staging, synchronous prefetch and
+            // threaded prefetch all failed. Ordering becomes explicit via an event instead.
+            ggml_backend_t copy_backend = nullptr;
+            if (const char * cs = getenv("BELLS_COPY_STREAM")) {
+                if (cs[0] && cs[0] != '0') {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(backends.front().get());
+                    if (dev) {
+                        copy_backend = ggml_backend_dev_init(dev, nullptr);
+                    }
+                    if (copy_backend) {
+                        bells_copy_backend.reset(copy_backend);
+                        LLAMA_LOG_INFO("%s: BELLS copies on a second stream\n", __func__);
+                    } else {
+                        LLAMA_LOG_WARN("%s: could not create a second backend for BELLS copies\n",
+                                       __func__);
+                    }
+                }
+            }
+
             bells = std::make_unique<bells_runtime>();
             if (!bells->init(bp, buft, srcs, model.hparams.n_expert,
-                             model.hparams.n_expert_used, backends.front().get())) {
+                             model.hparams.n_expert_used, backends.front().get(), copy_backend)) {
                 LLAMA_LOG_WARN("%s: BELLS disabled\n", __func__);
                 bells.reset();
             }

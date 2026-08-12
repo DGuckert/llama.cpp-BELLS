@@ -102,13 +102,27 @@ public:
         int32_t       il      = -1;
     };
 
-    // `backend`, when given, lets writes go out asynchronously on the compute stream instead
-    // of stalling the pipeline. Ordering against the graph still holds because it is the
-    // same stream the graph runs on.
+    // `backend` is the compute backend the graph runs on.
+    //
+    // `copy_backend`, when given, is a *second* backend on the same device, which means a second
+    // CUDA stream. This is the fix for the constraint that made every transfer optimisation in
+    // this project fail: ggml issues host-to-device copies on `cuda_ctx->stream()`, the same
+    // stream as the graph (ggml-cuda.cu:2991), and streams are strictly ordered - so a copy can
+    // never execute alongside a kernel, no matter which host thread enqueues it. Issuing copies
+    // on their own stream is the only way they can overlap compute at all.
+    //
+    // Ordering is then explicit rather than implicit: record an event after the copies and have
+    // the compute stream wait on it before anything reads the slots.
     ~bells_tensors() { free(); }
 
     bool init(ggml_backend_buffer_type_t buft, const std::vector<layer_src> & srcs,
-              uint32_t n_slot, ggml_backend_t backend = nullptr);
+              uint32_t n_slot, ggml_backend_t backend = nullptr,
+              ggml_backend_t copy_backend = nullptr);
+
+    // Order the copies issued since the last call against the compute stream. No-op unless a
+    // separate copy backend is in use; with one, this is what keeps the graph from reading a
+    // slot mid-write.
+    void sync_copies();
 
     void free();
 
@@ -160,11 +174,14 @@ private:
 
     entry & get_mut(uint32_t il) { return entries_[index_[il]]; }
 
-    void copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t expert, int32_t slot) const;
+    void copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t expert, int32_t slot);
 
-    ggml_context          *      ctx_     = nullptr;
-    ggml_backend_buffer_t        buffer_  = nullptr;
-    ggml_backend_t               backend_ = nullptr;
+    ggml_context          *      ctx_          = nullptr;
+    ggml_backend_buffer_t        buffer_       = nullptr;
+    ggml_backend_t               backend_      = nullptr;
+    ggml_backend_t               copy_backend_ = nullptr;   // second stream, not owned here
+    ggml_backend_event_t         copy_event_   = nullptr;
+    bool                         copies_pending_ = false;
 
     std::vector<entry>   entries_;
     std::vector<int32_t> index_;      // model layer -> entries_ index, -1 if not MoE
@@ -266,7 +283,8 @@ public:
               const std::vector<bells_tensors::layer_src> & srcs,
               uint32_t n_expert,
               uint32_t n_expert_used,
-              ggml_backend_t backend = nullptr);
+              ggml_backend_t backend = nullptr,
+              ggml_backend_t copy_backend = nullptr);
 
     ~bells_runtime() { free(); }
 

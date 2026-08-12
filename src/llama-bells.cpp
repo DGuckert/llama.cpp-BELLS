@@ -187,10 +187,21 @@ static ggml_tensor * bells_make_slice(ggml_context * ctx, ggml_tensor * src, uin
 }
 
 bool bells_tensors::init(ggml_backend_buffer_type_t buft, const std::vector<layer_src> & srcs,
-                         uint32_t n_slot, ggml_backend_t backend) {
+                         uint32_t n_slot, ggml_backend_t backend, ggml_backend_t copy_backend) {
     free();
 
-    backend_ = backend;
+    backend_      = backend;
+    copy_backend_ = copy_backend;
+
+    if (copy_backend_) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        copy_event_ = dev ? ggml_backend_event_new(dev) : nullptr;
+        if (!copy_event_) {
+            // without an event there is no way to order the two streams, and guessing would
+            // mean the graph reading half-written experts
+            copy_backend_ = nullptr;
+        }
+    }
 
     if (srcs.empty() || n_slot == 0) {
         return false;
@@ -278,6 +289,14 @@ bool bells_tensors::init(ggml_backend_buffer_type_t buft, const std::vector<laye
 }
 
 void bells_tensors::free() {
+    if (copy_event_) {
+        ggml_backend_event_synchronize(copy_event_);
+        ggml_backend_event_free(copy_event_);
+        copy_event_ = nullptr;
+    }
+    copy_backend_   = nullptr;
+    copies_pending_ = false;
+
     if (buffer_) {
         ggml_backend_buffer_free(buffer_);
         buffer_ = nullptr;
@@ -295,7 +314,7 @@ void bells_tensors::free() {
     bytes_per_expert_ = 0;
 }
 
-void bells_tensors::copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t expert, int32_t slot) const {
+void bells_tensors::copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t expert, int32_t slot) {
     if (!dst || !src) {
         return;
     }
@@ -305,11 +324,28 @@ void bells_tensors::copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t exper
     // the source expert stack is host resident, which is the whole premise of offloading
     const char * base = (const char *) src->data + (size_t) expert*stride;
 
-    if (backend_) {
+    if (copy_backend_) {
+        // second stream: this can genuinely overlap the graph, which is the entire point
+        ggml_backend_tensor_set_async(copy_backend_, dst, base, (size_t) slot*stride, stride);
+        copies_pending_ = true;
+    } else if (backend_) {
         ggml_backend_tensor_set_async(backend_, dst, base, (size_t) slot*stride, stride);
     } else {
         ggml_backend_tensor_set(dst, base, (size_t) slot*stride, stride);
     }
+}
+
+void bells_tensors::sync_copies() {
+    if (!copies_pending_ || !copy_backend_ || !copy_event_ || !backend_) {
+        return;
+    }
+
+    // Stream-level ordering, not a host stall: the compute stream is told to wait for the
+    // copies, and the host returns immediately.
+    ggml_backend_event_record(copy_event_, copy_backend_);
+    ggml_backend_event_wait(backend_, copy_event_);
+
+    copies_pending_ = false;
 }
 
 void bells_tensors::copy_expert(uint32_t il, int32_t expert, int32_t slot) {
@@ -445,7 +481,8 @@ bool bells_runtime::init(const bells_params & params,
                          const std::vector<bells_tensors::layer_src> & srcs,
                          uint32_t n_expert,
                          uint32_t n_expert_used,
-                         ggml_backend_t backend) {
+                         ggml_backend_t backend,
+                         ggml_backend_t copy_backend) {
     free();
 
     params_ = params;
@@ -585,7 +622,7 @@ bool bells_runtime::init(const bells_params & params,
                         "explicitly\n", __func__, n_slot, ratio);
     }
 
-    if (!tensors_.init(buft, srcs, n_slot, backend)) {
+    if (!tensors_.init(buft, srcs, n_slot, backend, copy_backend)) {
         fprintf(stderr, "%s: failed to allocate %u expert slots per layer\n", __func__, n_slot);
         return false;
     }
@@ -936,6 +973,11 @@ bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
     n_copied_ += copies_.size();
 
     const auto t_copy1 = std::chrono::steady_clock::now();
+
+    // Make the compute stream wait for this layer's copies before anything reads the slots.
+    // With one stream this is a no-op and the ordering was implicit; with two it is the only
+    // thing standing between the graph and a half-written expert.
+    tensors_.sync_copies();
 
     tensors_.upload_slots(il, cache_.slot_table(il));
 

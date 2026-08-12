@@ -146,8 +146,45 @@ That single fact explains every failure in these notes and in OPTIMIZATION.md:
 
 **The prerequisite for any of this is a second stream.** A second `ggml_backend_cuda_init` on
 the same device gets its own stream; copies go there, and `ggml_backend_event_record` /
-`ggml_backend_event_wait` order them against compute only where they must be. Until that exists,
-no prefetching scheme can pay, because there is nothing for the transfer to overlap with.
+`ggml_backend_event_wait` order them against compute only where they must be.
+
+### Built the second stream. It changes nothing, and that is the useful part.
+
+Implemented: copies issued on a second CUDA backend, ordered against the graph with an event so
+the dependency is stream-level rather than a host stall. Three paired passes at 17 slots:
+
+| | copy/layer | perplexity | decode |
+|---|---|---|---|
+| one stream | 1083.9 / 1097.2 / 1091.7 us | 13.8380 | 76.38 / 77.49 / 76.63 ms |
+| two streams | 1092.4 / 1103.4 / 1099.1 us | 13.8380 | 76.48 / 78.11 / 76.70 ms |
+
+Identical within noise. Correct, and pointless.
+
+**The copy timer is what gives it away.** It measures *host* time inside `copy_expert`, and it
+stays at ~1090 us with or without a second stream. A genuinely asynchronous copy would leave
+that near zero and do the work on the device. **The host is blocking for the full duration of
+every transfer**, so stream ordering was never the binding constraint - it was the second half
+of the problem, not the whole of it:
+
+> `cudaMemcpyAsync` from **pageable** memory is not asynchronous. The driver stages it through
+> an internal pinned buffer and the call blocks the caller.
+
+A second stream cannot fix a host-side stall. Nor could the background copy thread (for demand
+copies `on_routing` must finish before the layer proceeds). Nor could a staging buffer of our
+own, which merely duplicates the copy the driver already makes.
+
+**The two fixes are only useful together, and all the testing so far has been one at a time:**
+
+| | alone | why it failed |
+|---|---|---|
+| pinned source (own staging) | 37% slower | duplicated the driver's internal copy |
+| second stream | no change | the host still blocks |
+| `cudaHostRegister` + second stream | **untested** | removes the stall *and* allows overlap |
+
+Only registering the model's pages in place removes the host stall while leaving a copy that is
+actually async, which is the thing a second stream can then overlap. That pins pages against
+swap, so it needs a machine with RAM to spare - the 128 GB cloud instances, not a 32 GB desktop
+holding a 17 GB model.
 
 Worth one caution against over-claiming: on the configuration measured here, transfers (74.5 ms
 per token) exceed GPU compute (~16 ms), so perfect overlap would still leave transfers dominant.

@@ -214,28 +214,48 @@ rate rather than to everything. At the 70% hit rate measured on Qwen3-30B at 4x,
 - It degrades gracefully: at 0% hit it *is* `--cpu-moe`, so it should never be much worse than
   the baseline. The current design can be 6x worse.
 
-**It is implementable with machinery that already exists.** The slot table already maps a
-non-resident expert to a zero slot - that mechanism was built for the removed `drop_missing`
-mode, where a missing expert contributed nothing. Reuse it on both sides:
+**The mechanism it needs exists, and is verified.** The obvious objection is that masking wastes
+work: point half the ids somewhere harmless and the matmul computes them anyway. That is not how
+ggml's CPU `mul_mat_id` behaves. It buckets rows by expert first and then skips any expert no row
+selected (`ggml-cpu.c:1628`):
 
-- GPU path: `mul_mat_id` over the cache, non-resident ids -> zero slot, contributing 0
-- CPU path: `mul_mat_id` over the host tensors, resident ids -> a zero row, contributing 0
-- sum the two
+```c
+for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+    const int64_t cne1 = matrix_row_counts[cur_a];
+    if (cne1 == 0) {
+        continue;          // never touched, so never read from memory
+    }
+```
 
-Both paths run over the same routing ids, each masking out what the other handled, and the sum
-is exact. No mid-graph decision is needed beyond the slot table the runtime already uploads.
-`ggml_backend_sched` already places ops across backends, which is how `--cpu-moe` works at all.
+An expert nothing points at costs nothing - not even the weight read, which is the whole cost on
+a memory-bound CPU path. So:
 
-**Costs and unknowns, stated before rather than after:**
+- **GPU path**: `mul_mat_id` over the cache. Non-resident ids -> the zero slot, contributing 0.
+  This is exactly the machinery built for the removed `drop_missing` mode.
+- **CPU path**: `mul_mat_id` over the host tensors. Resident ids are pointed at *one of the
+  experts this token is already missing*, and their router weight is set to 0 so the garbage
+  they produce is multiplied away.
+- sum the two.
 
-- Doubles the number of MoE matmuls, most of them mostly-zero work. Whether ggml's `mul_mat_id`
-  skips zero rows cheaply is unverified and decides whether this is viable.
-- Adds a CPU/GPU sync per layer for the join, which the current design also has.
-- The CPU path cannot start until routing is known, same as today.
-- **Entirely untested.** This is a design note, not a result. Given that five predictions in
-  this project were confidently wrong before measurement, treat it as a hypothesis with a clear
-  falsification test: build it, and measure against `--cpu-moe` on GPT-OSS-120B, the case the
-  current design loses worst.
+Pointing the masked ids at an expert already being computed rather than at a spare is what makes
+the CPU cost exactly "the distinct missing experts, and nothing else". A dedicated dummy expert
+would have added one wasted weight read per layer. (When a token misses nothing there is no such
+expert to borrow; that token pays one wasted expert, or the layer skips the CPU path entirely.)
+
+**Costs and unknowns, honestly:**
+
+- Needs `build_moe_ffn` to emit two expert paths and a join, which is a real change to graph
+  construction rather than a tuning knob.
+- Relies on `ggml_backend_sched` placing the CPU matmul on the CPU and not migrating the expert
+  tensors. `--cpu-moe` already depends on that working, so the risk is moderate.
+- The join is another cross-device dependency per layer. The current design already pays a
+  host round trip per layer, so this may be a wash - but "may be" is doing work in that sentence.
+- The weights for masked slots must be zeroed on the CPU side only, so the two paths need
+  different weight vectors. Cheap, but fiddly.
+- **Still untested end to end.** The mechanism is verified; the design is not. Three of the four
+  avenues in these notes were expected to work and did not. The falsification test:
+  build it and measure against `--cpu-moe` on GPT-OSS-120B, the configuration the current design
+  loses worst (0.16x), where a design whose floor is `--cpu-moe` should show the largest gain.
 
 ---
 

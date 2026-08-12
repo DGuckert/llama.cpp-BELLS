@@ -12,11 +12,18 @@ Qwen3-30B-A3B at 17 slots, the per-layer cost splits as
 Across 48 layers that is 74.5 ms of a 90.84 ms decode. **Transfers are the system.** Anything
 that does not reduce bytes moved, or make a miss stop requiring a transfer, is rounding error.
 
-There are only three ways to move fewer bytes:
+There are only three ways to make transfers cost less:
 
-1. miss less often - **tested below, dead end**
-2. transfer more cheaply - bounded by PCIe, and on some hardware badly so
-3. **stop transferring on a miss at all** - the promising one, sketched at the end
+1. miss less often - **tested below, dead end.** Seven policies, two architectures, nothing
+   beats LRU.
+2. **transfer more cheaply - a projected 1.43x, and the clearest next task.** The copies run at
+   7.09 GB/s against a 12.25 GB/s pinned benchmark on the same machine.
+3. stop transferring on a miss at all - the largest prize and the largest unknown; a design
+   sketch, not a result.
+
+Ordered by expected value: **do (2) first.** It is a bounded change to one function with a
+measured gap behind it. (3) rewrites how the MoE graph is built and rests on an assumption
+about `mul_mat_id` that has not been checked.
 
 ---
 
@@ -64,24 +71,61 @@ That gap is the price of not knowing the future, not a bug in LRU.
 
 ---
 
-## 2. Cheaper transfers: mostly not available
+## 2. Cheaper transfers: a measured 1.43x is sitting there
 
-**Pinned staging is a wash or a loss.** Measured host-to-device: 9.0 GB/s pageable, 12.25 GB/s
-pinned on the desktop. Tempting, but the source is the model's mmap, so using a pinned buffer
-means `mmap -> pinned` (host memcpy, ~20 GB/s) then `pinned -> device` (12.25). Serially that is
-`1/(1/20 + 1/12.25)` = **7.6 GB/s, worse than the 9.0 direct path**. It only pays if the memcpy
-of expert *n+1* overlaps the DMA of expert *n*, which needs a double-buffered pipeline and wins
-at most 36%.
+This is the most valuable thing in these notes, and it comes straight out of the existing
+counters. The same run reports 164.96 GiB moved and 1356.3 us of copy per layer-call over 18432
+calls:
 
-**PCIe width matters more than any of this.** The same benchmark on a laptop dGPU: 3.11 GB/s
-pageable, 3.14 pinned, because the card is wired x4 instead of x16 (`LnkSta: Width x4
-(downgraded)`). Pinned memory stops helping entirely there. No software change recovers a
-missing 12 lanes.
+```
+177.1 GB  /  25.0 s  =  7.09 GB/s effective
+```
 
-**Batching the per-expert copies** is untested and plausible. Each miss issues 3-4 separate
-`ggml_backend_tensor_set_async` calls (gate, up, down), each a strided read of one expert. At
-~2 misses per layer that is ~6 small transfers per layer, 288 per token on a 48-layer model.
-Coalescing adjacent slots into one transfer would cut launch overhead, though not bytes.
+Against the selftest's own bandwidth benchmark on the same machine:
+
+| | GB/s | vs effective |
+|---|---|---|
+| **BELLS copies, measured** | **7.09** | - |
+| benchmark, pageable | 9.02 | 1.27x |
+| benchmark, pinned | 12.25 | **1.73x** |
+
+Two things follow. We are at **79% of pageable peak**, so per-transfer launch overhead is small
+and coalescing copies is not where the money is. But we are at **58% of pinned peak**, and that
+gap is worth having:
+
+```
+copy/layer        1356 -> 784 us
+per-layer total   1552 -> 980 us
+BELLS overhead    74.5 -> 47.1 ms/token
+decode            90.84 -> 63.4 ms   =  1.43x
+```
+
+**Why the copies are pageable.** The source is the model's mmap, which is ordinary pageable
+memory. `cudaMemcpyAsync` from pageable memory is not truly asynchronous - the driver stages it
+internally and the call blocks - so BELLS pays both the slower path and a stall it did not ask
+for. `ggml_backend_tensor_set_async` cannot fix that; the memory has to be pinned.
+
+**Two ways to get it, with different risk:**
+
+*Register the expert tensors in place* (`cudaHostRegister`). No staging copy at all, and the
+existing code path is otherwise unchanged. The hazard is that pinned pages cannot be swapped:
+pinning a 27 GB model on a 32 GB machine is asking for trouble, and registration of a large
+file-backed mapping can itself be slow. Viable where RAM is plentiful (the 128 GB configurations
+this technique actually wins on), reckless on a laptop.
+
+*Double-buffered pinned staging.* Bounded memory, no swap hazard, works everywhere. `mmap ->
+pinned` memcpy runs at ~20 GB/s and `pinned -> device` at 12.25, so overlapping expert *n+1*'s
+memcpy with expert *n*'s DMA converges on 12.25 rather than the serial
+`1/(1/20 + 1/12.25)` = 7.6 GB/s, which would be *worse* than today. The overlap is the entire
+point - a naive staging buffer is a regression.
+
+Numbers above are projections from measured rates, not results. The falsification test is
+direct: pin the source, re-run the same profile, and check whether copy/layer approaches 784 us.
+
+**PCIe width still dominates all of it.** On a laptop dGPU the same benchmark gives 3.11 GB/s
+pageable and 3.14 pinned - pinning buys *nothing* there, because the card is wired x4 instead of
+x16 (`LnkSta: Width x4 (downgraded)`). This optimization helps the machines where BELLS already
+wins and does nothing for the ones where it loses.
 
 ---
 

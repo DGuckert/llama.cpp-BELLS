@@ -4,8 +4,6 @@
 #include "ggml-backend.h"
 
 #include <cstdint>
-#include <string>
-#include <utility>
 #include <vector>
 
 // BELLS: a per-layer VRAM expert cache.
@@ -114,13 +112,6 @@ public:
     // copy one expert from the model tensors into its slot
     void copy_expert(uint32_t il, int32_t expert, int32_t slot);
 
-    // Touch the source pages for a set of experts across worker threads.
-    //
-    // When the model is larger than RAM these reads come off disk, and faulting them one at
-    // a time leaves the NVMe at queue depth 1, which costs most of its throughput. Issuing
-    // them in parallel first means the later copies hit warm pages.
-    void prefault(const std::vector<std::pair<uint32_t, int32_t>> & experts, int n_threads) const;
-
     // push the current expert->slot mapping to the device
     void upload_slots(uint32_t il, const std::vector<int32_t> & table);
 
@@ -197,9 +188,6 @@ struct bells_params {
     // at 1, BELLS silently did nothing as soon as two requests decoded together.
     uint32_t    max_tokens = 0;
 
-    // Threads used to fault source pages in before copying. Only matters when the model is
-    // larger than RAM; 0 disables. Exists to give the NVMe enough queue depth.
-    int         n_fault_threads = 8;
 };
 
 // Ties the pieces together for the inference path.
@@ -247,7 +235,6 @@ private:
     bells_tensors tensors_;
 
     std::vector<bells_copy> copies_;
-    std::vector<std::pair<uint32_t, int32_t>> faults_;
 
     bool     ready_      = false;
     bool     active_now_ = false;

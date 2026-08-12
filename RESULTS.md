@@ -212,6 +212,45 @@ Two caveats:
 Note also that `-ngl` is not merely slower here, it cannot run the model at all. Expert-level
 caching lets a 27 GB model run on a 24 GB card; layer-level offload does not.
 
+## On a 6 GB card, under a server workload, BELLS does not help
+
+The 1.52x recorded for Qwen3-30B-A3B on an RTX 2060 was measured with `llama-bells-profile` at
+`-c 512`: pure decode, no prefill, no chat template, no sampling, and a large cache precisely
+because a 512-token context leaves VRAM free. Re-measured through `llama-server` with
+100-token chat completions, three passes each after a heavy warmup, paired within one session:
+
+| concurrency | `--cpu-moe` | BELLS, 17 slots | ratio |
+|---|---|---|---|
+| 1 | 10.70 | 10.02 | 0.94x |
+| 2 | 13.18 | 12.79 | 0.97x |
+| 3 | 15.16 | 14.40 | 0.95x |
+| 4 | 17.69 | 17.00 | 0.96x |
+
+Uniformly about 5% slower. The shape is the informative part: with 17 slots BELLS serves
+`ubatch <= 2`, so at concurrency 3 and 4 it bypasses itself entirely and should cost nothing -
+yet those are slower too. **The cache occupies its VRAM whether or not it is used**, roughly
+1.5 GB here, and squeezing the compute buffers on a 6 GB card costs about 5% unconditionally.
+The benefit at low concurrency does not cover that fixed tax.
+
+### The cache and the context come out of the same VRAM
+
+llama.cpp allocates the KV cache first and BELLS sizes itself from the remainder, so context
+length silently determines whether a cache is possible at all. Same card, same model:
+
+| context | free VRAM at BELLS init | slots | ratio | verdict printed |
+|---|---|---|---|---|
+| 16384 | 2.4 GiB | 10 | 1.2x | "poor fit, expect a slowdown" |
+| 4096 | 3.6 GiB | 17 | 2.1x | "workable" |
+
+At `-c 16384` the tool warns and then proceeds anyway, and the measured result is 0.83x at
+concurrency 1 - exactly what it warned about. That is a usability bug: it should refuse below a
+ratio it knows is bad, not print a line the user will not read.
+
+**The honest summary for a 6 GB card: use `--cpu-moe` and leave BELLS off.** It needs room for a
+large cache *and* a real context at the same time, and 6 GB cannot provide both. The 24 GB
+results below are unaffected - that card holds a 16K context and a 128-slot cache simultaneously,
+which is why they work.
+
 ## The comparable set: one GPU, one CPU count, four models
 
 Everything below was measured on the same A10G 24 GB with **16 vCPU and 128 GB RAM**, same

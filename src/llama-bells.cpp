@@ -4,7 +4,6 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <thread>
 
 void bells_cache::init(uint32_t n_layer, uint32_t n_expert, uint32_t n_slot) {
     n_layer_  = n_layer;
@@ -253,53 +252,6 @@ void bells_tensors::copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t exper
     }
 }
 
-void bells_tensors::prefault(const std::vector<std::pair<uint32_t, int32_t>> & experts, int n_threads) const {
-    if (experts.empty() || n_threads < 1) {
-        return;
-    }
-
-    n_threads = std::min<int>(n_threads, (int) experts.size());
-
-    // reading one byte per page is enough to fault it in; volatile keeps it from being elided
-    auto worker = [&](int id) {
-        for (size_t i = id; i < experts.size(); i += n_threads) {
-            const uint32_t il = experts[i].first;
-            const int32_t   e = experts[i].second;
-
-            if (!has(il)) {
-                continue;
-            }
-
-            const entry & ent = get(il);
-
-            for (ggml_tensor * src : { ent.src.gate, ent.src.up, ent.src.down, ent.src.gate_up }) {
-                if (!src || !src->data) {
-                    continue;
-                }
-
-                const size_t stride = ggml_nbytes(src)/src->ne[2];
-                const volatile char * p = (const char *) src->data + (size_t) e*stride;
-
-                for (size_t off = 0; off < stride; off += 4096) {
-                    (void) p[off];
-                }
-            }
-        }
-    };
-
-    std::vector<std::thread> pool;
-    pool.reserve(n_threads - 1);
-
-    for (int t = 1; t < n_threads; ++t) {
-        pool.emplace_back(worker, t);
-    }
-    worker(0);
-
-    for (auto & t : pool) {
-        t.join();
-    }
-}
-
 void bells_tensors::copy_expert(uint32_t il, int32_t expert, int32_t slot) {
     if (!has(il)) {
         return;
@@ -509,18 +461,12 @@ bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
         return false;
     }
 
-    // Fault all the source pages in first, across threads, then copy. When the model is larger
-    // than RAM these reads come off disk, and faulting inside the copy loop leaves the drive at
-    // queue depth 1 - worth 2042 -> 1430 ms on GPT-OSS-120B when this ran on the prefetch path.
-    // Skipped for a single copy, where the thread handoff costs more than it saves.
-    if (params_.n_fault_threads > 0 && copies_.size() > 1) {
-        faults_.clear();
-        for (const auto & c : copies_) {
-            faults_.emplace_back(il, c.expert);
-        }
-        tensors_.prefault(faults_, params_.n_fault_threads);
-    }
-
+    // No parallel prefault here, though it is tempting. It belonged to the prefetch path, where
+    // one call covered every layer's admissions for the whole token. On the demand path it
+    // would run per layer - 48x per token on Qwen3-Next, spawning a thread pool each time - and
+    // measuring it that way cost more than it saved: 1.01/1.14/1.12x against --cpu-moe at
+    // concurrency 1-4 became 0.88/0.94/0.93x. Its only win was GPT-OSS-120B, a configuration
+    // BELLS loses at anyway, so it never converted a loss into a win. See RESULTS.md.
     for (const auto & c : copies_) {
         tensors_.copy_expert(il, c.expert, c.slot);
     }

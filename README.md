@@ -45,13 +45,36 @@ not), and hit rate fails in both directions.
 slots and falls to 0.73x at 36; Mixtral peaks at 4 and drops to 0.80x at 8; Qwen3-Next reaches
 a knee at 128 and then simply stops improving. Start with `--bells-slots -1` and sweep.
 
-Across three models on the 6 GB card:
+### On a 6 GB card, don't bother
+
+Three models with `llama-bells-profile` at `-c 512` - pure decode, no prefill or sampling, and
+a large cache because a 512-token context leaves VRAM free:
 
 | Model | cache ratio | baseline | BELLS | result |
 |---|---|---|---|---|
-| Qwen3-30B-A3B (Q4_K_M) | 2.2x | 11.4 tok/s | 17.6 tok/s | **1.52x** |
-| Qwen3-Next-80B (Q2_K) | 4.7x | 15.5 tok/s | 18.4 tok/s | **1.18x** |
-| GPT-OSS-120B (MXFP4) | 1.0x | 1.82 tok/s | 1.15 tok/s | **0.63x - slower** |
+| Qwen3-30B-A3B (Q4_K_M) | 2.2x | 11.4 tok/s | 17.6 tok/s | 1.52x |
+| Qwen3-Next-80B (Q2_K) | 4.7x | 15.5 tok/s | 18.4 tok/s | 1.18x |
+| GPT-OSS-120B (MXFP4) | 1.0x | 1.82 tok/s | 1.15 tok/s | 0.63x - slower |
+
+**Those do not survive a server workload.** The same 2060 and the same Qwen3-30B, through
+`llama-server` at `-c 4096` with 100-token chat completions, paired and warmed:
+
+| concurrency | `--cpu-moe` | BELLS | ratio |
+|---|---|---|---|
+| 1 | 10.70 | 10.02 | 0.94x |
+| 2 | 13.18 | 12.79 | 0.97x |
+| 3 | 15.16 | 14.40 | 0.95x |
+| 4 | 17.69 | 17.00 | 0.96x |
+
+Uniformly ~5% slower, including at concurrencies where BELLS bypasses itself and should cost
+nothing - **the cache holds its VRAM whether used or not**, and on a 6 GB card that squeeze is
+worth about 5%. Worse, the cache and the KV cache come out of the same pool: at `-c 16384`
+there is only room for a 1.2x ratio, which BELLS itself labels *"poor fit, expect a slowdown"*
+before proceeding anyway, and it duly measures 0.83x.
+
+**If you have 6 GB, use `--cpu-moe` and leave BELLS off.** It needs room for a large cache *and*
+a real context at once. The 24 GB results above are unaffected, because that card has room for
+both.
 
 ### Superseded: the same models at 8 vCPU
 
@@ -174,6 +197,10 @@ Three further conditions:
   mmap the baseline does, so a miss costs the same disk read *plus* a PCIe copy. Strictly worse.
 - **Helps decode, not prefill.** A 512-token prompt touches 57-64 of 64 experts, so there is
   no hot set to exploit. Long prompts pay full price.
+- **You need enough VRAM for a large cache *and* your context, at once.** They come out of the
+  same pool and llama.cpp allocates the KV cache first. On a 6 GB card at `-c 16384` only a
+  1.2x ratio fits, which is worse than useless. 24 GB holds a 16K context and a 128-slot cache
+  together, which is why every positive result here is on the larger card.
 - **The weaker your CPU, the more this helps** - possibly the whole of the effect. BELLS moves
   expert compute onto the GPU, so its own throughput barely responds to core count while the
   `--cpu-moe` baseline does. Doubling cores left Qwen3-Next's BELLS number at 39.9 -> 41.3

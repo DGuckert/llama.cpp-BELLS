@@ -35,9 +35,15 @@ void bells_cache::reset() {
     clock_ = 0;
 }
 
-int32_t bells_cache::victim(layer & l, const int32_t * keep, size_t n_keep) const {
+int32_t bells_cache::victim(layer & l, const int32_t * keep, size_t n_keep,
+                            const std::vector<uint8_t> * protect) const {
     int32_t best     = -1;
     int64_t best_age = 0;
+
+    // Second choice, used only when everything unprotected is spoken for. Keeping it means a
+    // wrong prediction costs a worse eviction rather than a failed ensure().
+    int32_t fallback     = -1;
+    int64_t fallback_age = 0;
 
     for (uint32_t s = 0; s < n_slot_; ++s) {
         const int32_t held = l.slot_expert[s];
@@ -57,13 +63,23 @@ int32_t bells_cache::victim(layer & l, const int32_t * keep, size_t n_keep) cons
             continue;
         }
 
+        const bool wanted_soon = protect && (size_t) held < protect->size() && (*protect)[held];
+
+        if (wanted_soon) {
+            if (fallback < 0 || l.last_used[s] < fallback_age) {
+                fallback     = (int32_t) s;
+                fallback_age = l.last_used[s];
+            }
+            continue;
+        }
+
         if (best < 0 || l.last_used[s] < best_age) {
             best     = (int32_t) s;
             best_age = l.last_used[s];
         }
     }
 
-    return best;
+    return best >= 0 ? best : fallback;
 }
 
 void bells_cache::prefetch(uint32_t il, const int32_t * experts, size_t n, std::vector<bells_copy> & out) {
@@ -107,7 +123,8 @@ void bells_cache::prefetch(uint32_t il, const int32_t * experts, size_t n, std::
     }
 }
 
-bool bells_cache::ensure(uint32_t il, const int32_t * experts, size_t n, std::vector<bells_copy> & out) {
+bool bells_cache::ensure(uint32_t il, const int32_t * experts, size_t n,
+                         std::vector<bells_copy> & out, const std::vector<uint8_t> * protect) {
     if (!enabled() || il >= n_layer_) {
         return true;
     }
@@ -130,7 +147,7 @@ bool bells_cache::ensure(uint32_t il, const int32_t * experts, size_t n, std::ve
 
         n_miss_++;
 
-        const int32_t s = victim(l, experts, n);
+        const int32_t s = victim(l, experts, n, protect);
         if (s < 0) {
             // more distinct experts requested than the cache can hold
             return false;
@@ -594,11 +611,46 @@ bool bells_runtime::init(const bells_params & params,
                 conf_thresh_ = (float) atof(ct);
             }
             if (conf_.load(tp)) {
-                pf_pending_.assign(n_layer, 0);
-                pf_start();
-                fprintf(stderr, "%s: confidence prefetch on, table %s, threshold %.2f, "
-                                "copies on a background thread\n",
-                        __func__, tp, conf_thresh_);
+                // Prefetch is now opt-in, so lookahead eviction can be measured without it.
+                // It has never produced a speedup: copies share the compute stream, so moving
+                // a transfer earlier does not let it overlap anything.
+                if (const char * pf = getenv("BELLS_PREFETCH")) {
+                    if (pf[0] && pf[0] != '0') {
+                        pf_pending_.assign(n_layer, 0);
+                        pf_start();
+                        fprintf(stderr, "%s: confidence prefetch on, threshold %.2f\n",
+                                __func__, conf_thresh_);
+                    }
+                }
+
+                // Lookahead eviction: protect what the next K tokens are predicted to want.
+                if (const char * la = getenv("BELLS_LOOKAHEAD")) {
+                    const uint32_t k = (uint32_t) atoi(la);
+                    const char * fp  = getenv("BELLS_FUTURE");
+
+                    if (k > 0 && fp && fp[0]) {
+                        std::ifstream ff(fp, std::ios::binary);
+                        if (ff) {
+                            ff.seekg(0, std::ios::end);
+                            const size_t n_tok = (size_t) ff.tellg()/sizeof(int32_t);
+                            ff.seekg(0, std::ios::beg);
+                            future_.resize(n_tok);
+                            ff.read((char *) future_.data(), (std::streamsize) n_tok*sizeof(int32_t));
+                        }
+
+                        if (!future_.empty()) {
+                            lookahead_ = k;
+                            protect_.assign(n_layer, std::vector<uint8_t>(n_expert, 0));
+                            fprintf(stderr, "%s: lookahead eviction on, K=%u, %zu future tokens\n",
+                                    __func__, k, future_.size());
+                        } else {
+                            fprintf(stderr, "%s: could not read future tokens from '%s'\n",
+                                    __func__, fp);
+                        }
+                    }
+                }
+
+                fprintf(stderr, "%s: confidence table %s loaded\n", __func__, tp);
             } else {
                 fprintf(stderr, "%s: could not load confidence table '%s', prefetch off\n",
                         __func__, tp);
@@ -742,11 +794,62 @@ void bells_runtime::pf_drain(uint32_t il) {
     });
 }
 
-void bells_runtime::begin_ubatch(int32_t token, int64_t n_tokens) {
+void bells_runtime::build_protect(int32_t pos) {
+    // Union of the experts the next K tokens are predicted to want, per layer. Confidence is
+    // deliberately not thresholded here: for eviction a weak signal is still better than the
+    // nothing LRU has, and a wrong entry only costs a slightly worse victim choice.
+    for (int32_t il : tensors_.layers()) {
+        if ((size_t) il >= protect_.size()) {
+            continue;
+        }
+        std::fill(protect_[il].begin(), protect_[il].end(), (uint8_t) 0);
+    }
+
+    for (uint32_t k = 1; k <= lookahead_; ++k) {
+        const size_t p = (size_t) pos + k;
+        if (p >= future_.size()) {
+            break;
+        }
+
+        const int32_t tok = future_[p];
+
+        for (int32_t il : tensors_.layers()) {
+            if ((size_t) il >= protect_.size()) {
+                continue;
+            }
+
+            const float * cf = nullptr;
+            const int32_t * ex = conf_.predict(tok, (uint32_t) il, &cf);
+            if (!ex) {
+                continue;
+            }
+
+            for (uint32_t j = 0; j < conf_.max_k(); ++j) {
+                if (ex[j] < 0) {
+                    break;
+                }
+                if ((size_t) ex[j] < protect_[il].size()) {
+                    protect_[il][ex[j]] = 1;
+                    n_protect_hits_++;
+                }
+            }
+        }
+    }
+}
+
+void bells_runtime::begin_ubatch(int32_t token, int32_t pos, int64_t n_tokens) {
     active_now_ = active(n_tokens);
 
     if (!active_now_ || !conf_.enabled() || token < 0) {
         return;
+    }
+
+    if (lookahead_ > 0 && pos >= 0 && !future_.empty()) {
+        build_protect(pos);
+    }
+
+    if (!pf_enabled_) {
+        return;   // lookahead eviction only; prefetch is a separate opt-in
     }
 
     // Prefetch every layer here, before the graph runs. The token id is known now and layer 47's
@@ -811,8 +914,11 @@ bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
 
     // Every expert this layer asked for must be resident before the matmul reads the slot
     // table, so this is a demand fetch with no lead time to hide it behind.
+    const std::vector<uint8_t> * protect =
+        (lookahead_ > 0 && il < protect_.size()) ? &protect_[il] : nullptr;
+
     copies_.clear();
-    if (!cache_.ensure(il, experts, n, copies_)) {
+    if (!cache_.ensure(il, experts, n, copies_, protect)) {
         return false;
     }
 

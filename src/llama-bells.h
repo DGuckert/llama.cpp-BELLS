@@ -47,7 +47,14 @@ public:
 
     // Mandatory: after this every expert in `experts` is resident, or it returns false
     // because the request exceeds n_slot and cannot be satisfied at all.
-    bool ensure(uint32_t il, const int32_t * experts, size_t n, std::vector<bells_copy> & out);
+    //
+    // `protect`, when given, is a bitmap over experts that upcoming tokens are expected to want.
+    // Eviction prefers anything outside it, which is Belady approximated through whatever
+    // supplies the prediction. It is only a preference: if every evictable slot is protected the
+    // fallback is plain LRU, so residency is still guaranteed and the caller cannot deadlock
+    // itself with a bad hint.
+    bool ensure(uint32_t il, const int32_t * experts, size_t n, std::vector<bells_copy> & out,
+                const std::vector<uint8_t> * protect = nullptr);
 
     void reset();
 
@@ -61,8 +68,10 @@ private:
         std::vector<int64_t> last_used;    // n_slot
     };
 
-    // slot to evict, preferring empty, then least recently used, skipping anything pinned
-    int32_t victim(layer & l, const int32_t * keep, size_t n_keep) const;
+    // slot to evict, preferring empty, then least recently used, skipping anything pinned.
+    // With `protect`, unprotected slots are exhausted before any protected one is touched.
+    int32_t victim(layer & l, const int32_t * keep, size_t n_keep,
+                   const std::vector<uint8_t> * protect = nullptr) const;
 
     uint32_t n_layer_  = 0;
     uint32_t n_expert_ = 0;
@@ -284,7 +293,7 @@ public:
     // The token id is what makes prefetching possible: it is known before layer 0 runs, while
     // layer 47's experts are not needed for another 47 layers. Lead time was never the problem
     // with the old predictor - bandwidth was.
-    void begin_ubatch(int32_t token, int64_t n_tokens);
+    void begin_ubatch(int32_t token, int32_t pos, int64_t n_tokens);
 
     // called once layer il's router has produced its selection; guarantees residency
     bool on_routing(uint32_t il, const int32_t * experts, size_t n);
@@ -317,6 +326,26 @@ private:
     float    conf_thresh_ = 0.9f;
     uint64_t n_prefetched_ = 0;
     uint64_t n_pf_used_    = 0;
+
+    // Lookahead eviction.
+    //
+    // The one idea here that survives the fact that copies share the compute stream. Prefetching
+    // cannot reduce bytes - it moves the same experts through the same bottleneck, earlier -
+    // whereas evicting the right thing removes transfers outright. Belady sits 13.6 points above
+    // LRU at a 4x ratio, and offline a 4-token window captures about half of that, worth ~23%
+    // fewer transfers and 25%+ less VRAM for the same hit rate.
+    //
+    // Belady needs the future, which the token-id table cannot supply on its own: it describes
+    // the *current* token. Feed it the next K token ids and it yields the experts those tokens
+    // will want, which is what eviction should protect. In production those ids would come from
+    // a draft model; here they come from a dump of the real sequence, which measures the ceiling
+    // rather than what a 60-80% accurate drafter would deliver.
+    std::vector<int32_t>  future_;        // token id by position, from BELLS_FUTURE
+    uint32_t              lookahead_ = 0; // K, 0 = off
+    std::vector<std::vector<uint8_t>> protect_;  // per model layer, bitmap over experts
+    uint64_t              n_protect_hits_ = 0;
+
+    void build_protect(int32_t pos);
 
     // Background copier.
     //

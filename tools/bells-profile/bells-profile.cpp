@@ -893,6 +893,22 @@ int main(int argc, char ** argv) {
         w_path += ".weights.bin";
 
         bells_write_weights(w_path, prof, n_expert_used);
+
+        // The token sequence by position, for BELLS_FUTURE. Lookahead eviction needs to know
+        // what the next few tokens will be; in production that would come from a draft model,
+        // and feeding it the real sequence here measures the ceiling instead.
+        std::string t_path = trace_path;
+        t_path.erase(t_path.size() - strlen(".trace.bin"));
+        t_path += ".tokens.bin";
+
+        {
+            std::ofstream tf(t_path, std::ios::binary);
+            if (tf) {
+                tf.write((const char *) tokens.data(),
+                         (std::streamsize) tokens.size()*sizeof(llama_token));
+                LOG_INF("%s: wrote %s (%zu tokens)\n", __func__, t_path.c_str(), tokens.size());
+            }
+        }
     }
 
     llama_backend_free();

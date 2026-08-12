@@ -22,7 +22,6 @@ Confidence is P(expert used | this token id, this layer), counted over the trace
 import argparse
 import struct
 import sys
-from collections import defaultdict
 
 import numpy as np
 
@@ -44,30 +43,40 @@ def main():
     n_layer, n_expert = t["n_layer"], t["n_expert"]
     rows, tokens = t["rows"], t["tokens"]
 
-    seen = defaultdict(int)
-    for tok in tokens.tolist():
-        seen[int(tok)] += 1
+    # Counting is done with bincount rather than nested loops. At the trace sizes this is meant
+    # for - 200k records, 48 layers, 8 ids each - the loop version is 79M Python iterations and
+    # takes the better part of a day, which is how it escaped notice on a 7k-record trace.
+    uniq, first_count = np.unique(tokens, return_counts=True)
 
-    keep = sorted(tok for tok, c in seen.items() if c >= a.min_count)
-    if not keep:
+    keep_mask = first_count >= a.min_count
+    keep = uniq[keep_mask].astype(np.int64)
+    if keep.size == 0:
         sys.exit("no token appears often enough to be worth a table entry")
 
-    index = {tok: i for i, tok in enumerate(keep)}
+    n_keep = int(keep.size)
+    keep_n = first_count[keep_mask].astype(np.float64)   # sightings per kept token, aligned to keep
 
-    counts = np.zeros((len(keep), n_layer, n_expert), dtype=np.int32)
+    # record -> row in the table, or -1 for tokens that did not clear min-count
+    slot = np.searchsorted(keep, tokens)
+    slot = np.where((slot < n_keep) & (keep[np.minimum(slot, n_keep - 1)] == tokens), slot, -1)
+    kept_rec = slot >= 0
+    slot_kept = slot[kept_rec]
+
+    counts   = np.zeros((n_keep, n_layer, n_expert), dtype=np.int32)
     globals_ = np.zeros((n_layer, n_expert), dtype=np.int64)
 
-    for i in range(t["n_rec"]):
-        tok = int(tokens[i])
-        gi = index.get(tok)
-        for il in range(n_layer):
-            for e in rows[i, il, :]:
-                globals_[il, int(e)] += 1
-                if gi is not None:
-                    counts[gi, il, int(e)] += 1
+    # One bincount per layer keeps the flat index under n_keep*n_expert instead of
+    # n_keep*n_layer*n_expert, which for a 20k-token table is 2.6M instead of 123M.
+    for il in range(n_layer):
+        ids = rows[:, il, :].astype(np.int64)
+        globals_[il] = np.bincount(ids.ravel(), minlength=n_expert)[:n_expert]
 
-    print(f"{t['n_rec']} records, {len(keep)} tokens kept "
-          f"(of {len(seen)} distinct, min-count {a.min_count})")
+        flat = (slot_kept[:, None]*n_expert + ids[kept_rec]).ravel()
+        counts[:, il, :] = np.bincount(
+            flat, minlength=n_keep*n_expert).reshape(n_keep, n_expert).astype(np.int32)
+
+    print(f"{t['n_rec']} records, {n_keep} tokens kept "
+          f"(of {uniq.size} distinct, min-count {a.min_count})")
 
     max_k = a.max_k
 
@@ -79,21 +88,23 @@ def main():
                          dtype=np.uint32).tobytes())
         f.write(np.array(keep, dtype=np.int32).tobytes())
 
-        # per token
-        for gi, tok in enumerate(keep):
-            n = seen[tok]
-            for il in range(n_layer):
-                c = counts[gi, il]
-                top = np.argsort(-c)[:max_k]
-                ex = np.full(max_k, -1, dtype=np.int32)
-                cf = np.zeros(max_k, dtype=np.float32)
-                for j, e in enumerate(top):
-                    if c[e] <= 0:
-                        break
-                    ex[j] = e
-                    cf[j] = c[e]/float(n)
-                f.write(ex.tobytes())
-                f.write(cf.tobytes())
+        # per token. The on-disk block is ex[max_k] then cf[max_k] for each (token, layer), and
+        # both are 4 bytes wide, so the whole thing is built as one uint32 array with the pair
+        # axis in the middle and written in a single call - 960k argsorts otherwise.
+        block = np.empty((n_keep, n_layer, 2, max_k), dtype=np.uint32)
+
+        for il in range(n_layer):
+            c   = counts[:, il, :]                                  # (n_keep, n_expert)
+            top = np.argsort(-c, axis=1, kind="stable")[:, :max_k]   # ties -> lowest expert id
+            val = np.take_along_axis(c, top, axis=1)
+
+            ex = np.where(val > 0, top, -1).astype(np.int32)
+            cf = np.where(val > 0, val/keep_n[:, None], 0.0).astype(np.float32)
+
+            block[:, il, 0, :] = ex.view(np.uint32)
+            block[:, il, 1, :] = cf.view(np.uint32)
+
+        f.write(block.tobytes())
 
         # global fallback
         total = max(1, t["n_rec"])
@@ -115,12 +126,16 @@ def main():
 
     # what the runtime will actually see at each threshold
     print("\ncandidates per layer that clear each threshold (mean over kept tokens):")
-    for thr in (0.9, 0.7, 0.5, 0.3):
-        n_pass = 0
-        for gi, tok in enumerate(keep):
-            n = seen[tok]
-            n_pass += int(((counts[gi]/float(n)) >= thr).sum())
-        print(f"  {thr:.2f}: {n_pass/max(1, len(keep)*n_layer):.2f}")
+    thresholds = (0.9, 0.7, 0.5, 0.3)
+    n_pass = dict.fromkeys(thresholds, 0)
+
+    for il in range(n_layer):
+        conf = counts[:, il, :]/keep_n[:, None]
+        for thr in thresholds:
+            n_pass[thr] += int((conf >= thr).sum())
+
+    for thr in thresholds:
+        print(f"  {thr:.2f}: {n_pass[thr]/max(1, n_keep*n_layer):.2f}")
 
 
 if __name__ == "__main__":

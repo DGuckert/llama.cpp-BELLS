@@ -45,12 +45,19 @@ token's experts. Above that it tells you nothing:
 | cache ratio | model | result |
 |---|---|---|
 | 7.8x | GPT-OSS-120B, 24 GB card | **6.1x slower** |
-| 2.2x | Qwen3-30B-A3B, 6 GB card | **1.52x faster** |
+| 2.1x | Qwen3-30B-A3B, 6 GB card, `llama-server` | **0.95x - slower** |
 
-The calculator rated that first row a "good fit". It is the worst result in the project. Four
+The calculator rated that first row a "good fit". It is the worst result in the project. Five
 separate rules for predicting which models benefit - sparsity, cache ratio, active parameters,
-expert size - were each proposed from real data and each falsified by the next measurement.
-Measure your own model; `llama-bells-profile` takes ten minutes.
+expert size, and "it works on the card I built it on" - were each proposed from real data and
+each falsified by the next measurement.
+
+**The one rule that survived a controlled test** predicts an absolute number rather than a
+ratio: BELLS converges on a **CPU-independent** throughput, because once the experts are
+resident the work is on the GPU. Varying only the core count on one machine, BELLS moved 13%
+while the `--cpu-moe` baseline moved 2.6x. So measure your baseline - if it sits below what
+BELLS reaches, you win by the difference; if above, you lose. `llama-bells-profile` takes ten
+minutes.
 
 ## Strengths
 

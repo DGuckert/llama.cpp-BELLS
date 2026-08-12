@@ -430,8 +430,12 @@ Qwen3-Next-80B-A3B Q2_K:
 | **BELLS, 48 slots** | **33.12** | **30.19** | **1.63x** | 73.6% |
 
 **2.80x becomes 1.63x.** Doubling the cores lifted the baseline from 14.3 to 18.56 tok/s and
-dropped BELLS from 39.9 to 30.19. The remaining 1.63x is real and is the number a 3090 owner
-should expect, on a model plain `-ngl` cannot load at all.
+dropped BELLS from 39.9 to 30.19.
+
+**Superseded again, upward:** 48 slots was a cache size carried over from a 6 GB card and is far
+too small for 24 GB. Swept properly the same configuration reaches 41.30 tok/s at 128+ slots, so
+the figure a 3090 owner should expect is **2.08x**, not 1.63x. Kept here because the 8-vCPU
+comparison above is what this section exists to correct.
 
 Two notes. 48 slots was the largest tried and the curve was still improving, so this is a lower
 bound rather than a tuned optimum. And the slot response here is the exact opposite of

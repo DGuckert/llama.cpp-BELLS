@@ -585,8 +585,10 @@ def dual_gpu(model: str, slots: str = "0", n_gen: int = 64, n_ctx: int = 512):
 
     for s in [int(x) for x in slots.split(",") if x.strip()]:
         args = common + ["-o", f"/tmp/d{s}.json", "--cpu-moe-pinned"]
-        if s > 0:
-            args += ["--bells-slots", str(s)]
+        # 0 means auto-size, which is --bells. Omitting the flag entirely leaves bells_enabled
+        # false and runs no cache at all - which is what an earlier "auto slots" row here
+        # actually measured.
+        args += ["--bells-slots", str(s)] if s > 0 else ["--bells"]
         out.append(_run(args, f"2 GPU, BELLS {s if s else 'auto'} slots"))
 
     with open("/results/dual_gpu.json", "w") as f:

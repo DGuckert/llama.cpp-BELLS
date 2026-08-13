@@ -51,6 +51,40 @@ No property in that table orders the results. Expert size fails (18 MB beats 12.
 ratio fails (GPT-OSS was rated a 7.8x "good fit"), active parameters fail (14 B wins, 13 B does
 not), and hit rate fails in both directions.
 
+### Re-measured with a pinned expert source, and the table changes
+
+Everything above copies experts out of **pageable** host memory, where `cudaMemcpyAsync` blocks
+the caller for 99.7% of each transfer. With `--cpu-moe-pinned` ([PINNED.md](PINNED.md)):
+
+| Model | pageable | **pinned** | gain | vs `--cpu-moe` |
+|---|---|---|---|---|
+| Qwen3-Next-80B, 256 slots | 40.65 tok/s | **52.66** | 1.31x | ~2.7x |
+| Qwen3-235B-A22B, 28 slots | 5.45 | **11.27** | 2.08x | ~3.6x |
+| Qwen3-235B-A22B, 16 slots | 3.84 | **8.64** | 2.25x | |
+| **Mixtral-8x7B, 4 slots** | 3.24 | **8.46** | **2.61x** | **2.23x** |
+| GPT-OSS-120B, 16 slots | 2.14 | 2.83 | 1.32x | still 0.21x |
+
+**Mixtral moves from 1.06x to 2.23x**, against a baseline measured in the same session. It was
+the headline example of a model BELLS does not help.
+
+**And GPT-OSS is not a cache failure.** Per-layer counters put BELLS' entire contribution at
+~50 us against a 263 ms token - **under 1%**. The cache behaves correctly throughout (hit rate
+46% to 78% as slots rise, copy and layer totals falling) and the model still gets slower. A
+component worth 1% cannot cause a 6x loss. The time is in graph execution, so the real
+comparison is GPU expert compute against CPU, and the GPU loses 3.4x *on this model only* -
+consistent with MXFP4 being a Blackwell-native format emulated on Ampere.
+
+So the negative result above needs reading with care. **Three of its four rules were falsified
+by GPT-OSS**, and GPT-OSS appears not to have been measuring the cache at all. Two of the four
+`--cpu-moe` baselines in the first table are also from earlier sessions, which this repository
+is emphatic elsewhere is not a valid comparison. The claim has not been rewritten because
+settling it properly needs those two baselines re-measured, not because it still stands.
+
+One correction to the first table regardless: Mixtral's experts are **~99 MB**, not 18 MB. The
+cache measures 15.89 GiB for five allocated slots across 32 layers, and 3 x 4096 x 14336 at
+Q4_K_M independently gives 105 MB. Expert size was one of the properties used to argue that
+nothing orders the results.
+
 ### The ratio is not a property of BELLS
 
 Varying **only** the core count, same GPU, same model, same 192 slots:

@@ -32,11 +32,16 @@ needs the VRAM, not when it fits.
 
 | Model | `--cpu-moe` | BELLS pinned | |
 |---|---|---|---|
-| Qwen3-Next-80B (Q2_K) | 15.56 tok/s | **47.49** | **3.05x** |
+| Qwen3-Next-80B (Q2_K) | 15.56 - 19.79 tok/s | **47.49 - 53.23** | **2.7 - 3.1x** |
 | Qwen3-235B-A22B (Q2_K) | 3.09 | **8.03** | **2.60x** |
 | Mixtral-8x7B (Q4_K_M) | 3.79 | **8.46** | **2.23x** |
 | DeepSeek V4-Flash (IQ2_M) | 3.26 | **6.68** | **2.05x** |
 | GPT-OSS-120B (MXFP4) | 13.21 | 2.83 | **0.21x** |
+
+The 80B row is a range because it is the only one measured twice, and the two runs disagreed by
+13% on the ratio - baseline 15.56 against 19.79, BELLS 47.49 against 53.23. Nothing changed
+between them but the container. **Read every other row as carrying the same uncertainty**; they
+are single runs and only look more precise.
 
 GPT-OSS is the exception, and per-layer counters say the cache is not responsible: BELLS
 contributes about **50 us against a 263 ms token, under 1%**. The cache behaves correctly

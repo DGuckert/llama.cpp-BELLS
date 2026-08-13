@@ -1,4 +1,4 @@
-# Where the remaining performance is
+﻿# Where the remaining performance is
 
 Research notes on the `bells-opt` branch. Everything here follows from one measurement: on
 Qwen3-30B-A3B at 17 slots, the per-layer cost splits as
@@ -274,6 +274,44 @@ Why this is more attractive than anything else left here:
   at ~1.0x. Removing the layers dragging that average down is the difference between "no better
   than `--cpu-moe`" and a win.
 - **It degrades safely.** A layer that is gated off is just `--cpu-moe`, the baseline.
+
+### Correction: "gating puts a floor under BELLS" is too strong
+
+That last bullet was the most valuable-sounding claim here and it does not survive its own test.
+
+GPT-OSS-120B is where it mattered - the model BELLS loses worst on, 0.16x - so the prediction
+was that gating should walk it back toward 1.0x. Measured on the A10G with a warmup pass and the
+baseline re-measured afterwards to catch drift:
+
+| skip | tok/s | vs baseline |
+|---|---|---|
+| baseline `--cpu-moe` | 8.63 | 1.00x |
+| 0 (all 36 layers cached) | 1.53 | 0.18x |
+| 12 | 2.30 | 0.27x |
+| 24 | 2.57 | 0.30x |
+| 30 (only 6 cached) | 4.10 | **0.48x** |
+
+Gating helps a great deal - 0.18x to 0.48x, and the 0.18x agrees with the 0.16x already on
+record, so the setup is comparable. **But it does not reach parity.** With 30 of 36 layers
+already uncached it is still half the baseline, and the 22% baseline drift the harness reported
+comes nowhere near explaining a gap that size.
+
+The reason is the caveat written above before the test ran: the break-even assumes the CPU expert
+path is memory-bound. GPT-OSS is MXFP4 and dequantises per element, so its CPU path is cheap and
+*no* hit rate justifies paying 12.6 MB per miss. The correct decision for that model is to gate
+every layer - which is BELLS switched off. A fixed "skip the first N" cannot express that; a
+çœŸ per-layer gater would, and would land at the baseline trivially.
+
+So the honest statement is: **the floor is the baseline only in the limit where gating disables
+the cache entirely.** Partial gating does not interpolate to it. That is much weaker than "safe
+to leave on", and the earlier wording should not be relied on.
+
+A first attempt at this measurement, without the warmup, reported the baseline at 0.80 tok/s
+against the 13.21 recorded for the same model on the same instance type, and produced an
+apparent **6.70x** that was entirely the page cache filling across run order. The sweep now runs
+a discarded warmup first and re-measures the baseline at the end, printing the drift. That check
+is in the harness rather than in my attention because this is the fourth time in this project
+that a quantity drifting with run order has been mistaken for the variable under test.
 
 **Where the reasoning is incomplete, stated plainly.** The break-even assumes the CPU expert path
 is memory-bound, so its time scales with bytes read. That holds for K-quants. It does not

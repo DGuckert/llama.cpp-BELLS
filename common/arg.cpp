@@ -2307,6 +2307,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
     add_opt(common_arg(
+        {"-cmoep", "--cpu-moe-pinned"},
+        "like --cpu-moe, but keep the expert weights in pinned host memory and disable mmap. "
+        "Copies out of pageable memory block the caller for the whole transfer; pinning them "
+        "measured 1.15x on Qwen3-Next-80B and 1.59x on Qwen3-30B. Falls back to plain host "
+        "memory, per allocation, for whatever will not pin",
+        [](common_params & params) {
+            const auto ov = llm_ffn_exps_pinned_override();
+            if (ov.buft == nullptr) {
+                // No backend offers pinned host memory; behave exactly like --cpu-moe rather
+                // than failing, so the flag is safe to leave in a script across machines.
+                LOG_WRN("%s: no backend provides pinned host memory, falling back to --cpu-moe\n",
+                        __func__);
+                params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+                return;
+            }
+            params.tensor_buft_overrides.push_back(ov);
+
+            // Required, not merely advisable: llama-model-loader replaces a host buffer type
+            // with plain CPU whenever mmap is on, so an mmap'd model can never hold pinned
+            // weights and the flag would silently do nothing.
+            params.use_mmap = false;
+        }
+    ).set_env("LLAMA_ARG_CPU_MOE_PINNED"));
+    add_opt(common_arg(
         {"--bells"},
         "enable the BELLS expert cache, sizing it automatically from free VRAM. Equivalent to "
         "--bells-slots -1. Use with --cpu-moe, which keeps the expert weights on the host",

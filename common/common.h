@@ -1002,6 +1002,21 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
     return { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() };
 }
 
+// The pinned equivalent. Experts kept on the host are the source of every host-to-device copy,
+// and out of pageable memory cudaMemcpyAsync blocks the caller for 99.7% of the transfer - worth
+// 1.15x to 1.59x depending on how much the configuration moves. See PINNED.md.
+//
+// Returns a null buft if no device offers pinned host memory, in which case the caller should
+// fall back to llm_ffn_exps_cpu_override().
+inline llama_model_tensor_buft_override llm_ffn_exps_pinned_override() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        if (auto * buft = ggml_backend_dev_host_buffer_type(ggml_backend_dev_get(i))) {
+            return { LLM_FFN_EXPS_REGEX, buft };
+        }
+    }
+    return { LLM_FFN_EXPS_REGEX, nullptr };
+}
+
 //
 // training utils
 //

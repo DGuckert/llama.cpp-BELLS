@@ -1360,7 +1360,18 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
     void * ptr = ggml_cuda_host_malloc(size);
 
     if (ptr == nullptr) {
-        // fallback to cpu buffer
+        // Fall back to a pageable buffer. Say so: this is not a neutral substitution. Copies out
+        // of pageable memory block the calling thread for the whole transfer, and asking for
+        // pinned memory, silently receiving pageable, and drawing conclusions from the result is
+        // an easy afternoon to lose. Warned once - an oversized request is split into chunks, so
+        // the tail of a model can fail repeatedly.
+        static bool warned = false;
+        if (!warned && getenv("GGML_CUDA_NO_PINNED") == nullptr) {
+            warned = true;
+            GGML_LOG_WARN("%s: could not pin %.2f MiB, falling back to pageable host memory - "
+                          "host-to-device copies will block the caller\n",
+                          __func__, size / 1024.0 / 1024.0);
+        }
         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
     }
 
@@ -1371,13 +1382,44 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
     return buffer;
 }
 
+// A single large cudaMallocHost fails long before the machine runs out of pinnable memory. On a
+// 32 GB Windows desktop one 17.6 GB request fails outright, while the same total requested in
+// 1 GB pieces reaches 16.1 GB:
+//
+//     single 17.6 GB   FAILED        1024 MB chunks   16.1 GB
+//     4096 MB chunks   12.9 GB        512 MB chunks   16.1 GB
+//     2048 MB chunks   15.0 GB        256 MB chunks   16.1 GB
+//
+// Without a max size, ggml asks for a model's whole CPU-resident weight in one allocation, gets
+// nothing, and alloc_buffer below quietly falls back to pageable memory. That fallback costs
+// 1.80x on decode - a pageable cudaMemcpyAsync blocks the caller for 99.7% of the transfer,
+// where a pinned one blocks for 4.7%. See PINNED.md.
+//
+// Splitting lets almost all of it pin, and the per-allocation fallback then degrades only the
+// remainder rather than the whole model. 1 GiB is where the measured returns flatten.
+//
+// Note a single tensor must still fit within one chunk; ggml_backend_alloc_ctx_tensors_from_buft
+// treats a tensor larger than max_size as an error. Expert tensors are ~110-160 MiB, far under.
+static size_t ggml_backend_cuda_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+
+    if (const char * s = getenv("GGML_CUDA_PINNED_CHUNK_MB")) {
+        const long mb = atol(s);
+        if (mb > 0) {
+            return (size_t) mb*1024*1024;
+        }
+    }
+
+    return (size_t) 1024*1024*1024;
+}
+
 ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
     static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_host = {
         /* .iface    = */ {
             /* .get_name         = */ ggml_backend_cuda_host_buffer_type_name,
             /* .alloc_buffer     = */ ggml_backend_cuda_host_buffer_type_alloc_buffer,
             /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
-            /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
+            /* .get_max_size     = */ ggml_backend_cuda_host_buffer_type_get_max_size,
             /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
             /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
         },

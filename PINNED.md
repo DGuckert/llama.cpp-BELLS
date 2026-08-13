@@ -39,6 +39,19 @@ OLMoE-1B-7B, 3.9 GB, 16 slots, three passes:
 identical at 67.96 GiB and perplexity is identical to four decimals - the same work, the same
 output, the host simply stops waiting for it. Variance across passes is under 1%.
 
+And on the model this project actually benchmarks - Qwen3-30B-A3B, 17 slots, three paired
+passes, with the chunked allocation below in place:
+
+| | copy/layer | layer total | decode | tok/s |
+|---|---|---|---|---|
+| pageable | 1,399 us | 27,862 ms | 94.34 ms | 10.62 |
+| **pinned** | **166 us** | **6,939 ms** | **59.42 ms** | **16.83** |
+
+**1.59x**, perplexity identical at 13.8380 across all six runs, and that is with only 94% of the
+weight pinned - a 1012 MiB tail still falls back. Pinned decode varies 3% across passes against
+10% for pageable, which is itself a result: removing the stall removes most of the sensitivity to
+whatever else the machine is doing.
+
 ## Why this took so long to find
 
 Because it explains the failures rather than announcing itself. From these notes:
@@ -55,19 +68,36 @@ events, and changed nothing - because a second stream cannot help a host that is
 result was read at the time as "transfers cannot overlap compute"; it actually meant "the host
 never gets far enough ahead to overlap anything".
 
-## What blocks it on a 32 GB machine
+## What blocked it on a 32 GB machine
 
 ```
 ggml_cuda_host_malloc: failed to allocate 16740.00 MiB of pinned memory: out of memory
 ```
 
-Windows will not hand out a 16.7 GB pinned block on a 32 GB desktop, and `ggml-cuda.cu:1362`
-**silently falls back to a plain CPU buffer**. The diagnostic is `GGML_LOG_DEBUG`, so at normal
-verbosity a user asks for pinned memory, receives pageable, and is told nothing.
+Windows will not hand out a 16.7 GB pinned block on a 32 GB desktop, and `ggml-cuda.cu` **silently
+fell back to a plain CPU buffer**. The diagnostic was `GGML_LOG_DEBUG`, so at normal verbosity a
+user asked for pinned memory, received pageable, and was told nothing. Every measurement taken
+inside llama.cpp before this was therefore pageable against pageable, which is exactly why they
+all tied.
 
-Every measurement taken inside llama.cpp before this was therefore pageable against pageable,
-which is exactly why they all tied. That is worth a warning at normal log level: a silent
-downgrade of the thing that turns out to matter most is a bad default.
+**But the limit is mostly per-allocation, not total.** Requesting the same amount in pieces:
+
+| chunk | total pinned | | chunk | total pinned |
+|---|---|---|---|---|
+| single 17.6 GB | **failed** | | 1024 MB | **16.1 GB** |
+| 4096 MB | 12.9 GB | | 512 MB | 16.1 GB |
+| 2048 MB | 15.0 GB | | 256 MB | 16.1 GB |
+
+So the CUDA host buffer type now declares a 1 GiB `get_max_size`, which is where the returns
+flatten. `ggml_backend_alloc_ctx_tensors_from_buft` splits on that, the per-allocation fallback
+then degrades only the tail that no longer fits, and 94% of a 17.55 GB model pins on a machine
+that could previously pin none of it. `GGML_CUDA_PINNED_CHUNK_MB` overrides the size.
+
+A single tensor must still fit inside one chunk - `ggml_backend_alloc_ctx_tensors_from_buft`
+treats a larger one as an error - but expert tensors are 110-160 MiB, far under.
+
+The fallback also warns at normal log level now. A silent downgrade of the thing that turns out
+to matter most is a bad default, and it cost an afternoon here.
 
 ## Getting at it
 

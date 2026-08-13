@@ -78,6 +78,35 @@ the ratio falls from 1.40x to 1.18x.
 Rule: alternate the configurations inside one session and quote the paired ratio. Never
 compare a number from one session against a number from another.
 
+### And even a paired ratio does not travel between cloud containers
+
+Two Modal runs of Qwen3-235B at 28 slots, three alternating passes each, every pass inside 0.5%
+of its neighbours:
+
+| | pageable | pinned | ratio |
+|---|---|---|---|
+| run A | 184.46 ms | 88.87 ms | **2.08x** |
+| run B | 134.11 ms | 124.53 ms | **1.08x** |
+
+Not drift in absolute speed - that would scale both numbers and preserve the ratio. Something
+differed between the containers that moved the two paths by different amounts, and it is not the
+code: the same refactor was checked locally on Qwen3-30B and pinned copy time held at ~142 us
+against ~166 us before it.
+
+So the pairing rule needs extending. **Alternate inside one session, and do not compare ratios
+across cloud runs either.** Everything in this file taken from a single Modal run is provisional.
+
+### Two smaller traps, both of which cost a wrong conclusion here
+
+**The benchmark corpus must not be a file you edit.** Runs used `-f README.md`, and perplexity
+moved 13.8380 -> 20.4423 -> 27.4715 across the session purely because the README was being
+rewritten between them. `models/bells/bench-corpus.txt` is a fixed 486 KB of public-domain text
+for this reason, and `models/` is gitignored so it cannot drift.
+
+**Perplexity is only comparable at the same `-n`.** It is scored after generation, so a different
+generation length leaves a different context and a different number - which is what a Modal shift
+from 8.6930 to 8.6686 turned out to be, having first been misattributed to a corpus change.
+
 ### The same trap, second encounter: a cold page cache
 
 The rule above is necessary and not sufficient. Measuring `llama-server` concurrency, a first

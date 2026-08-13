@@ -20,16 +20,42 @@ pageable memory `cudaMemcpyAsync` blocks the caller for 99.7% of every transfer,
 1.3x to 2.3x depending on how much a configuration moves, and which silently explains most of
 the failed optimisations in this repository. See [PINNED.md](PINNED.md).
 
-**One GPU only.** The cache is allocated on a single device while layers may be assigned to
-several, so BELLS disables itself with a warning when more than one GPU is present rather than
-reading expert slots that live on the wrong card. Multi-GPU needs a cache per device and layers
-grouped by assignment - a feature, not a fix.
+**Multi-GPU works, and buys capacity rather than speed.** Each device gets its own cache and
+every layer's slice lives on the device that layer's graph runs on. Verified by perplexity
+matching the single-GPU result exactly, since reading experts off the wrong card would produce
+entirely plausible throughput. But a layer split is sequential - only one card computes at a
+time - so two GPUs measure about **5% slower** than one. They are worth having when a model
+needs the VRAM, not when it fits.
 
-**It does not help every model, and there is no known way to predict which.** Of four models
-measured on identical hardware, two gain about 1.5x, one gains nothing, and one is six times
-*slower*. Four separate rules for telling them apart were proposed and each was falsified by
-the next measurement - see [there is no working
-predictor](RESULTS.md#there-is-no-working-predictor-and-this-is-the-main-negative-result).
+**It gains 2-3x on most MoE models, and the one exception is not a caching problem.** Against a
+`--cpu-moe` baseline measured in the same session, at the best slot count for each:
+
+| Model | `--cpu-moe` | BELLS pinned | |
+|---|---|---|---|
+| Qwen3-Next-80B (Q2_K) | 15.56 tok/s | **47.49** | **3.05x** |
+| Qwen3-235B-A22B (Q2_K) | 3.09 | **8.03** | **2.60x** |
+| Mixtral-8x7B (Q4_K_M) | 3.79 | **8.46** | **2.23x** |
+| DeepSeek V4-Flash (IQ2_M) | 3.26 | **6.68** | **2.05x** |
+| GPT-OSS-120B (MXFP4) | 13.21 | 2.83 | **0.21x** |
+
+GPT-OSS is the exception, and per-layer counters say the cache is not responsible: BELLS
+contributes about **50 us against a 263 ms token, under 1%**. The cache behaves correctly
+throughout - hit rate climbing 46% to 78% as slots rise, copy and layer totals falling - and the
+model gets slower anyway. Something worth 1% cannot cause a 6x loss. The time is in graph
+execution, which makes the real comparison GPU expert compute against CPU, and the GPU loses 3.4x
+*on this model alone*. It is MXFP4, a Blackwell-native format, on Ampere.
+
+**Two caveats that matter more than the numbers.**
+
+The ratio is **not a property of BELLS**. Its own throughput is roughly CPU-independent, so the
+multiplier is really "your CPU against this GPU" - the same Mixtral configuration measured 5.88x
+on 8 vCPU and 1.06x on 16. A fast desktop CPU will show less than the table above. What travels
+is the absolute figure: experts run at GPU speed instead of CPU speed.
+
+And the slot count needs sweeping. Wrong values measured 0.94x on a 6 GB card, and oversizing is
+punished harder than undersizing. `--bells` auto-sizes conservatively; beat it with
+`--bells-slots`.
+
 Measure your own model; the tool for it is in this repo and takes ten minutes.
 
 ---

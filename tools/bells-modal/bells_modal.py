@@ -142,6 +142,15 @@ def _run(args, tag):
     if h:
         hit = float(h.group(1))
 
+    # per layer-call: readback X us, copy Y us, upload Z us (N calls, T ms total)
+    rdbk = copy_us = layer_ms = None
+    r = re.search(r"readback ([\d.]+) us, copy ([\d.]+) us, upload [\d.]+ us "
+                  r"\(\d+ calls, ([\d.]+) ms total\)", blob)
+    if r:
+        rdbk     = float(r.group(1))
+        copy_us  = float(r.group(2))
+        layer_ms = float(r.group(3))
+
     # init: N slots/layer of M experts, X.XX GiB VRAM (Y% of the card), serves ubatch <= Z
     slots = cache_gib = cache_pct = None
     c = re.search(r"init: (\d+) slots/layer of \d+ experts, ([\d.]+) GiB VRAM \((\d+)% of the card\)", blob)
@@ -159,7 +168,78 @@ def _run(args, tag):
         print(blob[-2500:])
 
     return {"tag": tag, "ms": ms, "tps": tps, "hit": hit,
+            "rdbk_us": rdbk, "copy_us": copy_us, "layer_ms": layer_ms,
             "slots": slots, "cache_gib": cache_gib, "cache_pct": cache_pct, "args": args}
+
+
+@app.function(
+    image=image,
+    volumes={"/models": models, "/results": results},
+    gpu="A10G",
+    cpu=16.0,
+    memory=131072,
+    timeout=7200,
+)
+def readback_scaling(model: str, slots: str = "8,16,32,64,128,192", n_gen: int = 96):
+    """Is the per-layer readback fixed overhead, or is it waiting on GPU compute?
+
+    It is now the largest item in BELLS' per-layer accounting - ~230 us against ~150 us of copy
+    once the source is pinned - and the second-stream result showed it is also the barrier that
+    prevents copies overlapping compute. So it is the obvious next target.
+
+    But the timer wraps ggml_backend_tensor_get, which blocks until the GPU has produced the
+    routing tensor. Part of that 230 us may be the GPU computing the layer rather than
+    synchronisation overhead, and removing the sync would not remove GPU work.
+
+    Sweeping the cache size varies the miss rate over a wide range while holding the model,
+    the layer count and the graph identical. If readback stays flat while copy time moves with
+    the miss rate, it is fixed overhead and worth attacking. If readback tracks the misses, it
+    is mostly GPU wait and the ceiling on any fix is much lower.
+
+    Everything runs pinned, so copy time is at its floor and readback is not hidden behind it.
+    """
+    import json
+    import os
+    import subprocess
+
+    subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv"], check=False)
+
+    path = f"/models/{model}"
+    corpus = "/results/corpus.txt"
+    if not os.path.exists(corpus):
+        subprocess.run(
+            ["bash", "-c", f"cat /llama/docs/*.md /llama/*.md > {corpus} 2>/dev/null || true"],
+            check=False,
+        )
+
+    common = ["-m", path, "-f", corpus, "--chunks", "1", "-c", "512", "-n", str(n_gen),
+              "-ngl", "99", "--cpu-moe-pinned"]
+    out = []
+
+    want = [int(x) for x in slots.split(",") if x.strip()]
+    _run(common + ["-o", "/tmp/rw.json", "--bells-slots", str(want[0])], "warmup")
+
+    for s in want:
+        out.append(_run(common + ["-o", f"/tmp/rb{s}.json", "--bells-slots", str(s)],
+                        f"{s} slots"))
+
+    with open("/results/readback_scaling.json", "w") as f:
+        json.dump(out, f, indent=2)
+    results.commit()
+
+    print("\n\n===== SUMMARY =====")
+    print(f"{'slots':>6} {'hit':>7} {'readback':>10} {'copy':>10} {'layer tot':>11} {'ms/token':>9}")
+    for r in out:
+        if r["rdbk_us"] is None:
+            print(f"{str(r['slots']):>6}   no counters")
+            continue
+        print(f"{str(r['slots']):>6} {r['hit']:>6.1f}% {r['rdbk_us']:>9.1f}us "
+              f"{r['copy_us']:>9.1f}us {r['layer_ms']:>10.0f}ms {r['ms']:>9.2f}")
+    print("\nIf readback is flat while copy falls with the hit rate, it is fixed overhead")
+    print("and removing the sync is worth roughly its full value. If it falls too, it is")
+    print("largely GPU wait and the fix buys only the overlap, not the time.")
+
+    return out
 
 
 @app.local_entrypoint()

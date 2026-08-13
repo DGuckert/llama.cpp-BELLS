@@ -249,6 +249,29 @@ Two caveats:
 Note also that `-ngl` is not merely slower here, it cannot run the model at all. Expert-level
 caching lets a 27 GB model run on a 24 GB card; layer-level offload does not.
 
+### Pinned, on 128 GB, where the whole model fits in pinned memory
+
+The 6 GB numbers above always leave a ~944 MiB tail pageable, because Windows will not pin that
+much on 32 GB. This machine has 128 GB, so the whole expert weight pins. A10G, 16 vCPU, three
+paired passes alternating within one session:
+
+| slots | pageable | pinned | | cache |
+|---|---|---|---|---|
+| 192 | 24.60 ms (40.65 tok/s) | **18.84 ms (53.09 tok/s)** | **1.31x** | 9.82 GiB, 45% of card |
+| 48 | 32.72 ms (30.57 tok/s) | **21.98 ms (45.49 tok/s)** | **1.49x** | 2.49 GiB, 11% of card |
+
+**53.09 tok/s on an 80B**, against the 41.30 that was this project's best before pinning. Cache
+hit rates are identical between configurations (91.0% at 192 slots, 73.6% at 48), so this is the
+same work with the host no longer waiting for it.
+
+**The tail was expensive.** Locally the same 48-slot configuration gained only 1.15x; here it
+gains 1.49x. The difference is those 944 MiB - about 6% of the weight, but a pageable copy costs
+roughly 8x a pinned one in host time, so a 6% remainder consumed a large share of the remaining
+stall. **Every 6 GB number in this file understates the technique**, and the gap is not small.
+
+Note the gain is larger at 48 slots than at 192, which is the expected direction: a lower hit
+rate means more copying, and pinning pays in proportion to how much a configuration transfers.
+
 ## Portability: three GPU architectures and the first Linux build
 
 Everything in this project was developed on Windows/MSVC against sm_75 and sm_86. Both of those

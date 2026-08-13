@@ -442,3 +442,81 @@ def bench(model: str, n_gen: int = 128, corpus_chunks: int = 1, slots: str = "16
         print(f"{r['tag']:<28} {str(r['ms']):>10} ms/token  {str(r['tps']):>8} tok/s")
 
     return out
+
+
+@app.function(
+    image=image,
+    volumes={"/models": models, "/results": results},
+    gpu="A10G",
+    cpu=16.0,
+    memory=131072,       # the point of running this here: locally a 944 MiB tail would not pin
+    timeout=7200,
+)
+def pinned_ab(model: str, slots: str = "48", n_gen: int = 128, passes: int = 3):
+    """Pageable vs pinned expert source, alternating inside one session.
+
+    Locally this is worth 1.59x on Qwen3-30B at 17 slots and 1.15x on Qwen3-Next-80B at 48,
+    the difference being how much each configuration was transferring - a pageable
+    cudaMemcpyAsync blocks the caller for 99.7% of the transfer, so removing the stall pays in
+    proportion to the miss rate. See PINNED.md.
+
+    Two things only a big machine answers. Locally a 944 MiB tail always failed to pin, so the
+    measured figure is 94-96% of the technique rather than all of it. And 11.3 MB experts have
+    never been tried pinned at all: the isolated H2D probe says block size matters a lot
+    (1.44x at 1.09 MB against 1.12x at 2.92 MB), which predicts the 235B gains least. If that
+    holds it confirms the model; if it does not, the model is wrong somewhere.
+
+    Configurations alternate within a pass because absolute throughput drifts 30%+ over tens of
+    minutes on any machine - see the methodology warning in RESULTS.md. Only paired ratios mean
+    anything.
+    """
+    import json
+    import os
+    import subprocess
+    import statistics as st
+
+    subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv"], check=False)
+    print(f"cpu count: {os.cpu_count()}, "
+          f"RAM {os.sysconf('SC_PAGE_SIZE')*os.sysconf('SC_PHYS_PAGES')/1e9:.0f} GB")
+
+    path = f"/models/{model}"
+    corpus = "/results/corpus.txt"
+    if not os.path.exists(corpus):
+        subprocess.run(
+            ["bash", "-c", f"cat /llama/docs/*.md /llama/*.md > {corpus} 2>/dev/null || true"],
+            check=False,
+        )
+
+    common = ["-m", path, "-f", corpus, "--chunks", "1", "-c", "512", "-n", str(n_gen), "-ngl", "99"]
+    out = []
+
+    for s in [int(x) for x in slots.split(",") if x.strip()]:
+        # one throwaway first: the page cache is cold on a fresh volume mount, and a cold
+        # first run is what produced a fake 6.70x earlier in this project
+        _run(common + ["-o", "/tmp/w.json", "--cpu-moe", "--bells-slots", str(s)],
+             f"warmup {s} slots")
+
+        for p in range(1, passes + 1):
+            out.append(_run(common + ["-o", f"/tmp/pg{s}_{p}.json", "--cpu-moe",
+                                      "--bells-slots", str(s)],
+                            f"{s} slots pageable p{p}"))
+            out.append(_run(common + ["-o", f"/tmp/pn{s}_{p}.json", "--cpu-moe-pinned",
+                                      "--bells-slots", str(s)],
+                            f"{s} slots PINNED p{p}"))
+
+    with open("/results/pinned_ab.json", "w") as f:
+        json.dump(out, f, indent=2)
+    results.commit()
+
+    print("\n\n===== SUMMARY =====")
+    for s in [int(x) for x in slots.split(",") if x.strip()]:
+        pg = [r["ms"] for r in out if r["tag"].startswith(f"{s} slots pageable") and r["ms"]]
+        pn = [r["ms"] for r in out if r["tag"].startswith(f"{s} slots PINNED") and r["ms"]]
+        if pg and pn:
+            a, b = st.mean(pg), st.mean(pn)
+            print(f"{s:>4} slots   pageable {a:7.2f} ms   pinned {b:7.2f} ms   "
+                  f"{a/b:.2f}x   (n={len(pg)})")
+        else:
+            print(f"{s:>4} slots   INCOMPLETE  pageable={pg} pinned={pn}")
+
+    return out

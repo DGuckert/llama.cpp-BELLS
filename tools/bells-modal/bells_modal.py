@@ -531,6 +531,73 @@ def bench(model: str, n_gen: int = 128, corpus_chunks: int = 1, slots: str = "16
 @app.function(
     image=image,
     volumes={"/models": models, "/results": results},
+    gpu="A10G:2",        # the whole point: two devices, so the layer split is real
+    cpu=16.0,
+    memory=131072,
+    timeout=7200,
+)
+def dual_gpu(model: str, slots: str = "0", n_gen: int = 64, n_ctx: int = 512):
+    """Does the cache survive being split across two GPUs?
+
+    BELLS allocated one cache on backends.front() and collected every MoE layer without asking
+    model.dev_layer(il) which device the layer runs on. With a layer split that means half the
+    matmuls read slots resident on the other card - either cross-device copies, which are slower
+    than not caching, or a fault. Nothing detected it.
+
+    Now each device gets its own context and buffer, every layer's slice is pinned to the device
+    its graph runs on, and the slot count is sized from whichever device has least room per layer
+    it carries.
+
+    This is the only test that exercises any of that. Correctness first - perplexity has to match
+    the single-GPU run on the same model and corpus - and throughput second.
+    """
+    import json
+    import os
+    import subprocess
+
+    subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv"], check=False)
+
+    path = f"/models/{model}"
+    corpus = "/results/corpus.txt"
+    if not os.path.exists(corpus):
+        subprocess.run(
+            ["bash", "-c", f"cat /llama/docs/*.md /llama/*.md > {corpus} 2>/dev/null || true"],
+            check=False,
+        )
+
+    common = ["-m", path, "-f", corpus, "--chunks", "1", "-c", str(n_ctx), "-b", str(n_ctx),
+              "-n", str(n_gen), "-ngl", "99"]
+
+    out = []
+
+    # Baseline on both cards without the cache, so a BELLS regression is distinguishable from
+    # the model simply behaving differently when split.
+    out.append(_run(common + ["-o", "/tmp/d0.json", "--cpu-moe"], "2 GPU, no BELLS"))
+
+    for s in [int(x) for x in slots.split(",") if x.strip()]:
+        args = common + ["-o", f"/tmp/d{s}.json", "--cpu-moe-pinned"]
+        if s > 0:
+            args += ["--bells-slots", str(s)]
+        out.append(_run(args, f"2 GPU, BELLS {s if s else 'auto'} slots"))
+
+    with open("/results/dual_gpu.json", "w") as f:
+        json.dump(out, f, indent=2)
+    results.commit()
+
+    print("\n\n===== SUMMARY =====")
+    for r in out:
+        print(f"{r['tag']:<28} {str(r['ms']):>9} ms/token  {str(r['tps']):>8} tok/s  "
+              f"hit {str(r['hit']):>6}")
+    print("\nPerplexity must match the single-GPU run on the same model and corpus.")
+    print("A number here that is merely plausible is not enough - the failure this guards")
+    print("against produces plausible numbers.")
+
+    return out
+
+
+@app.function(
+    image=image,
+    volumes={"/models": models, "/results": results},
     gpu="A10G",
     cpu=16.0,
     memory=131072,

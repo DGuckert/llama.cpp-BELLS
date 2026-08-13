@@ -100,6 +100,13 @@ public:
         ggml_tensor * down    = nullptr;
         ggml_tensor * gate_up = nullptr;
         int32_t       il      = -1;
+
+        // Where this layer's graph runs. A cache slice must live on the same device as the
+        // matmul that reads it, so with the layers split across several GPUs the cache is
+        // split the same way. Null falls back to the default passed to init(), which is the
+        // single-GPU case.
+        ggml_backend_buffer_type_t buft    = nullptr;
+        ggml_backend_t             backend = nullptr;
     };
 
     // `backend` is the compute backend the graph runs on.
@@ -126,7 +133,10 @@ public:
 
     void free();
 
-    bool ready() const { return buffer_ != nullptr; }
+    bool ready() const { return !buffers_.empty(); }
+
+    // how many distinct devices the cache is spread over
+    size_t n_device() const { return buffers_.size(); }
 
     size_t vram_bytes() const { return vram_bytes_; }
 
@@ -164,6 +174,9 @@ private:
         ggml_tensor * gate_up = nullptr;
         ggml_tensor * slots   = nullptr;
         layer_src     src;
+
+        // the device this layer's slices live on; copies must be issued against it
+        ggml_backend_t backend = nullptr;
     };
 
     static const entry & empty();
@@ -174,10 +187,14 @@ private:
 
     entry & get_mut(uint32_t il) { return entries_[index_[il]]; }
 
-    void copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t expert, int32_t slot);
+    void copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t expert, int32_t slot,
+                  ggml_backend_t backend);
 
-    ggml_context          *      ctx_          = nullptr;
-    ggml_backend_buffer_t        buffer_       = nullptr;
+    // One context and buffer per device. Single GPU leaves both vectors with one element, which
+    // is the common case and costs nothing; with the layers split across cards each device gets
+    // its own allocation so a matmul never reads a slice living on another card.
+    std::vector<ggml_context *>         ctxs_;
+    std::vector<ggml_backend_buffer_t>  buffers_;
     ggml_backend_t               backend_      = nullptr;
     ggml_backend_t               copy_backend_ = nullptr;   // second stream, not owned here
     ggml_backend_event_t         copy_event_   = nullptr;

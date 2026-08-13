@@ -222,45 +222,91 @@ bool bells_tensors::init(ggml_backend_buffer_type_t buft, const std::vector<laye
     // somewhere harmless rather than out of bounds
     const uint32_t n_alloc = n_slot + 1;
 
-    // 5 tensors per layer at most, plus overhead
-    ggml_init_params ip = { ggml_tensor_overhead()*srcs.size()*8, nullptr, true };
-    ctx_ = ggml_init(ip);
-    if (!ctx_) {
-        return false;
-    }
+    // Group the layers by the device they run on. A cache slice has to live where the matmul
+    // that reads it runs, so with a layer split across cards each device needs its own context
+    // and buffer. One device is the ordinary case and falls out of this unchanged.
+    std::vector<ggml_backend_buffer_type_t> bufts;
+    std::vector<std::vector<size_t>>        by_buft;   // indices into srcs
 
-    for (const auto & s : srcs) {
-        entry e;
-        e.src = s;
-
-        e.gate    = bells_make_slice(ctx_, s.gate,    n_alloc);
-        e.up      = bells_make_slice(ctx_, s.up,      n_alloc);
-        e.down    = bells_make_slice(ctx_, s.down,    n_alloc);
-        e.gate_up = bells_make_slice(ctx_, s.gate_up, n_alloc);
-
-        ggml_tensor * any = s.gate ? s.gate : (s.gate_up ? s.gate_up : s.up);
-        if (!any) {
-            ggml_free(ctx_);
-            ctx_ = nullptr;
+    for (size_t i = 0; i < srcs.size(); ++i) {
+        ggml_backend_buffer_type_t b = srcs[i].buft ? srcs[i].buft : buft;
+        if (!b) {
             return false;
         }
 
-        e.slots = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, any->ne[2]);
-        ggml_set_input(e.slots);
-
-        index_[s.il] = (int32_t) entries_.size();
-        entries_.push_back(e);
-        layer_ids_.push_back(s.il);
+        size_t g = 0;
+        while (g < bufts.size() && bufts[g] != b) {
+            g++;
+        }
+        if (g == bufts.size()) {
+            bufts.push_back(b);
+            by_buft.emplace_back();
+        }
+        by_buft[g].push_back(i);
     }
 
-    buffer_ = ggml_backend_alloc_ctx_tensors_from_buft(ctx_, buft);
-    if (!buffer_) {
-        ggml_free(ctx_);
-        ctx_ = nullptr;
-        return false;
+    // The second stream orders one copy backend against one compute backend with a single event.
+    // Across devices that is no longer a well-defined pairing, and it has never been worth
+    // anything anyway - measured 1.005x, because the per-layer readback is the real barrier.
+    if (bufts.size() > 1 && copy_backend_) {
+        if (copy_event_) {
+            ggml_backend_event_free(copy_event_);
+            copy_event_ = nullptr;
+        }
+        copy_backend_ = nullptr;
     }
 
-    vram_bytes_ = ggml_backend_buffer_get_size(buffer_);
+    vram_bytes_ = 0;
+
+    for (size_t g = 0; g < bufts.size(); ++g) {
+        // 5 tensors per layer at most, plus overhead
+        ggml_init_params ip = { ggml_tensor_overhead()*by_buft[g].size()*8, nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        if (!ctx) {
+            free();
+            return false;
+        }
+        ctxs_.push_back(ctx);
+
+        for (size_t i : by_buft[g]) {
+            const layer_src & s = srcs[i];
+
+            entry e;
+            e.src     = s;
+            e.backend = s.backend ? s.backend : backend;
+
+            e.gate    = bells_make_slice(ctx, s.gate,    n_alloc);
+            e.up      = bells_make_slice(ctx, s.up,      n_alloc);
+            e.down    = bells_make_slice(ctx, s.down,    n_alloc);
+            e.gate_up = bells_make_slice(ctx, s.gate_up, n_alloc);
+
+            ggml_tensor * any = s.gate ? s.gate : (s.gate_up ? s.gate_up : s.up);
+            if (!any) {
+                free();
+                return false;
+            }
+
+            e.slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, any->ne[2]);
+            ggml_set_input(e.slots);
+
+            index_[s.il] = (int32_t) entries_.size();
+            entries_.push_back(e);
+            layer_ids_.push_back(s.il);
+        }
+
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, bufts[g]);
+        if (!buf) {
+            free();
+            return false;
+        }
+        buffers_.push_back(buf);
+
+        vram_bytes_ += ggml_backend_buffer_get_size(buf);
+    }
+
+    // layer_ids_ must stay ordered by layer for callers that walk it as a schedule; grouping by
+    // device above interleaves it when the split is not contiguous.
+    std::sort(layer_ids_.begin(), layer_ids_.end());
 
     bytes_per_expert_ = 0;
     const entry & first = entries_.front();
@@ -297,14 +343,19 @@ void bells_tensors::free() {
     copy_backend_   = nullptr;
     copies_pending_ = false;
 
-    if (buffer_) {
-        ggml_backend_buffer_free(buffer_);
-        buffer_ = nullptr;
+    for (ggml_backend_buffer_t b : buffers_) {
+        if (b) {
+            ggml_backend_buffer_free(b);
+        }
     }
-    if (ctx_) {
-        ggml_free(ctx_);
-        ctx_ = nullptr;
+    buffers_.clear();
+
+    for (ggml_context * c : ctxs_) {
+        if (c) {
+            ggml_free(c);
+        }
     }
+    ctxs_.clear();
 
     entries_.clear();
     index_.clear();
@@ -314,7 +365,8 @@ void bells_tensors::free() {
     bytes_per_expert_ = 0;
 }
 
-void bells_tensors::copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t expert, int32_t slot) {
+void bells_tensors::copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t expert, int32_t slot,
+                             ggml_backend_t backend) {
     if (!dst || !src) {
         return;
     }
@@ -324,12 +376,14 @@ void bells_tensors::copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t exper
     // the source expert stack is host resident, which is the whole premise of offloading
     const char * base = (const char *) src->data + (size_t) expert*stride;
 
+    // copy_backend_ is only ever set in the single-device case; see init(). Otherwise the copy
+    // has to be issued against the device the destination actually lives on.
     if (copy_backend_) {
         // second stream: this can genuinely overlap the graph, which is the entire point
         ggml_backend_tensor_set_async(copy_backend_, dst, base, (size_t) slot*stride, stride);
         copies_pending_ = true;
-    } else if (backend_) {
-        ggml_backend_tensor_set_async(backend_, dst, base, (size_t) slot*stride, stride);
+    } else if (backend) {
+        ggml_backend_tensor_set_async(backend, dst, base, (size_t) slot*stride, stride);
     } else {
         ggml_backend_tensor_set(dst, base, (size_t) slot*stride, stride);
     }
@@ -355,10 +409,10 @@ void bells_tensors::copy_expert(uint32_t il, int32_t expert, int32_t slot) {
 
     entry & e = get_mut(il);
 
-    copy_one(e.gate,    e.src.gate,    expert, slot);
-    copy_one(e.up,      e.src.up,      expert, slot);
-    copy_one(e.down,    e.src.down,    expert, slot);
-    copy_one(e.gate_up, e.src.gate_up, expert, slot);
+    copy_one(e.gate,    e.src.gate,    expert, slot, e.backend);
+    copy_one(e.up,      e.src.up,      expert, slot, e.backend);
+    copy_one(e.down,    e.src.down,    expert, slot, e.backend);
+    copy_one(e.gate_up, e.src.gate_up, expert, slot, e.backend);
 }
 
 void bells_tensors::upload_slots(uint32_t il, const std::vector<int32_t> & table) {
@@ -534,11 +588,55 @@ bool bells_runtime::init(const bells_params & params,
 
     uint32_t n_slot = params.n_slot;
 
+    // Free VRAM on the *tightest* device, expressed as though every layer lived there.
+    //
+    // With the layers split across cards, each device holds only its own share, so the slot
+    // count that fits is set by whichever device has the least room per layer it carries - not
+    // by the total across all of them. Scaling that back up to a whole-model figure lets the
+    // sizing arithmetic below stay as written.
     size_t dev_free = 0, dev_total = 0;
     {
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        if (dev) {
-            ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+        std::vector<ggml_backend_dev_t> devs;
+        std::vector<size_t>             n_layer_on;
+
+        for (const auto & s : srcs) {
+            ggml_backend_dev_t d = ggml_backend_buft_get_device(s.buft ? s.buft : buft);
+            size_t i = 0;
+            while (i < devs.size() && devs[i] != d) {
+                i++;
+            }
+            if (i == devs.size()) {
+                devs.push_back(d);
+                n_layer_on.push_back(0);
+            }
+            n_layer_on[i]++;
+        }
+
+        double tightest_free = 0.0, tightest_total = 0.0;
+
+        for (size_t i = 0; i < devs.size(); ++i) {
+            size_t f = 0, t = 0;
+            if (devs[i]) {
+                ggml_backend_dev_memory(devs[i], &f, &t);
+            }
+
+            // per-layer room on this device, scaled to the whole model
+            const double share = (double) srcs.size()/std::max<size_t>(1, n_layer_on[i]);
+            const double f_eq  = (double) f*share;
+            const double t_eq  = (double) t*share;
+
+            if (i == 0 || f_eq < tightest_free) {
+                tightest_free  = f_eq;
+                tightest_total = t_eq;
+            }
+        }
+
+        dev_free  = (size_t) tightest_free;
+        dev_total = (size_t) tightest_total;
+
+        if (devs.size() > 1) {
+            fprintf(stderr, "%s: cache split over %zu devices, sizing from the tightest\n",
+                    __func__, devs.size());
         }
     }
 

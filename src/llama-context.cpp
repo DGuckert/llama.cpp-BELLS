@@ -404,6 +404,19 @@ llama_context::llama_context(
             s.down    = layer.ffn_down_exps;
             s.gate_up = layer.ffn_gate_up_exps;
 
+            // Pin the slice to the device this layer's graph runs on. With one GPU every layer
+            // resolves to the same backend and this is a no-op; with a layer split it is what
+            // stops a matmul reading slots that live on another card.
+            if (ggml_backend_dev_t dev = model.dev_layer(il)) {
+                for (auto & b : backends) {
+                    if (ggml_backend_get_device(b.get()) == dev) {
+                        s.backend = b.get();
+                        s.buft    = ggml_backend_get_default_buffer_type(b.get());
+                        break;
+                    }
+                }
+            }
+
             srcs.push_back(s);
         }
 
@@ -415,18 +428,10 @@ llama_context::llama_context(
         if (srcs.empty()) {
             LLAMA_LOG_WARN("%s: BELLS requested but this model has no MoE layers\n", __func__);
         } else {
-            // Single GPU only, and this has to be a refusal rather than a warning.
-            //
-            // The cache is allocated once, on backends.front(), and the loop above collects
-            // every MoE layer without consulting model.dev_layer(il). With more than one device
-            // and the default layer split, half the layers execute on a device whose graph would
-            // be reading expert slots that live on the other one. The scheduler would either
-            // insert cross-device copies - correct but far slower than not caching at all - or
-            // fault. The auto-sizer would also be sizing against one device's free VRAM while
-            // caching layers belonging to all of them.
-            //
-            // Supporting it properly means one cache per device, layers grouped by assignment,
-            // and per-device sizing. That is a feature, not a guard.
+            // Multi-GPU works by giving each device its own cache, sized from the tightest, and
+            // pinning every layer's slice to the device that layer's graph runs on (set above).
+            // Any layer whose device could not be resolved falls back to the default buft below,
+            // which is only correct when there is one GPU - so refuse rather than guess.
             size_t n_gpu = 0;
             for (const auto & b : backends) {
                 if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
@@ -435,10 +440,15 @@ llama_context::llama_context(
             }
 
             if (n_gpu > 1) {
-                LLAMA_LOG_WARN("%s: BELLS supports one GPU and %zu are in use - disabling. The "
-                               "cache would be allocated on the first device only while layers "
-                               "run on all of them.\n", __func__, n_gpu);
-                return;
+                for (const auto & s : srcs) {
+                    if (!s.buft) {
+                        LLAMA_LOG_WARN("%s: BELLS could not resolve a device for MoE layer %d "
+                                       "with %zu GPUs in use - disabling rather than caching it "
+                                       "on the wrong card.\n", __func__, s.il, n_gpu);
+                        return;
+                    }
+                }
+                LLAMA_LOG_INFO("%s: BELLS spread over %zu GPUs\n", __func__, n_gpu);
             }
 
             bells_params bp;

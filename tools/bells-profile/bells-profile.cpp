@@ -585,6 +585,21 @@ int main(int argc, char ** argv) {
 
         int64_t t_gen_us = 0;
 
+        // Steady-state timing, measured alongside the whole-run average.
+        //
+        // The cache starts empty, so the first tokens pay a fill cost proportional to the cache
+        // size - measured at ~25 us/token-equivalent for 8 slots against ~158 for 48 on OLMoE,
+        // one-time either way. Averaging from cold therefore charges a large cache a setup cost
+        // it never earns back inside a short run, and every slot sweep in RESULTS.md was run at
+        // 96-128 tokens. A 48-slot cache measured 55.61 tok/s at n=16 and 118.60 at n=512 with
+        // a flat hit rate throughout; the difference is entirely amortisation.
+        //
+        // llama-server holds the cache across requests, so real use sees the steady-state figure
+        // and the whole-run average is the pessimistic one.
+        int64_t t_steady_us = 0;
+        int     n_steady    = 0;
+        const int n_warm = std::min(n_gen/4, 64);   // discard the first quarter, capped
+
         llama_memory_clear(llama_get_memory(ctx), true);
 
         common_batch_clear(batch);
@@ -634,7 +649,13 @@ int main(int argc, char ** argv) {
                 break;
             }
 
-            t_gen_us += ggml_time_us() - t0;
+            const int64_t dt = ggml_time_us() - t0;
+            t_gen_us += dt;
+
+            if (i >= n_warm) {
+                t_steady_us += dt;
+                n_steady++;
+            }
 
             prof.tok_id.push_back(best);
             prof.tok_pos.push_back(pos);
@@ -647,6 +668,15 @@ int main(int argc, char ** argv) {
         if (t_gen_us > 0) {
             LOG_INF("%s: decode %.2f ms/token, %.2f tok/s (%d tokens)\n", __func__,
                     t_gen_us/1000.0/n_gen, 1e6*n_gen/(double) t_gen_us, n_gen);
+
+            if (n_steady > 0 && n_warm > 0) {
+                const double steady_ms  = t_steady_us/1000.0/n_steady;
+                const double whole_ms   = t_gen_us/1000.0/n_gen;
+                LOG_INF("%s: steady %.2f ms/token, %.2f tok/s (%d tokens after %d warm-up, "
+                        "%.0f%% faster than the whole-run average)\n", __func__,
+                        steady_ms, 1e6*n_steady/(double) t_steady_us, n_steady, n_warm,
+                        100.0*(whole_ms - steady_ms)/steady_ms);
+            }
         }
 
         // Degeneration guard. A generation that collapses into a loop touches almost no

@@ -449,6 +449,75 @@ def bench(model: str, n_gen: int = 128, corpus_chunks: int = 1, slots: str = "16
     volumes={"/models": models, "/results": results},
     gpu="A10G",
     cpu=16.0,
+    memory=131072,
+    timeout=7200,
+)
+def stream_ab(model: str, slots: str = "16", n_gen: int = 96, passes: int = 3):
+    """Does a second CUDA stream help now that the source is pinned?
+
+    It was built and measured before and changed nothing: copies came out of pageable memory,
+    where cudaMemcpyAsync blocks the caller for 99.7% of the transfer, so the host never got far
+    enough ahead for stream ordering to matter. That premise is gone. Pinned copies return to the
+    caller in 4.7% of the transfer time, so there is finally something for a second stream to
+    overlap - and the 2.25x on the 235B suggests some overlap is already happening implicitly.
+
+    Everything here runs pinned; the only variable is BELLS_COPY_STREAM.
+    """
+    import json
+    import os
+    import subprocess
+    import statistics as st
+
+    subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv"], check=False)
+
+    path = f"/models/{model}"
+    corpus = "/results/corpus.txt"
+    if not os.path.exists(corpus):
+        subprocess.run(
+            ["bash", "-c", f"cat /llama/docs/*.md /llama/*.md > {corpus} 2>/dev/null || true"],
+            check=False,
+        )
+
+    common = ["-m", path, "-f", corpus, "--chunks", "1", "-c", "512", "-n", str(n_gen),
+              "-ngl", "99", "--cpu-moe-pinned"]
+    out = []
+
+    for s in [int(x) for x in slots.split(",") if x.strip()]:
+        os.environ.pop("BELLS_COPY_STREAM", None)
+        _run(common + ["-o", "/tmp/sw.json", "--bells-slots", str(s)], f"warmup {s} slots")
+
+        for p in range(1, passes + 1):
+            os.environ.pop("BELLS_COPY_STREAM", None)
+            out.append(_run(common + ["-o", f"/tmp/s1_{s}_{p}.json", "--bells-slots", str(s)],
+                            f"{s} slots one stream p{p}"))
+
+            os.environ["BELLS_COPY_STREAM"] = "1"
+            out.append(_run(common + ["-o", f"/tmp/s2_{s}_{p}.json", "--bells-slots", str(s)],
+                            f"{s} slots TWO streams p{p}"))
+            os.environ.pop("BELLS_COPY_STREAM", None)
+
+    with open("/results/stream_ab.json", "w") as f:
+        json.dump(out, f, indent=2)
+    results.commit()
+
+    print("\n\n===== SUMMARY =====")
+    for s in [int(x) for x in slots.split(",") if x.strip()]:
+        one = [r["ms"] for r in out if r["tag"].startswith(f"{s} slots one") and r["ms"]]
+        two = [r["ms"] for r in out if r["tag"].startswith(f"{s} slots TWO") and r["ms"]]
+        if one and two:
+            a, b = st.mean(one), st.mean(two)
+            print(f"{s:>4} slots   one stream {a:7.2f} ms   two streams {b:7.2f} ms   {a/b:.3f}x")
+        else:
+            print(f"{s:>4} slots   INCOMPLETE one={one} two={two}")
+
+    return out
+
+
+@app.function(
+    image=image,
+    volumes={"/models": models, "/results": results},
+    gpu="A10G",
+    cpu=16.0,
     memory=131072,       # the point of running this here: locally a 944 MiB tail would not pin
     timeout=7200,
 )

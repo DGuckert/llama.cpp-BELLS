@@ -102,6 +102,24 @@ before proceeding anyway, and it duly measures 0.83x.
 a real context at once. The 24 GB results above are unaffected, because that card has room for
 both.
 
+> **This section predates pinned expert memory and needs re-testing.** Every number in it copies
+> experts out of pageable host memory, where `cudaMemcpyAsync` blocks the caller for 99.7% of the
+> transfer. Pinning the source ([PINNED.md](PINNED.md)) is worth **1.59x on Qwen3-30B at 17 slots**
+> and **1.15x on Qwen3-Next-80B at 48 slots**, both paired in-session on this same 6 GB 2060:
+>
+> | model | pageable | pinned | |
+> |---|---|---|---|
+> | Qwen3-30B-A3B (Q4_K_M), 17 slots | 10.62 tok/s | **16.83** | 1.59x |
+> | Qwen3-Next-80B (Q2_K), 48 slots | 20.04 tok/s | **23.06** | 1.15x |
+>
+> The *server* verdict above may or may not survive that - the ~5% loss there was attributed to
+> the cache holding VRAM whether used or not, which pinning does not change, so it plausibly
+> stands. It has not been re-measured. The VRAM squeeze argument is unaffected either way.
+>
+> One thing that does change: at 32 slots pinned the 80B still reaches 21.46 tok/s while giving
+> back 840 MB, which is a better trade than it looks when 22 tok/s is already faster than most
+> people read.
+
 ### Superseded: the same models at 8 vCPU
 
 An earlier version of this file led with these, from the same GPU on Modal's default 8 vCPU:

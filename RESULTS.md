@@ -24,6 +24,43 @@ Markdown corpus, same protocol: baseline 65.70/73.04, BELLS 64.21/61.95 -> **1.1
 
 So on a 6 GB RTX 2060 the honest figure is **1.10-1.18x**.
 
+### Then the expert source was pinned, and the number moved
+
+Everything above copies experts out of pageable host memory, where `cudaMemcpyAsync` blocks the
+caller for 99.7% of the transfer. Pinning the source removes that stall - see [PINNED.md](PINNED.md).
+Re-measured on the same machine, three paired passes alternating in one session:
+
+| Config | ms/token | tok/s | vs pageable |
+|---|---|---|---|
+| BELLS 48 slots, pageable | 50.00 | 20.04 | 1.00x |
+| **BELLS 48 slots, pinned** | **43.38** | **23.06** | **1.15x** |
+
+Perplexity identical at 10.5201 across all six runs. 26688 MiB of experts pinned, a 944 MiB tail
+still pageable.
+
+**23.06 tok/s for an 80B model on a card that holds about a fortieth of it.** Note the pageable
+baseline reads 20.04 here against 18.4 above - the same configuration, months apart, differing by
+9%. That is the session drift the warning below is about, and it is why only the paired ratio is
+quoted.
+
+Slot sweep with pinning on, same session:
+
+| slots | tok/s | cache VRAM |
+|---|---|---|
+| 48 | 23.06 | 2.51 GB |
+| 32 | 21.46 | 1.67 GB |
+| 24 | 18.96 | 1.26 GB |
+| 16 | 17.09 | 0.84 GB |
+
+More slots still wins, so pinning did not move the optimum. But **32 slots pinned beats 48 slots
+pageable while using 840 MB less VRAM**, and on a 6 GB card spare VRAM is what decides whether a
+larger model fits at all. Given ~22 tok/s already exceeds reading speed, that trade is usually the
+better one.
+
+The 1.15x here is much smaller than the 1.59x the same change gives on Qwen3-30B at 17 slots, and
+the reason is the hit rate: 72% here against 61% there. Less copying leaves less stall to remove.
+**Pinning pays in proportion to how much the configuration was transferring.**
+
 ## Methodology warning: pair your runs in time
 
 An earlier version of this file claimed 1.25x mean and 1.40x best. Those numbers were wrong,

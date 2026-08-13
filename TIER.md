@@ -51,6 +51,28 @@ blocks. The 64 KB row is where that number actually lives.
 Caveat: measured on a volume 98% full, where SSDs degrade. The 2.9 GB/s ceiling is below what
 the drive should manage, so ratios should hold but absolute figures are pessimistic.
 
+## What a RAM tier would hit, without building one
+
+The cache curve already answers this, because hit rate against *residency fraction* is the same
+question at either tier - only the units change. From the 205k-token trace, 128 experts, 8
+active:
+
+| experts resident | LRU hit | Belady | oracle gap |
+|---|---|---|---|
+| 12.5% | 61.8% | 78.2% | 16.4 pt |
+| 25% | 81.9% | 91.3% | 9.4 pt |
+| 50% | 95.9% | 98.3% | 2.4 pt |
+| 75% | 99.3% | 99.8% | 0.5 pt |
+
+Read at the RAM tier: a 200B model with 26 GB of usable page cache against ~100 GB of experts
+is 25% resident, so **plain LRU already gets ~82%** and a perfect oracle would reach 91%. Nine
+points is the entire prize for routing-aware RAM eviction, and only ~2 points of it is
+reachable by a predictor that measured 49.5% precision out of domain.
+
+Skew is doing most of the work here, and the OS page cache gets skew for free. That is the case
+against building an explicit RAM tier for eviction *policy* reasons - as opposed to the I/O
+reasons above, which remain the real argument.
+
 ## Where speculative fill pays, and where it does not
 
 Only where the drive has spare capacity, which is narrower than it sounds.

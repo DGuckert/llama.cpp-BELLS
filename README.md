@@ -12,8 +12,13 @@ compute buffers. **Expert**: per-expert granularity, as opposed to the layer gra
 `-ngl`. **LRU**: plain least-recently-used, which beat the predictive scheme this project was
 originally built around.
 
-**A 235B model on one 24 GB card at 5.6 tok/s, up from 3.1.** An 80B on the same card at
-41.3 tok/s, up from 19.8. Both are models plain `-ngl` cannot load at all.
+**A 235B model on one 24 GB card at 11.3 tok/s, up from 3.1.** An 80B on the same card at
+53.1 tok/s, up from 19.8. Both are models plain `-ngl` cannot load at all.
+
+Those figures need the expert source in **pinned** host memory - `--cpu-moe-pinned`. Out of
+pageable memory `cudaMemcpyAsync` blocks the caller for 99.7% of every transfer, which is worth
+1.3x to 2.3x depending on how much a configuration moves, and which silently explains most of
+the failed optimisations in this repository. See [PINNED.md](PINNED.md).
 
 **It does not help every model, and there is no known way to predict which.** Of four models
 measured on identical hardware, two gain about 1.5x, one gains nothing, and one is six times

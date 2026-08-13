@@ -115,6 +115,41 @@ whenever mmap is on, so an mmap'd model can never have pinned weights.
 Note this replaces `--cpu-moe` rather than accompanying it - both push a buffer override for the
 same tensors, and the first match wins.
 
+## What is left afterwards, and where
+
+With copies pinned, the readback becomes the larger per-layer item. Sweeping the cache size on
+Qwen3-Next-80B - same model, same graph, miss rate varying 5.7x - separates fixed overhead from
+time spent waiting on the GPU:
+
+| slots | hit | readback | copy | ms/token |
+|---|---|---|---|---|
+| 16 | 53.8% | 30.6 us | 26.1 us | 27.13 |
+| 64 | 78.0% | 30.5 us | 12.5 us | 21.59 |
+| 192 | 91.0% | 30.3 us | 5.3 us | 19.27 |
+| **256** | **92.2%** | 30.1 us | 4.6 us | **18.99 (52.66 tok/s)** |
+
+**Readback is flat to within 2% while copy falls sixfold.** It is fixed synchronisation
+overhead, not GPU wait - which is what makes it worth attacking in principle, and what makes it
+the barrier stopping a second stream from finding anything to overlap.
+
+**But the magnitude is platform-dependent, and that matters more than the mechanism:**
+
+| | readback/layer | over 48 layers | share of token |
+|---|---|---|---|
+| A10G, Linux | 30 us | 1.4 ms | ~6% |
+| RTX 2060, Windows | 230 us | 11 ms | **~19%** |
+
+A 7.7x gap. The likely cause is WDDM, whose kernel-launch and synchronisation latency exceeds
+Linux's by a wide margin. Confounded by a different GPU and model, so not proven - but far too
+large to be a 2060-versus-A10G difference in a device sync.
+
+So on Linux, BELLS' entire per-layer overhead is ~11% of the token at high slot counts and
+there is little left to collect. On Windows it is worth about a fifth, and **the cheapest way to
+collect it is to run Linux, not to write code.**
+
+Note also 52.66 tok/s at 256 slots, with copy at 4.6 us per layer. On that configuration
+transfers have been optimised out of relevance rather than merely reduced.
+
 ## Where this leaves things
 
 The mechanism is confirmed, the integration is proven, and the remaining question is only how

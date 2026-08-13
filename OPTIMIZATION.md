@@ -1,5 +1,32 @@
 ﻿# Where the remaining performance is
 
+> **Superseded at the root. Route 2 below was taken and it won.**
+>
+> Every measurement in this document was made with the expert source in **pageable** host
+> memory, where `cudaMemcpyAsync` blocks the caller for 99.7% of the transfer. Registering the
+> model's pages - listed below as "one route remains, with a real hazard attached" - turned out
+> to be the answer, and it is now `--cpu-moe-pinned`. See [PINNED.md](PINNED.md).
+>
+> The per-layer split inverts once it is applied:
+>
+> | | pageable | pinned |
+> |---|---|---|
+> | readback | 167 us (11%) | **~230 us (59%)** |
+> | copy | **1356 us (87%)** | ~150 us (39%) |
+>
+> So "transfers are the system" was true of the configuration measured and is not true of the
+> fixed one. Copy time fell roughly 9x; the readback did not move and is now the larger item.
+> End to end that is 1.15x to 2.25x depending on how much a configuration was moving.
+>
+> What that does to the routes below: **1 (miss less often) and 3 (skip low-value transfers)
+> are worth much less than they looked**, because they economise on transfers that are now
+> cheap - lookahead eviction measured neutral after pinning, having been worth ~1-3% before.
+> **5 (stop transferring on a miss) shrinks for the same reason.** The live target is now the
+> readback, which is both the largest remaining item and the synchronisation barrier that stops
+> copies overlapping compute - a second stream still measures 1.005x because of it.
+>
+> The original text follows unchanged, because what was believed at the time is the point.
+
 Research notes on the `bells-opt` branch. Everything here follows from one measurement: on
 Qwen3-30B-A3B at 17 slots, the per-layer cost splits as
 

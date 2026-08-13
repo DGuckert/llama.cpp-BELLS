@@ -20,6 +20,11 @@ pageable memory `cudaMemcpyAsync` blocks the caller for 99.7% of every transfer,
 1.3x to 2.3x depending on how much a configuration moves, and which silently explains most of
 the failed optimisations in this repository. See [PINNED.md](PINNED.md).
 
+**One GPU only.** The cache is allocated on a single device while layers may be assigned to
+several, so BELLS disables itself with a warning when more than one GPU is present rather than
+reading expert slots that live on the wrong card. Multi-GPU needs a cache per device and layers
+grouped by assignment - a feature, not a fix.
+
 **It does not help every model, and there is no known way to predict which.** Of four models
 measured on identical hardware, two gain about 1.5x, one gains nothing, and one is six times
 *slower*. Four separate rules for telling them apart were proposed and each was falsified by

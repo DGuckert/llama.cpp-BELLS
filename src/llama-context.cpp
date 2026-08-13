@@ -415,6 +415,32 @@ llama_context::llama_context(
         if (srcs.empty()) {
             LLAMA_LOG_WARN("%s: BELLS requested but this model has no MoE layers\n", __func__);
         } else {
+            // Single GPU only, and this has to be a refusal rather than a warning.
+            //
+            // The cache is allocated once, on backends.front(), and the loop above collects
+            // every MoE layer without consulting model.dev_layer(il). With more than one device
+            // and the default layer split, half the layers execute on a device whose graph would
+            // be reading expert slots that live on the other one. The scheduler would either
+            // insert cross-device copies - correct but far slower than not caching at all - or
+            // fault. The auto-sizer would also be sizing against one device's free VRAM while
+            // caching layers belonging to all of them.
+            //
+            // Supporting it properly means one cache per device, layers grouped by assignment,
+            // and per-device sizing. That is a feature, not a guard.
+            size_t n_gpu = 0;
+            for (const auto & b : backends) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    n_gpu++;
+                }
+            }
+
+            if (n_gpu > 1) {
+                LLAMA_LOG_WARN("%s: BELLS supports one GPU and %zu are in use - disabling. The "
+                               "cache would be allocated on the first device only while layers "
+                               "run on all of them.\n", __func__, n_gpu);
+                return;
+            }
+
             bells_params bp;
             bp.enabled      = true;
             bp.n_slot       = params.bells_n_slot;

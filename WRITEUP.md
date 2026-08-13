@@ -1,5 +1,24 @@
 # I built an MoE expert cache and spent most of my time discovering my benchmarks were lying
 
+> **Postscript, and a seventh dead rule.** Every number below was measured with the expert
+> source in **pageable** host memory, where `cudaMemcpyAsync` blocks the caller for 99.7% of the
+> transfer. Pinning it - `--cpu-moe-pinned` - moves the 235B from 5.6 to **11.3 tok/s** and the
+> 80B from 41.3 to **52.7**, with perplexity unchanged. See [PINNED.md](PINNED.md).
+>
+> So the essay's own thesis applies to the essay. The rules kept dying because of *how the
+> numbers were taken*, and this was one more instance of exactly that: a host stall being
+> measured and attributed to bandwidth. It also retires the optimisations built to work around
+> it - a second stream, a background copy thread, lookahead eviction - all of which measure
+> neutral once the stall is gone.
+>
+> The section on GPT-OSS-120B losing at 0.16x may be wrong at the root. It is MXFP4, a
+> Blackwell-native format, benchmarked on Ampere where it is likely emulated - which would make
+> it a quantisation outlier rather than a cache failure. **Three of the five dead rules were
+> killed by that single model.** Unverified, and flagged rather than corrected.
+>
+> The text below is unchanged. An essay about being misled by your own measurements should show
+> its own workings rather than quietly acquire better numbers.
+
 I wanted to run models that do not fit in my GPU. The result is a working expert cache that
 gets a 235B model to 5.6 tok/s on a single 24 GB card. That part worked.
 

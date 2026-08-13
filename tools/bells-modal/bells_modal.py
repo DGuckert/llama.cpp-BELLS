@@ -167,6 +167,15 @@ def _run(args, tag):
     print(f"  ms/token {ms}   tok/s {tps}   cache hit {hit}   wall {wall:.0f}s")
     if cache_gib is not None:
         print(f"  cache {slots} slots = {cache_gib:.2f} GiB ({cache_pct}% of card)")
+
+    # Lines that say where things actually landed. Without these a multi-GPU run cannot be
+    # distinguished from a single-GPU run with an idle second card - and the numbers look
+    # entirely reasonable either way, which is the whole problem.
+    for line in blob.splitlines():
+        if any(k in line for k in ("cache split over", "spread over", "BELLS", "bells",
+                                   "model buffer size", "could not pin", "perplexity")):
+            print(f"  | {line.strip()[:150]}")
+
     if ms is None:
         print("  NO TIMING FOUND, tail follows:")
         print(blob[-2500:])

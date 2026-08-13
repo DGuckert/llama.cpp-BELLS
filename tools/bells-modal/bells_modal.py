@@ -125,7 +125,11 @@ def _run(args, tag):
     import time
 
     t0 = time.time()
-    p = subprocess.run([BIN] + args, capture_output=True, text=True, timeout=3600)
+    # errors="replace": llama.cpp emits model-derived bytes (tokenizer output, generated text)
+    # that are not always valid UTF-8, and a strict decode kills the whole run at the point of
+    # capture rather than anywhere informative.
+    p = subprocess.run([BIN] + args, capture_output=True, timeout=3600,
+                       encoding="utf-8", errors="replace")
     wall = time.time() - t0
 
     blob = p.stdout + p.stderr
@@ -601,8 +605,9 @@ def stream_ab(model: str, slots: str = "16", n_gen: int = 96, passes: int = 3):
     memory=131072,       # the point of running this here: locally a 944 MiB tail would not pin
     timeout=7200,
 )
+# n_ctx rather than ctx: modal's CLI is click-based and `ctx` collides with click's own Context
 def pinned_ab(model: str, slots: str = "48", n_gen: int = 128, passes: int = 3,
-              ctx: int = 512, baseline: bool = False):
+              n_ctx: int = 512, baseline: bool = False):
     """Pageable vs pinned expert source, alternating inside one session.
 
     Locally this is worth 1.59x on Qwen3-30B at 17 slots and 1.15x on Qwen3-Next-80B at 48,
@@ -637,8 +642,10 @@ def pinned_ab(model: str, slots: str = "48", n_gen: int = 128, passes: int = 3,
             check=False,
         )
 
-    common = ["-m", path, "-f", corpus, "--chunks", "1", "-c", str(ctx), "-n", str(n_gen),
-              "-ngl", "99"]
+    # -b must cover a whole chunk: the profiler feeds n_ctx tokens in one llama_decode and
+    # llama-context asserts n_tokens_all <= n_batch, whose default is 2048.
+    common = ["-m", path, "-f", corpus, "--chunks", "1", "-c", str(n_ctx), "-b", str(n_ctx),
+              "-n", str(n_gen), "-ngl", "99"]
     out = []
 
     # DeepSeek V4 sizes its compressed attention cache from kv_size, so a small -c can make the

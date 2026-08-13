@@ -1319,8 +1319,38 @@ bool llama_context::bells_eval(ggml_tensor * t, bool ask) {
             std::chrono::duration_cast<std::chrono::microseconds>(t_rb1 - t_rb0).count());
 
         if (!bells->on_routing(il, ids.data(), ids.size())) {
-            LLAMA_LOG_ERROR("%s: layer %d needs more experts than the cache holds, "
-                            "raise --bells-slots\n", __func__, il);
+            // Once, with the numbers. Every MoE layer hits this in the same ubatch, so the
+            // unconditional version printed 48 identical lines at llama-server startup and
+            // looked like a crash. It is also not actionable without knowing how far over the
+            // cache the request went, which is what the counts are for.
+            //
+            // Reaching here means active() admitted a ubatch whose routing wants more distinct
+            // experts than the cache has slots - so n_tokens*n_expert_used exceeded n_slot
+            // despite max_tokens being derived to prevent exactly that. Worth the numbers.
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+
+                std::vector<uint8_t> seen;
+                size_t n_distinct = 0;
+                for (int32_t e : ids) {
+                    if (e < 0) {
+                        continue;
+                    }
+                    if ((size_t) e >= seen.size()) {
+                        seen.resize((size_t) e + 1, 0);
+                    }
+                    if (!seen[e]) {
+                        seen[e] = 1;
+                        n_distinct++;
+                    }
+                }
+
+                LLAMA_LOG_ERROR("%s: layer %d wants %zu distinct experts from %lld tokens x %lld "
+                                "active, more than the cache holds - raise --bells-slots. "
+                                "Further occurrences suppressed.\n",
+                                __func__, il, n_distinct, (long long) rows, (long long) k);
+            }
         }
     }
 

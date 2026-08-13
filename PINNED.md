@@ -132,16 +132,31 @@ time spent waiting on the GPU:
 overhead, not GPU wait - which is what makes it worth attacking in principle, and what makes it
 the barrier stopping a second stream from finding anything to overlap.
 
-**But the magnitude is platform-dependent, and that matters more than the mechanism:**
+**But the magnitude is platform-dependent, and that matters more than the mechanism.** Same
+model, same slot counts, only the GPU and the operating system differing:
 
-| | readback/layer | over 48 layers | share of token |
+| slots | A10G / Linux | RTX 2060 / Windows | |
 |---|---|---|---|
-| A10G, Linux | 30 us | 1.4 ms | ~6% |
-| RTX 2060, Windows | 230 us | 11 ms | **~19%** |
+| 16 | 30.6 us | 279.3 us | **9.1x** |
+| 32 | 30.6 us | 274.0 us | 9.0x |
+| 48 | ~30.5 us | 268.4 us | 8.8x |
 
-A 7.7x gap. The likely cause is WDDM, whose kernel-launch and synchronisation latency exceeds
-Linux's by a wide margin. Confounded by a different GPU and model, so not proven - but far too
-large to be a 2060-versus-A10G difference in a device sync.
+Flat on both, so it is fixed overhead in either case - but an order of magnitude larger under
+Windows. Across 48 layers that is 1.4 ms of a 19 ms token on Linux, about 6%, against 13 ms of
+a 48 ms token on Windows, about **27%**.
+
+The cause is almost certainly WDDM, whose kernel-launch and synchronisation latency exceeds
+Linux's by a wide margin. A GPU difference cannot plausibly produce 9x in a device sync, and the
+ratio holds across three independent slot counts.
+
+**So the cheapest remaining optimisation on a Windows machine is to stop running Windows.** No
+code, no hardware, roughly a fifth to a quarter of a token.
+
+One caution about the Windows run those figures come from: its *copy* column measured 448.5,
+369.4 and 302.9 us, which works out at 10.9-12.0 GB/s - exactly the blocking PCIe 3.0 rate. The
+pinned allocation had failed (a 27.2 GB model against 32 GB of RAM, with less free than during
+the successful run earlier), so that column reflects pageable behaviour. Readback does not
+depend on pinning and is unaffected.
 
 So on Linux, BELLS' entire per-layer overhead is ~11% of the token at high slot counts and
 there is little left to collect. On Windows it is worth about a fifth, and **the cheapest way to

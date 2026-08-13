@@ -607,7 +607,7 @@ def stream_ab(model: str, slots: str = "16", n_gen: int = 96, passes: int = 3):
 )
 # n_ctx rather than ctx: modal's CLI is click-based and `ctx` collides with click's own Context
 def pinned_ab(model: str, slots: str = "48", n_gen: int = 128, passes: int = 3,
-              n_ctx: int = 512, baseline: bool = False):
+              n_ctx: int = 512, baseline: bool = False, ctk: str = ""):
     """Pageable vs pinned expert source, alternating inside one session.
 
     Locally this is worth 1.59x on Qwen3-30B at 17 slots and 1.15x on Qwen3-Next-80B at 48,
@@ -646,6 +646,12 @@ def pinned_ab(model: str, slots: str = "48", n_gen: int = 128, passes: int = 3,
     # llama-context asserts n_tokens_all <= n_batch, whose default is 2048.
     common = ["-m", path, "-f", corpus, "--chunks", "1", "-c", str(n_ctx), "-b", str(n_ctx),
               "-n", str(n_gen), "-ngl", "99"]
+
+    # DeepSeek V4 allocates its compressed attention cache at type_k, which defaults to F16, and
+    # then concatenates it with the SWA k cache. ggml's CUDA concat requires F32, so the default
+    # asserts. -ctk f32 makes both operands F32 at the cost of doubling the KV cache.
+    if ctk:
+        common += ["-ctk", ctk]
     out = []
 
     # DeepSeek V4 sizes its compressed attention cache from kv_size, so a small -c can make the

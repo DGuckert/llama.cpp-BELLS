@@ -601,7 +601,8 @@ def stream_ab(model: str, slots: str = "16", n_gen: int = 96, passes: int = 3):
     memory=131072,       # the point of running this here: locally a 944 MiB tail would not pin
     timeout=7200,
 )
-def pinned_ab(model: str, slots: str = "48", n_gen: int = 128, passes: int = 3):
+def pinned_ab(model: str, slots: str = "48", n_gen: int = 128, passes: int = 3,
+              ctx: int = 512, baseline: bool = False):
     """Pageable vs pinned expert source, alternating inside one session.
 
     Locally this is worth 1.59x on Qwen3-30B at 17 slots and 1.15x on Qwen3-Next-80B at 48,
@@ -636,8 +637,15 @@ def pinned_ab(model: str, slots: str = "48", n_gen: int = 128, passes: int = 3):
             check=False,
         )
 
-    common = ["-m", path, "-f", corpus, "--chunks", "1", "-c", "512", "-n", str(n_gen), "-ngl", "99"]
+    common = ["-m", path, "-f", corpus, "--chunks", "1", "-c", str(ctx), "-n", str(n_gen),
+              "-ngl", "99"]
     out = []
+
+    # DeepSeek V4 sizes its compressed attention cache from kv_size, so a small -c can make the
+    # graph assert before anything runs. A no-BELLS run first separates "the model does not work
+    # here" from "BELLS breaks it".
+    if baseline:
+        out.append(_run(common + ["-o", "/tmp/base.json", "--cpu-moe"], "baseline, no BELLS"))
 
     for s in [int(x) for x in slots.split(",") if x.strip()]:
         # one throwaway first: the page cache is cold on a fresh volume mount, and a cold

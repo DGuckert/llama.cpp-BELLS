@@ -43,12 +43,24 @@ The 80B row is a range because it is the only one measured twice, and the two ru
 between them but the container. **Read every other row as carrying the same uncertainty**; they
 are single runs and only look more precise.
 
-GPT-OSS is the exception, and per-layer counters say the cache is not responsible: BELLS
-contributes about **50 us against a 263 ms token, under 1%**. The cache behaves correctly
-throughout - hit rate climbing 46% to 78% as slots rise, copy and layer totals falling - and the
-model gets slower anyway. Something worth 1% cannot cause a 6x loss. The time is in graph
-execution, which makes the real comparison GPU expert compute against CPU, and the GPU loses 3.4x
-*on this model alone*. It is MXFP4, a Blackwell-native format, on Ampere.
+GPT-OSS is the exception and **we do not know why**. What is ruled out:
+
+- **Not the transfers.** Per-layer counters put readback, copy and upload together at about
+  **50 us against a 263 ms token, under 1%**, while hit rate climbs 46% to 78% with slots and
+  copy totals fall. The parts BELLS instruments behave correctly.
+- **Not VRAM pressure.** More slots makes it reliably *worse*, but 32 slots is 14.5 GB on a
+  183 GB B200 - there is nothing to starve.
+- **Not MXFP4 emulation.** This was the leading theory: the format is Blackwell-native and the
+  A10G is Ampere, so the expert matmul would be emulated there. Tested on a B200 with native
+  support and it still loses - 22.67 tok/s without BELLS against 6.65 with, a **0.29x** where
+  Ampere gave 0.21x.
+
+What is left is the part the counters do not time. BELLS replaces a `mul_mat_id` over the full
+128-expert tensor with one over an n_slot+1 row cache plus a slot remap. On every other model
+that is free. On this one it costs 6x, on two architectures, and worse as the cache grows.
+
+So it *is* a cache failure - just not in the transfer path, which is where all the
+instrumentation points. Anyone extending this should start there.
 
 **Two caveats that matter more than the numbers.**
 

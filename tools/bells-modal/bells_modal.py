@@ -64,6 +64,101 @@ image = (
 )
 
 
+# Blackwell needs its own image. GPT-OSS-120B is MXFP4, a format native to Blackwell, and it is
+# the only model here BELLS loses on - 0.21x, with per-layer counters showing the cache
+# contributing under 1% of the token. The hypothesis is that the matmul is emulated on Ampere and
+# the GPU therefore loses to 16 CPU cores at arithmetic it should win.
+#
+# Two things stop the main image being reused: it is CUDA 12.4, which predates sm_100, and it
+# compiles for sm_86 only with no forward-compatible PTX, so a B200 would find no kernels.
+CUDA_ARCHS_BLACKWELL = "100"
+
+image_blackwell = (
+    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
+    .apt_install("git", "cmake", "ninja-build", "build-essential", "curl", "libcurl4-openssl-dev")
+    .pip_install("huggingface_hub[hf_transfer]", "numpy")
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    .add_local_dir(
+        "C:/Users/Daniel/AppData/Local/Temp/claude/C--Users-Daniel/dc34c62a-4c48-46b9-9018-044226134f7f/scratchpad/modal/new",
+        remote_path="/bells-src/new",
+        copy=True,
+    )
+    .run_commands(
+        f"git clone {UPSTREAM} /llama && cd /llama && git checkout {BASE_REV}",
+        "cp -rv /bells-src/new/. /llama/",
+        f'cd /llama && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release '
+        f'-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="{CUDA_ARCHS_BLACKWELL}" '
+        f'-DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF '
+        f'-DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" '
+        f'-DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"',
+        "cd /llama && LIBRARY_PATH=/usr/local/cuda/lib64/stubs cmake --build build -j $(nproc)",
+        gpu="T4",
+    )
+)
+
+
+@app.function(
+    image=image_blackwell,
+    volumes={"/models": models, "/results": results},
+    gpu="B200",
+    cpu=16.0,
+    memory=131072,
+    timeout=7200,
+)
+def blackwell(model: str = "gpt-oss-120b-MXFP4.gguf", slots: str = "16,32", n_gen: int = 64):
+    """Is GPT-OSS slow on Ampere because MXFP4 is emulated there?
+
+    On an A10G this model is the single case BELLS loses: 13.21 tok/s from --cpu-moe against
+    2.83 with the cache. The counters say the cache is not responsible - about 50 us against a
+    263 ms token - so the time is in graph execution, which makes it GPU expert compute losing to
+    16 CPU cores by 3.4x on this model and winning on every other one.
+
+    If the format is the reason, the same comparison on Blackwell should invert.
+
+    Experts are forced onto the host with --cpu-moe even though 59 GB fits in 192 GB of VRAM,
+    because the point is to exercise the same path the A10G ran, not to show that a big card can
+    hold the model.
+    """
+    import json
+    import os
+    import subprocess
+
+    subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total,compute_cap",
+                    "--format=csv"], check=False)
+
+    path = f"/models/{model}"
+    corpus = "/results/corpus.txt"
+    if not os.path.exists(corpus):
+        subprocess.run(
+            ["bash", "-c", f"cat /llama/docs/*.md /llama/*.md > {corpus} 2>/dev/null || true"],
+            check=False,
+        )
+
+    common = ["-m", path, "-f", corpus, "--chunks", "1", "-c", "512", "-b", "512",
+              "-n", str(n_gen), "-ngl", "99"]
+    out = []
+
+    out.append(_run(common + ["-o", "/tmp/bw0.json", "--cpu-moe"], "B200 baseline, no BELLS"))
+
+    for s in [int(x) for x in slots.split(",") if x.strip()]:
+        out.append(_run(common + ["-o", f"/tmp/bw{s}.json", "--cpu-moe-pinned",
+                                  "--bells-slots", str(s)],
+                        f"B200 BELLS {s} slots"))
+
+    with open("/results/blackwell.json", "w") as f:
+        json.dump(out, f, indent=2)
+    results.commit()
+
+    print("\n\n===== SUMMARY =====")
+    for r in out:
+        print(f"{r['tag']:<26} {str(r['ms']):>9} ms/token  {str(r['tps']):>8} tok/s")
+    print("\nOn A10G this model gave 13.21 tok/s without BELLS and 2.83 with, a 0.21x.")
+    print("If BELLS wins here, MXFP4 emulation on Ampere was the cause and the cache was")
+    print("never the problem.")
+
+    return out
+
+
 @app.function(image=image, timeout=3600)
 def build():
     """Force the image to build and report what came out."""

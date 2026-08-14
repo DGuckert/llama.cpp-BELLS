@@ -158,7 +158,7 @@ GPT-OSS-120B loses: its baseline of 13.21 tok/s is already faster than BELLS man
 slots and falls to 0.73x at 36; Mixtral peaks at 4 and drops to 0.80x at 8; Qwen3-Next reaches
 a knee at 128 and then simply stops improving. Start with `--bells-slots -1` and sweep.
 
-### On a 6 GB card, don't bother
+### On a 6 GB card: yes for chat, still no for a busy server
 
 Three models with `llama-bells-profile` at `-c 512` - pure decode, no prefill or sampling, and
 a large cache because a 512-token context leaves VRAM free:
@@ -185,9 +185,23 @@ worth about 5%. Worse, the cache and the KV cache come out of the same pool: at 
 there is only room for a 1.2x ratio, which BELLS itself labels *"poor fit, expect a slowdown"*
 before proceeding anyway, and it duly measures 0.83x.
 
-**If you have 6 GB, use `--cpu-moe` and leave BELLS off.** It needs room for a large cache *and*
-a real context at once. The 24 GB results above are unaffected, because that card has room for
-both.
+**Re-measured with pinning, the decode verdict flips.** Same 2060, same models, three paired
+passes each:
+
+| Model | pageable | **pinned** | |
+|---|---|---|---|
+| Qwen3-30B-A3B, 17 slots | 10.62 tok/s | **16.83** | 1.59x |
+| Qwen3-Next-80B, 48 slots | 20.04 | **23.06** | 1.15x |
+
+An 80B at 23 tok/s on a 6 GB card, and 22.4 through `llama-server` with 26.6 observed over a
+longer reply as the cache amortises. That is the case this project exists for, and it works.
+
+**The server verdict has not been re-tested and probably still stands.** Its ~5% loss came from
+the cache holding VRAM whether used or not, which pinning does not change, and the KV-cache
+squeeze at long contexts is unaffected too.
+
+So: **on 6 GB, use BELLS for single-user chat and leave it off for a busy server with a large
+context.** The 24 GB results above are unaffected either way.
 
 > **This section predates pinned expert memory and needs re-testing.** Every number in it copies
 > experts out of pageable host memory, where `cudaMemcpyAsync` blocks the caller for 99.7% of the

@@ -623,6 +623,13 @@ int main(int argc, char ** argv) {
 
         int last_out = n_seed - 1;
 
+        // Kept so the run can be checked for degenerate output. Throughput and hit rate say
+        // nothing about correctness: a broken cache can report 99.5% hit and 63 tok/s while
+        // emitting one token forever, and this tool reported exactly that before the check
+        // existed. See the sm_86 corruption in RESULTS.md.
+        std::vector<llama_token> gen_toks;
+        gen_toks.reserve(n_gen);
+
         for (int i = 0; i < n_gen; ++i) {
             const float * logits = llama_get_logits_ith(ctx, last_out);
             if (logits == nullptr) {
@@ -660,9 +667,50 @@ int main(int argc, char ** argv) {
             prof.tok_id.push_back(best);
             prof.tok_pos.push_back(pos);
             prof.tok_generated.push_back(1);
+            gen_toks.push_back(best);
 
             n_tokens_seen++;
             last_out = 0;
+        }
+
+        // Greedy decoding repeats itself sometimes, so this only fires on the pathological case:
+        // almost no distinct tokens, or one token taking over the whole sample. n_gen is at most
+        // a few hundred, so the quadratic scan is free and needs no extra headers.
+        if (gen_toks.size() >= 16) {
+            size_t n_distinct = 0;
+            size_t top_count  = 0;
+
+            for (size_t a = 0; a < gen_toks.size(); ++a) {
+                size_t count = 0;
+                bool   first = true;
+                for (size_t b = 0; b < gen_toks.size(); ++b) {
+                    if (gen_toks[b] == gen_toks[a]) {
+                        count++;
+                        if (b < a) {
+                            first = false;
+                        }
+                    }
+                }
+                if (first) {
+                    n_distinct++;
+                }
+                if (count > top_count) {
+                    top_count = count;
+                }
+            }
+
+            const double top_share = (double) top_count/gen_toks.size();
+
+            if (n_distinct <= 3 || top_share >= 0.9) {
+                LOG_ERR("%s: DEGENERATE OUTPUT - %zu distinct tokens in %zu, top token %.0f%%. "
+                        "The timings below are meaningless; the model is not generating text. "
+                        "Check the expert cache before trusting any number from this run.\n",
+                        __func__, n_distinct, gen_toks.size(), 100.0*top_share);
+            } else if (n_distinct*8 < gen_toks.size() || top_share >= 0.6) {
+                LOG_WRN("%s: output looks repetitive - %zu distinct tokens in %zu, top token "
+                        "%.0f%%. Verify the text before trusting these timings.\n",
+                        __func__, n_distinct, gen_toks.size(), 100.0*top_share);
+            }
         }
 
         if (t_gen_us > 0) {

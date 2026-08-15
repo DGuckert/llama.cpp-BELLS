@@ -845,3 +845,50 @@ The prediction analysis is offline and needs no runtime support:
 python bells_build_table.py profile.trace.bin model.bells 32   # table, for analysis only
 python bells_predict.py profile.trace.bin                      # LRU vs table vs Belady
 ```
+
+## sm_86 corruption
+
+**BELLS generates garbage on an RTX 3060 (sm_86) in the pinned configuration, and the
+instrumentation cannot see it.** Found 2026-08-15 on a Debian box (i7-4790K, 30 GB DDR3, driver
+595.84), building and running inside a `nvidia/cuda:12.4.1-devel` container, sm_86.
+
+Symptom: every reply is one token repeated to the token limit - `////////...` - with
+`finish_reason: length`. Throughput and hit rate look excellent throughout: 99.5% hit, 61-63
+tok/s, cache counters entirely normal.
+
+The bisect, all at `-c 4096`, 32 slots, same binary and GGUF:
+
+| configuration | output |
+|---|---|
+| `--cpu-moe`, BELLS off | correct |
+| BELLS passive (cache allocated, graph split taken, never read) | correct |
+| BELLS active, experts mmap'd (`--cpu-moe`) | correct |
+| BELLS active, experts pinned (`--cpu-moe-pinned`) | **garbage** |
+| BELLS active, `--cpu-moe --no-mmap` | **garbage** |
+
+The last two are the same condition: llama.cpp selects the host (pinned) buffer type whenever
+mmap is off, so `--no-mmap` and "pinned" are not separable from the command line.
+
+Eliminated, each by direct experiment rather than argument:
+
+- **Copy ordering.** `BELLS_SYNC_COPY=1` forces the fully blocking `ggml_backend_tensor_set`
+  and still corrupts. Not a race, which also kills the two-stream hypothesis - that stream is
+  opt-in via `BELLS_COPY_STREAM=1` and was never enabled in any failing run.
+- **CUDA graph capture.** `GGML_CUDA_DISABLE_GRAPHS=1` still corrupts.
+- **Pinned buffer chunking.** `GGML_CUDA_PINNED_CHUNK_MB` at 256 and at 8192 both corrupt.
+- **Graph placement.** `graph splits = 122/82` identical for pinned and mmap'd, so the
+  scheduler assigns the expert matmul the same way in both.
+- **CPU weight repacking.** `REPACK = 1` is present, but `load_tensors` shows the experts in
+  `CUDA_Host` with no repacked buffer type.
+
+Not reproduced on sm_75: the same 35B Q4_K_M at 26 slots pinned returns correct text on an RTX
+2060 at 19.24 tok/s, against 12.60 mmap'd - a verified 1.53x with the output read, not just
+timed. Two variables differ between the machines and this work did not separate them: the GPU
+architecture, and CUDA 12.4-in-container versus 12.8-on-Windows.
+
+**The process failure matters more than the bug.** `llama-bells-profile` reported healthy
+timings for a model emitting a single token forever, because it measured throughput and cache
+hit rate and never looked at what was generated. A 63 tok/s figure was reported from such a run
+and had to be retracted. The tool now counts distinct tokens and the most frequent token's share
+after generation, and prints `DEGENERATE OUTPUT` when a run collapses. Any benchmark taken
+before that check exists should be treated as unvalidated unless the text was read.

@@ -12,6 +12,23 @@ compute buffers. **Expert**: per-expert granularity, as opposed to the layer gra
 `-ngl`. **LRU**: plain least-recently-used, which beat the predictive scheme this project was
 originally built around.
 
+> [!WARNING]
+> **Known broken on Ampere: verify your output before trusting any speedup.**
+>
+> On an RTX 3060 (sm_86), BELLS with the expert source in pinned host memory generates
+> garbage - one repeated token, indefinitely - while throughput and hit rate look perfect
+> (99.5% hit, 63 tok/s). The same model, quant, commit and flags produce correct text on an
+> RTX 2060 (sm_75). Reproduce and diagnosis in [RESULTS.md](RESULTS.md#sm_86-corruption).
+>
+> Ruled out: copy ordering (a forced synchronous copy still corrupts), CUDA graph capture,
+> the second copy stream, pinned-buffer chunking, graph placement, and CPU weight repacking.
+> The one discriminator is the expert buffer type - mmap'd experts are correct, `CUDA_Host`
+> pinned experts are not. Since `--cpu-moe-pinned` is also what makes BELLS fast, the broken
+> configuration is the fast one. Root cause is still open.
+>
+> Every number below was measured on hardware where output was checked. If you are on Ampere
+> or newer, run a prompt and read the reply before believing a benchmark.
+
 **A 235B model on one 24 GB card at 11.3 tok/s, up from 3.1.** An 80B on the same card at
 53.1 tok/s, up from 19.8. Both are models plain `-ngl` cannot load at all.
 

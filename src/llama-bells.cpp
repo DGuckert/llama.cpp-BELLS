@@ -376,6 +376,19 @@ void bells_tensors::copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t exper
     // the source expert stack is host resident, which is the whole premise of offloading
     const char * base = (const char *) src->data + (size_t) expert*stride;
 
+    // BELLS_SYNC_COPY=1 forces the fully blocking copy. Diagnostic for the sm_86 corruption:
+    // if garbage survives a synchronous copy then the defect is in the data or the indexing,
+    // not in the ordering between the transfer and the matmul that reads it.
+    static const bool sync_copy = [] {
+        const char * s = getenv("BELLS_SYNC_COPY");
+        return s && s[0] && s[0] != '0';
+    }();
+
+    if (sync_copy) {
+        ggml_backend_tensor_set(dst, base, (size_t) slot*stride, stride);
+        return;
+    }
+
     // copy_backend_ is only ever set in the single-device case; see init(). Otherwise the copy
     // has to be issued against the device the destination actually lives on.
     if (copy_backend_) {

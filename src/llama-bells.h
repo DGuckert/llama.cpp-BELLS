@@ -158,6 +158,15 @@ public:
     // push the current expert->slot mapping to the device
     void upload_slots(uint32_t il, const std::vector<int32_t> & table);
 
+    // Diagnostic: does the cache slot actually hold that expert's bytes right now? Reads the slot
+    // back off the device, so only for BELLS_VERIFY_RESIDENT.
+    bool slot_matches_expert(uint32_t il, int32_t expert, int32_t slot);
+
+    // Wait for every kernel already queued on the compute backend to finish. Needed before a slot
+    // is overwritten: eviction reuses memory that an in-flight matmul may still be reading, and
+    // stream ordering does not cover it when the write is issued off the compute stream.
+    void sync_compute();
+
     // Index of the spare slot holding zeros. Routing a non-resident expert here makes it
     // contribute nothing instead of indexing out of bounds, which is what lets the graph
     // run without stopping to ask the host which experts were selected.

@@ -426,6 +426,130 @@ void bells_tensors::copy_expert(uint32_t il, int32_t expert, int32_t slot) {
     copy_one(e.up,      e.src.up,      expert, slot, e.backend);
     copy_one(e.down,    e.src.down,    expert, slot, e.backend);
     copy_one(e.gate_up, e.src.gate_up, expert, slot, e.backend);
+
+    // BELLS_VERIFY_COPY=1 reads each slot back and compares it against the host source. This is
+    // the question the sm_86 corruption turns on: if the bytes match, the copy is fine and the
+    // defect is in how the matmul reads the cache; if they differ, the transfer itself is wrong.
+    // Slow and synchronising - diagnostic only.
+    static const bool verify = [] {
+        const char * s = getenv("BELLS_VERIFY_COPY");
+        return s && s[0] && s[0] != '0';
+    }();
+
+    if (!verify) {
+        return;
+    }
+
+    static int n_checked = 0;
+    static int n_bad     = 0;
+    if (n_checked >= 64) {
+        return;
+    }
+
+    struct { ggml_tensor * dst; ggml_tensor * src; const char * name; } pairs[] = {
+        { e.gate,    e.src.gate,    "gate"    },
+        { e.up,      e.src.up,      "up"      },
+        { e.down,    e.src.down,    "down"    },
+        { e.gate_up, e.src.gate_up, "gate_up" },
+    };
+
+    // copy_one derives the per-expert stride from the SOURCE and uses it to offset into the
+    // DESTINATION. If the cache tensor strides differently the copy lands at the wrong offset,
+    // and a readback using the same source stride would not notice. Compare them once.
+    static bool geometry_logged = false;
+    if (!geometry_logged) {
+        geometry_logged = true;
+        for (const auto & p : pairs) {
+            if (!p.dst || !p.src) {
+                continue;
+            }
+            const size_t s_stride = ggml_nbytes(p.src)/p.src->ne[2];
+            const size_t d_stride = ggml_nbytes(p.dst)/p.dst->ne[2];
+            fprintf(stderr, "%s: geom %s: src type=%s ne=[%lld,%lld,%lld] nb1=%zu nb2=%zu stride=%zu | "
+                            "dst type=%s ne=[%lld,%lld,%lld] nb1=%zu nb2=%zu stride=%zu%s\n",
+                    __func__, p.name,
+                    ggml_type_name(p.src->type),
+                    (long long) p.src->ne[0], (long long) p.src->ne[1], (long long) p.src->ne[2],
+                    p.src->nb[1], p.src->nb[2], s_stride,
+                    ggml_type_name(p.dst->type),
+                    (long long) p.dst->ne[0], (long long) p.dst->ne[1], (long long) p.dst->ne[2],
+                    p.dst->nb[1], p.dst->nb[2], d_stride,
+                    s_stride == d_stride ? "" : "   <<< STRIDE MISMATCH");
+        }
+    }
+
+    std::vector<uint8_t> got;
+
+    for (const auto & p : pairs) {
+        if (!p.dst || !p.src) {
+            continue;
+        }
+
+        const size_t stride = ggml_nbytes(p.src)/p.src->ne[2];
+        const uint8_t * want = (const uint8_t *) p.src->data + (size_t) expert*stride;
+
+        got.resize(stride);
+        ggml_backend_tensor_get(p.dst, got.data(), (size_t) slot*stride, stride);
+
+        if (memcmp(got.data(), want, stride) != 0) {
+            size_t first = 0;
+            size_t ndiff = 0;
+            for (size_t i = 0; i < stride; ++i) {
+                if (got[i] != want[i]) {
+                    if (ndiff == 0) {
+                        first = i;
+                    }
+                    ndiff++;
+                }
+            }
+            n_bad++;
+            fprintf(stderr, "%s: MISMATCH layer %u expert %d slot %d %s: %zu/%zu bytes differ, "
+                            "first at %zu (host 0x%02x, vram 0x%02x)\n",
+                    __func__, il, expert, slot, p.name, ndiff, stride, first,
+                    want[first], got[first]);
+        }
+
+        n_checked++;
+    }
+
+    if (n_checked >= 64) {
+        fprintf(stderr, "%s: copy verification done - %d checks, %d mismatched\n",
+                __func__, n_checked, n_bad);
+    }
+}
+
+void bells_tensors::sync_compute() {
+    if (backend_) {
+        ggml_backend_synchronize(backend_);
+    }
+}
+
+bool bells_tensors::slot_matches_expert(uint32_t il, int32_t expert, int32_t slot) {
+    if (!has(il) || expert < 0 || slot < 0) {
+        return false;
+    }
+
+    entry & e = get_mut(il);
+
+    // one tensor is enough to catch a mismatched slot, and gate is always present
+    ggml_tensor * dst = e.gate;
+    ggml_tensor * src = e.src.gate;
+    if (!dst || !src) {
+        return true;
+    }
+
+    const size_t stride = ggml_nbytes(src)/src->ne[2];
+
+    // compare a prefix rather than the whole expert: a wrong slot differs almost everywhere,
+    // and reading 2 MB per expert per token would dominate the run
+    const size_t n_cmp = std::min<size_t>(stride, 4096);
+
+    std::vector<uint8_t> got(n_cmp);
+    ggml_backend_tensor_get(dst, got.data(), (size_t) slot*stride, n_cmp);
+
+    const uint8_t * want = (const uint8_t *) src->data + (size_t) expert*stride;
+
+    return memcmp(got.data(), want, n_cmp) == 0;
 }
 
 void bells_tensors::upload_slots(uint32_t il, const std::vector<int32_t> & table) {
@@ -443,6 +567,44 @@ void bells_tensors::upload_slots(uint32_t il, const std::vector<int32_t> & table
     // NOTE: cannot go async here. table is a caller-owned vector that may be rewritten
     // before an async copy drains, so the write has to complete before returning.
     ggml_backend_tensor_set(t, table.data(), 0, n*sizeof(int32_t));
+
+    // BELLS_VERIFY_SLOTS=1 reads the table back. The copies were proven byte-correct on sm_86
+    // while the output was still garbage, so the remaining suspect is the mapping the matmul
+    // indexes through. Diagnostic only.
+    static const bool verify = [] {
+        const char * s = getenv("BELLS_VERIFY_SLOTS");
+        return s && s[0] && s[0] != '0';
+    }();
+
+    if (!verify) {
+        return;
+    }
+
+    static int n_layers_checked = 0;
+    if (n_layers_checked >= 8) {
+        return;
+    }
+    n_layers_checked++;
+
+    std::vector<int32_t> got(n);
+    ggml_backend_tensor_get(t, got.data(), 0, n*sizeof(int32_t));
+
+    size_t n_diff = 0;
+    size_t n_oob  = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (got[i] != table[i]) {
+            n_diff++;
+        }
+        if (got[i] < 0 || (uint32_t) got[i] > n_slot_) {
+            n_oob++;
+        }
+    }
+
+    fprintf(stderr, "%s: layer %u slots: tensor=%p data=%p %zu entries, %zu readback mismatches, "
+                    "%zu out of range (n_slot=%u), first 8: %d %d %d %d %d %d %d %d\n",
+            __func__, il, (void *) t, (void *) t->data, n, n_diff, n_oob, n_slot_,
+            n > 0 ? got[0] : -1, n > 1 ? got[1] : -1, n > 2 ? got[2] : -1, n > 3 ? got[3] : -1,
+            n > 4 ? got[4] : -1, n > 5 ? got[5] : -1, n > 6 ? got[6] : -1, n > 7 ? got[7] : -1);
 }
 
 //
@@ -677,6 +839,20 @@ bool bells_runtime::init(const bells_params & params,
                         "(conservative, sweep --bells-slots to beat it)\n",
                 __func__, dev_free/1024.0/1024.0/1024.0,
                 headroom/1024.0/1024.0/1024.0, n_slot);
+
+        // Auto-sizing is not merely suboptimal when it comes out thin - it can be slower than not
+        // using BELLS at all, because the per-layer readback is charged on every layer of every
+        // token whether or not the cache saves anything. Measured on Qwen3-30B-A3B Q4_K_M on a
+        // 6 GB card: --bells picked 17 slots and ran at 11.07 tok/s against an 11.37 tok/s
+        // --cpu-moe baseline, while an explicit 26 slots reached 13.75. Below roughly 3x
+        // n_expert_used there is not enough reuse to pay for the round-trip, so say so.
+        if (n_expert_used > 0 && n_slot < 3*n_expert_used) {
+            fprintf(stderr, "%s: WARNING %u slots is only %.1fx n_expert_used (%u). BELLS is "
+                            "likely to be SLOWER than plain --cpu-moe at this size. Raise "
+                            "--bells-slots, or drop BELLS and try partial expert offload "
+                            "(-ot 'blk\\.(0|1|...)\\.ffn_.*_exps\\.weight=CPU') instead.\n",
+                    __func__, n_slot, (double) n_slot/n_expert_used, n_expert_used);
+        }
     }
 
     n_slot = std::min(n_slot, n_expert);
@@ -1070,6 +1246,19 @@ bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
         return false;
     }
 
+    // BELLS_SYNC_EVICT=1: before reusing a slot, wait for kernels already queued on the compute
+    // backend. Eviction overwrites memory an in-flight matmul may still be reading, and that is
+    // not covered by stream ordering when the write is issued off the compute stream. Suspected
+    // cause of the sm_86 corruption, which only appears once the cache starts reusing slots.
+    static const bool sync_evict = [] {
+        const char * s = getenv("BELLS_SYNC_EVICT");
+        return s && s[0] && s[0] != '0';
+    }();
+
+    if (sync_evict && !copies_.empty()) {
+        tensors_.sync_compute();
+    }
+
     const auto t_copy0 = std::chrono::steady_clock::now();
 
     // No parallel prefault here, though it is tempting. It belonged to the prefetch path, where
@@ -1091,6 +1280,49 @@ bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
     tensors_.sync_copies();
 
     tensors_.upload_slots(il, cache_.slot_table(il));
+
+    // BELLS_VERIFY_RESIDENT=1 checks the whole invariant the matmul depends on, at the moment it
+    // is about to run: for every expert this token routed to, the slot the table points at must
+    // hold that expert's bytes. Copies verify individually and ids verify valid, yet output still
+    // degrades once eviction starts - so this tests the combination rather than the parts.
+    static const bool verify_res = [] {
+        const char * s = getenv("BELLS_VERIFY_RESIDENT");
+        return s && s[0] && s[0] != '0';
+    }();
+
+    if (verify_res) {
+        static int n_reported = 0;
+        static long n_tok     = 0;
+        n_tok++;
+
+        if (n_reported < 6) {
+            const std::vector<int32_t> & tbl = cache_.slot_table(il);
+            size_t bad = 0;
+            int32_t bad_e = -1, bad_s = -1;
+
+            for (size_t i = 0; i < n && bad == 0; ++i) {
+                const int32_t e = experts[i];
+                if (e < 0 || (size_t) e >= tbl.size()) {
+                    continue;
+                }
+                const int32_t s = tbl[e];
+                if (s < 0) {
+                    bad++; bad_e = e; bad_s = s;
+                    break;
+                }
+                if (!tensors_.slot_matches_expert(il, e, s)) {
+                    bad++; bad_e = e; bad_s = s;
+                }
+            }
+
+            if (bad > 0) {
+                n_reported++;
+                fprintf(stderr, "%s: *** RESIDENCY VIOLATION call %ld layer %u: expert %d -> slot %d "
+                                "does not hold that expert's data\n",
+                        __func__, n_tok, il, bad_e, bad_s);
+            }
+        }
+    }
 
     const auto t_up1 = std::chrono::steady_clock::now();
 

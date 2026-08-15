@@ -892,3 +892,49 @@ hit rate and never looked at what was generated. A 63 tok/s figure was reported 
 and had to be retracted. The tool now counts distinct tokens and the most frequent token's share
 after generation, and prints `DEGENERATE OUTPUT` when a run collapses. Any benchmark taken
 before that check exists should be treated as unvalidated unless the text was read.
+
+## Partial expert offload beats BELLS on most models
+
+Found 2026-08-15. `--cpu-moe` pins **every** expert layer to the CPU, even when VRAM is sitting
+idle. llama.cpp's `-ot` can pin only some layers and let the rest run on the GPU:
+
+```
+-ot 'blk\.([0-9]|[12][0-9]|3[0-2])\.ffn_(gate|up|down)_exps\.weight=CPU'
+```
+
+That needs no custom code, touches nothing in the expert cache, and carries none of BELLS's
+correctness risk. Measured against it, BELLS loses on most models.
+
+**Qwen3.6-35B-A3B Q4_K_M** (40 layers, 256 experts, 8 active, 1.81 MB each, 0.57 GB/token):
+
+| card | baseline | BELLS | partial offload |
+|---|---|---|---|
+| RTX 3060 12 GB, 128k | 21.5 | 21.5 (corrupt at some sizes) | **30.4** (17 layers) |
+| RTX 2060 6 GB, 64k | 16.60 | 14.00 | **18.25** (4 layers) |
+
+**Qwen3-30B-A3B Q4_K_M** (48 layers, 128 experts, 8 active, ~2.7 MB each, 1.05 GB/token), 2060,
+8k, q8_0 KV:
+
+| config | tok/s |
+|---|---|
+| `--cpu-moe` baseline | 11.37 |
+| `--bells` (auto-sized to 17 slots) | 11.07 |
+| `-ot` 5 layers | 12.21 |
+| `-ot` 10 layers | 12.90 |
+| **`--bells-slots 26`** | **13.75** |
+
+Two conclusions.
+
+**BELLS only wins when it is sized properly and the model moves enough data per token.** Explicit
+26 slots beats partial offload here; the auto-sized 17 loses to doing nothing. The per-layer
+readback is charged regardless of hit rate, so a thin cache pays full overhead for little saving.
+`--bells` now warns when it sizes below 3x `n_expert_used`.
+
+**Bytes moved per token predicts the win better than the cache ratio.** Qwen3-30B moves 1.05 GB
+per token and BELLS wins; Qwen3.6-35B moves 0.57 GB and it loses on both cards, despite a *better*
+cache ratio. Below roughly 1 GB/token the CPU path is already fast enough that the fixed overhead
+dominates. This is the same lesson as the earlier "ratio is a screen, not a predictor" note,
+sharpened: what matters is how expensive the CPU baseline is.
+
+**Try `-ot` first on any new model.** Reach for BELLS only where offload cannot fit enough layers
+*and* the baseline is genuinely slow.

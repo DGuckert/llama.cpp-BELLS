@@ -1326,12 +1326,137 @@ bool llama_context::bells_eval(ggml_tensor * t, bool ask) {
         }
     }
 
+    // BELLS_VERIFY_IDS=1 inspects the remapped ids actually handed to mul_mat_id. Copies, slot
+    // table, tensor geometry and kernel choice have all been verified correct on sm_86 while the
+    // output stayed garbage, so this is the last unobserved link: if these are raw expert ids
+    // rather than slot ids, every read runs off the end of a cache that only has n_slot+1 entries.
+    static const bool verify_ids = [] {
+        const char * s = getenv("BELLS_VERIFY_IDS");
+        return s && s[0] && s[0] != '0';
+    }();
+
+    // Match the op, not the name: cb() names the reshaped view, and a view is not an evaluated
+    // node, so a name test never fires. The id remap is the only I32 get_rows in the MoE path.
+    const bool is_bells_ids = verify_ids &&
+                              t->op   == GGML_OP_GET_ROWS &&
+                              t->type == GGML_TYPE_I32;
+
     // chain to any user callback (imatrix, eval-callback). It may see nodes it did not ask
     // for when BELLS wants them too, which is harmless for observation-only consumers.
     const bool user = cparams.cb_eval ? cparams.cb_eval(t, ask, cparams.cb_eval_user_data) : false;
 
     if (ask) {
-        return is_topk || user;
+        return is_topk || is_bells_ids || user;
+    }
+
+    if (is_bells_ids && bells && bells->ready()) {
+        // Report the first few, then only anomalies. The corruption appears partway through a
+        // generation, so a fixed head of the log misses it entirely.
+        static int  n_seen    = 0;
+        static int  n_bad     = 0;
+        static long n_calls   = 0;
+        n_calls++;
+
+        bool want_log = n_seen < 3;
+        {
+            const int64_t nq = ggml_nelements(t);
+            if (nq > 1) {
+                std::vector<int32_t> q((size_t) nq);
+                for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                    ggml_backend_tensor_get(t, q.data() + r*t->ne[0], r*t->nb[1],
+                                            t->ne[0]*sizeof(int32_t));
+                }
+                bool all_same = true;
+                bool any_neg  = false;
+                for (int64_t i = 0; i < nq; ++i) {
+                    if (q[i] != q[0])  { all_same = false; }
+                    if (q[i] <  0)     { any_neg  = true;  }
+                }
+                if ((all_same || any_neg) && n_bad < 4) {
+                    n_bad++;
+                    want_log = true;
+                    LLAMA_LOG_INFO("%s: *** ANOMALY at call %ld: %s all_same=%d any_neg=%d\n",
+                                   __func__, n_calls, t->name, (int) all_same, (int) any_neg);
+                }
+            }
+        }
+
+        if (want_log) {
+            n_seen++;
+
+            const int64_t n = ggml_nelements(t);
+            std::vector<int32_t> ids((size_t) n);
+            for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                ggml_backend_tensor_get(t, ids.data() + r*t->ne[0], r*t->nb[1],
+                                        t->ne[0]*sizeof(int32_t));
+            }
+
+            int32_t lo = ids.empty() ? 0 : ids[0];
+            int32_t hi = ids.empty() ? 0 : ids[0];
+            size_t  neg = 0;
+            for (int32_t v : ids) {
+                lo = std::min(lo, v);
+                hi = std::max(hi, v);
+                if (v < 0) {
+                    neg++;
+                }
+            }
+
+            // Dump the op's inputs too. src[0] is the slot table, src[1] the expert ids being
+            // looked up. If src[0] is right and the output is zeros, the kernel is at fault; if
+            // src[0] is zeros at execution time, the graph is reading a stale or wrong tensor.
+            if (t->src[0]) {
+                ggml_tensor * s0 = t->src[0];
+                const int64_t n0 = std::min<int64_t>(ggml_nelements(s0), 16);
+                std::vector<int32_t> tbl((size_t) n0);
+                if (s0->type == GGML_TYPE_I32) {
+                    ggml_backend_tensor_get(s0, tbl.data(), 0, n0*sizeof(int32_t));
+                    LLAMA_LOG_INFO("%s:   src0 (slot table) %s type=%s ne=[%lld,%lld,%lld] "
+                                   "data=%p view_src=%p vs_data=%p "
+                                   "first16: %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
+                                   __func__, s0->name, ggml_type_name(s0->type),
+                                   (long long) s0->ne[0], (long long) s0->ne[1], (long long) s0->ne[2],
+                                   (void *) s0->data, (void *) s0->view_src,
+                                   (void *) (s0->view_src ? s0->view_src->data : nullptr),
+                                   tbl[0],  tbl[1],  tbl[2],  tbl[3],  tbl[4],  tbl[5],  tbl[6],  tbl[7],
+                                   tbl[8],  tbl[9],  tbl[10], tbl[11], tbl[12], tbl[13], tbl[14], tbl[15]);
+
+                    // read the underlying tensor too: if it holds the table while the view reads
+                    // zeros, the view is pointing at different memory
+                    if (s0->view_src && s0->view_src->type == GGML_TYPE_I32) {
+                        std::vector<int32_t> vs((size_t) n0);
+                        ggml_backend_tensor_get(s0->view_src, vs.data(), 0, n0*sizeof(int32_t));
+                        LLAMA_LOG_INFO("%s:   src0->view_src first16: "
+                                       "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
+                                       __func__,
+                                       vs[0], vs[1], vs[2],  vs[3],  vs[4],  vs[5],  vs[6],  vs[7],
+                                       vs[8], vs[9], vs[10], vs[11], vs[12], vs[13], vs[14], vs[15]);
+                    }
+                }
+            }
+            if (t->src[1]) {
+                ggml_tensor * s1 = t->src[1];
+                const int64_t n1 = std::min<int64_t>(ggml_nelements(s1), 8);
+                std::vector<int32_t> idx((size_t) n1);
+                if (s1->type == GGML_TYPE_I32) {
+                    ggml_backend_tensor_get(s1, idx.data(), 0, n1*sizeof(int32_t));
+                    LLAMA_LOG_INFO("%s:   src1 (expert ids) %s ne=[%lld,%lld] first8: "
+                                   "%d %d %d %d %d %d %d %d\n",
+                                   __func__, s1->name,
+                                   (long long) s1->ne[0], (long long) s1->ne[1],
+                                   idx[0], idx[1], idx[2], idx[3], idx[4], idx[5], idx[6], idx[7]);
+                }
+            }
+
+            // A slot id stays inside the cache (0..n_slot). An id in the hundreds is a raw
+            // expert id that never got remapped, and indexes off the end of the cache.
+            LLAMA_LOG_INFO("%s: %s -> %lld ids, range [%d..%d], %zu negative, "
+                           "first 8: %d %d %d %d %d %d %d %d\n",
+                           __func__, t->name, (long long) n, lo, hi, neg,
+                           n > 0 ? ids[0] : -1, n > 1 ? ids[1] : -1, n > 2 ? ids[2] : -1,
+                           n > 3 ? ids[3] : -1, n > 4 ? ids[4] : -1, n > 5 ? ids[5] : -1,
+                           n > 6 ? ids[6] : -1, n > 7 ? ids[7] : -1);
+        }
     }
 
     if (is_topk && bells && bells->ready()) {

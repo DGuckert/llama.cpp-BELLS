@@ -938,3 +938,73 @@ sharpened: what matters is how expensive the CPU baseline is.
 
 **Try `-ot` first on any new model.** Reach for BELLS only where offload cannot fit enough layers
 *and* the baseline is genuinely slow.
+
+## Correction: the sm_86 corruption is intermittent, and most eliminations above are unsafe
+
+The section above states two triggers, warm-up and eviction, and lists a series of causes ruled
+out. **Those eliminations each rest on a single run per hypothesis, and the fault is
+non-deterministic**, so they do not carry the weight they appear to.
+
+The evidence for intermittency: Qwen3.6-35B Q4_K_M at 128 slots with `--no-warmup` produced correct
+text in one run and garbage in another under identical settings - same prompt, same slot count,
+same context, same binary. "128 slots is clean" was luck. At 32 slots it is far more consistent
+(12/12 corrupt across three server starts), so eviction pressure sets the *probability* rather
+than being the cause.
+
+Four fixes were implemented and tested against repeated trials. All four failed:
+
+| attempt | result |
+|---|---|
+| `BELLS_SYNC_COPY=1`, fully blocking copies | still corrupt |
+| `BELLS_SYNC_EVICT=1`, wait for queued kernels before reusing a slot | still corrupt |
+| slot-table upload queued on the compute stream instead of `cudaStreamPerThread` | 12/12 corrupt |
+| `-ub 1`, single-token ubatches | 8/8 corrupt |
+
+The third is worth recording in detail because the reasoning looked sound and was not: expert
+copies go through `ggml_backend_tensor_set_async` on the compute backend and are correctly
+ordered, while `upload_slots` uses `ggml_backend_tensor_set`, which issues on
+`cudaStreamPerThread` and lands ahead of the compute queue. A matmul enqueued earlier but not yet
+executed could therefore read a newer slot table than the one current when it was queued. Staging
+the table and queueing the write on the compute stream did not change the outcome, so it was
+reverted rather than shipped.
+
+Also eliminated since: Docker entirely (a native run on the host corrupts identically), container
+privileges (`--privileged --ipc=host`), CUDA 12.4 versus 12.8, CUDA VMM (both cards report
+`VMM: yes`), and the OS - BELLS runs correctly under Linux on the sm_75 card, so Linux is not the
+variable.
+
+`compute-sanitizer --tool memcheck` reports **no out-of-bounds accesses** during a full generation,
+so the matmul is reading inside the cache tensor.
+
+What remains established: every input to `mul_mat_id` verifies correct at execution time - copied
+bytes byte-identical to the host source, slot table reading back exactly as written, remapped ids
+valid and never negative, and the residency invariant holding on every token - and the output is
+still wrong. The untried tool is `--tool racecheck`, which detects the race class `memcheck`
+cannot. Any future work here should use repeated trials; a single clean run means nothing.
+
+## Model choice decides whether BELLS is worth using at all
+
+Three-way comparison on a 6 GB card (RTX 2060), Qwen3-30B-A3B-Thinking-2507 Q4_K_M, 8k context,
+q8_0 KV, every output checked for degeneracy rather than timed alone:
+
+| config | tok/s |
+|---|---|
+| `--cpu-moe` baseline | 11.37 |
+| `--bells` (auto-sized to 17 slots) | 11.07 |
+| partial offload `-ot`, 5 layers | 12.21 |
+| partial offload `-ot`, 10 layers | 12.90 |
+| **`--bells-slots 26`** | **13.75** |
+
+This is the one configuration measured where BELLS beats partial offload, and it needs an explicit
+slot count: auto-sizing chose 17 and came out slower than not using BELLS at all. That is what the
+new sub-3x warning is for.
+
+The same three-way on Qwen3.6-35B-A3B Q4_K_M goes the other way on both cards - 14.00 for BELLS
+against a 16.60 baseline and 18.25 for offload on the 2060, and no gain at all on a 3060. The
+difference is bytes moved per token: 1.05 GB for Qwen3-30B where BELLS wins, 0.57 GB for
+Qwen3.6-35B where it loses. Below roughly 1 GB/token the CPU path is already fast enough that the
+per-layer readback, which is charged whatever the hit rate, eats the saving.
+
+**Practical order for a new model: measure `--cpu-moe` first, then `-ot`, then BELLS with an
+explicit slot count.** Reach for BELLS only where offload cannot fit enough layers and the
+baseline is genuinely slow.

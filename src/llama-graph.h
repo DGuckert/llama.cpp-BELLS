@@ -2,6 +2,7 @@
 
 #include "llama-arch.h"
 #include "llama-batch.h"
+#include "llama-bells.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
 
@@ -789,6 +790,7 @@ struct llm_graph_params {
     const llama_cross            * cross;
 
     const llama_prec_policy * prec_policy = nullptr;
+    bells_runtime * bells = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1031,6 +1033,7 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     const llama_prec_policy * prec_policy;
+    bells_runtime * bells;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1061,11 +1064,14 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
+    // ids_s indexes w_s. BELLS passes slot ids in ids but keeps expert ids here, because the
+    // scale array is never sliced into the cache and stays indexed by expert.
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+              ggml_tensor * ids_s = nullptr) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,

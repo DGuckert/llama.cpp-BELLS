@@ -260,6 +260,10 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // residency correction: fires on ffn_moe_topk-<il>, guarantees the selected experts are
+    // in the cache and refreshes the slot table before the gather downstream reads it
+    bool bells_eval(ggml_tensor * t, bool ask);
+
 private:
     llm_graph_result * get_gf_res_prev();
 
@@ -294,6 +298,12 @@ private:
     llama_adapter_loras_ptr loras;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
+
+    std::unique_ptr<bells_runtime> bells;
+
+    // Second backend, and so a second CUDA stream, used only for BELLS expert copies. Held here
+    // so it outlives the runtime that issues copies on it. Null unless BELLS_COPY_STREAM is set.
+    ggml_backend_ptr bells_copy_backend;
 
     llama_memory_ptr memory;
 

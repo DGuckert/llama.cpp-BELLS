@@ -395,6 +395,12 @@ extern "C" {
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
 
+        // BELLS: keep only a subset of MoE experts in VRAM and stream the rest in on demand.
+        // Requires the expert tensors to stay host resident, i.e. use together with --cpu-moe.
+        bool         bells_enabled; // enable the BELLS expert cache
+        uint32_t     bells_n_slot;  // resident experts per layer, 0 = size from free VRAM
+        bool         bells_passive; // research: allocate and split, but do not use the cache
+
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
@@ -594,6 +600,10 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
+
+    // MoE expert counts, 0 for dense models
+    LLAMA_API int32_t llama_model_n_expert     (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_expert_used(const struct llama_model * model);
 
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);

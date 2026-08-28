@@ -576,6 +576,10 @@ struct common_params {
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading
+    bool        bells_enabled = false; // BELLS on at all
+    uint32_t    bells_n_slot = 0;   // MoE experts resident per layer, 0 = size from free VRAM
+    bool        bells_passive = false; // research: allocate and split, but do not use the cache
+
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
@@ -1137,6 +1141,21 @@ inline std::string llm_ffn_block_regex(int idx, const char * ffn_regex) {
 
 inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
     return { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() };
+}
+
+// The pinned equivalent. Experts kept on the host are the source of every host-to-device copy,
+// and out of pageable memory cudaMemcpyAsync blocks the caller for 99.7% of the transfer - worth
+// 1.15x to 1.59x depending on how much the configuration moves. See PINNED.md.
+//
+// Returns a null buft if no device offers pinned host memory, in which case the caller should
+// fall back to llm_ffn_exps_cpu_override().
+inline llama_model_tensor_buft_override llm_ffn_exps_pinned_override() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        if (auto * buft = ggml_backend_dev_host_buffer_type(ggml_backend_dev_get(i))) {
+            return { LLM_FFN_EXPS_REGEX, buft };
+        }
+    }
+    return { LLM_FFN_EXPS_REGEX, nullptr };
 }
 
 inline void llm_add_n_cpu_ffn_overrides(int n, const char * ffn_regex, std::vector<llama_model_tensor_buft_override> & overrides) {

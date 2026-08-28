@@ -2755,6 +2755,9 @@ int32_t llama_model_n_swa(const llama_model * model) {
     return model->hparams.n_swa;
 }
 
+int32_t llama_model_n_expert_used(const llama_model * model) {
+    return model->hparams.n_expert_used;
+}
 
 uint32_t llama_model_n_cls_out(const struct llama_model * model) {
     return model->hparams.n_cls_out;

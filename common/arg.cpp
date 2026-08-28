@@ -259,6 +259,16 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // Also expose the pinned host buffer type, e.g. CUDA_Host. Tensors deliberately kept
+        // on the CPU are the source of every host-to-device copy, and from pageable memory
+        // cudaMemcpyAsync is not asynchronous - the driver stages through its own pinned
+        // buffer and blocks the caller. Naming the host buffer type here allows
+        //   -ot "\.ffn_(gate|up|down)_exps\.=CUDA_Host" --no-mmap
+        // which puts the offloaded experts somewhere the copy engine can DMA from directly.
+        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (host_buft) {
+            buft_list[ggml_backend_buft_name(host_buft)] = host_buft;
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {
@@ -2785,6 +2795,64 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
+    add_opt(common_arg(
+        {"-cmoep", "--cpu-moe-pinned"},
+        "like --cpu-moe, but keep the expert weights in pinned host memory and disable mmap. "
+        "Copies out of pageable memory block the caller for the whole transfer; pinning them "
+        "measured 1.15x on Qwen3-Next-80B and 1.59x on Qwen3-30B. Falls back to plain host "
+        "memory, per allocation, for whatever will not pin",
+        [](common_params & params) {
+            const auto ov = llm_ffn_exps_pinned_override();
+            if (ov.buft == nullptr) {
+                // No backend offers pinned host memory; behave exactly like --cpu-moe rather
+                // than failing, so the flag is safe to leave in a script across machines.
+                LOG_WRN("%s: no backend provides pinned host memory, falling back to --cpu-moe\n",
+                        __func__);
+                params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+                return;
+            }
+            params.tensor_buft_overrides.push_back(ov);
+
+            // Required, not merely advisable: llama-model-loader replaces a host buffer type
+            // with plain CPU whenever mmap is on, so an mmap'd model can never hold pinned
+            // weights and the flag would silently do nothing.
+            params.load_mode = LLAMA_LOAD_MODE_NONE;
+        }
+    ).set_env("LLAMA_ARG_CPU_MOE_PINNED"));
+    add_opt(common_arg(
+        {"--bells"},
+        "enable the BELLS expert cache, sizing it automatically from free VRAM. Equivalent to "
+        "--bells-slots -1. Use with --cpu-moe, which keeps the expert weights on the host",
+        [](common_params & params) {
+            params.bells_enabled = true;
+            params.bells_n_slot  = 0;
+        }
+    ).set_env("LLAMA_ARG_BELLS"));
+    add_opt(common_arg(
+        {"--bells-slots"}, "N",
+        "BELLS: keep N MoE experts per layer resident in VRAM and stream the rest in on demand. "
+        "Use -1 to size the cache automatically from free VRAM. Use together with --cpu-moe, "
+        "which keeps the expert weights on the host where BELLS reads them from "
+        "(default: 0 = disabled)",
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("invalid value");
+            }
+            // -1 means auto; the runtime treats 0 as "pick from free VRAM", and the enable
+            // flag is carried separately so that 0 can still mean off at the CLI
+            params.bells_enabled = value != 0;
+            params.bells_n_slot  = value > 0 ? (uint32_t) value : 0;
+        }
+    ).set_env("LLAMA_ARG_BELLS_SLOTS"));
+    add_opt(common_arg(
+        {"--bells-passive"},
+        "BELLS: research only. Allocate the cache and keep taking the per-layer graph split, but "
+        "leave the matmuls on the full expert stack and copy nothing. Measures what the mechanism "
+        "costs before the cache does any work",
+        [](common_params & params) {
+            params.bells_passive = true;
+        }
+    ).set_env("LLAMA_ARG_BELLS_PASSIVE"));
     add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",

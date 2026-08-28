@@ -13,8 +13,10 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -474,6 +476,129 @@ llama_context::llama_context(
         sampling.token_ids_full_vocab.resize(n_vocab);
         for (int i = 0; i < n_vocab; ++i) {
             sampling.token_ids_full_vocab[i] = i;
+        }
+    }
+
+    if (params.bells_enabled) {
+        std::vector<bells_tensors::layer_src> srcs;
+
+        // BELLS_SKIP_LAYERS=N leaves the first N MoE layers uncached, so they run as plain
+        // --cpu-moe. Research knob for one question: caching a layer only pays if moving its
+        // missing experts beats the CPU work it replaces, and measured per-layer hit rates vary
+        // enormously - 23% on layer 0 against 82% on layer 30 for Qwen3-Next, with the early
+        // layers consistently worst. A third of layers sit below break-even at a 2x ratio while
+        // consuming the most PCIe traffic, so skipping them should help rather than hurt.
+        //
+        // Env var rather than a context param because that would mean touching the public
+        // header and rebuilding the world for an experiment.
+        uint32_t skip = 0;
+        if (const char * s = getenv("BELLS_SKIP_LAYERS")) {
+            skip = (uint32_t) atoi(s);
+        }
+
+        uint32_t n_moe_seen = 0;
+
+        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            const auto & layer = model.layers[il];
+
+            if (!layer.ffn_gate_exps && !layer.ffn_up_exps && !layer.ffn_gate_up_exps) {
+                continue; // dense layer
+            }
+
+            if (n_moe_seen++ < skip) {
+                continue; // deliberately uncached
+            }
+
+            bells_tensors::layer_src s;
+            s.il      = (int32_t) il;
+            s.gate    = layer.ffn_gate_exps;
+            s.up      = layer.ffn_up_exps;
+            s.down    = layer.ffn_down_exps;
+            s.gate_up = layer.ffn_gate_up_exps;
+
+            // Pin the slice to the device this layer's graph runs on. With one GPU every layer
+            // resolves to the same backend and this is a no-op; with a layer split it is what
+            // stops a matmul reading slots that live on another card.
+            if (ggml_backend_dev_t dev = model.dev_layer(il)) {
+                for (auto & b : backends) {
+                    if (ggml_backend_get_device(b.get()) == dev) {
+                        s.backend = b.get();
+                        s.buft    = ggml_backend_get_default_buffer_type(b.get());
+                        break;
+                    }
+                }
+            }
+
+            srcs.push_back(s);
+        }
+
+        if (skip > 0) {
+            LLAMA_LOG_INFO("%s: BELLS skipping the first %u MoE layers, caching %zu\n",
+                           __func__, skip, srcs.size());
+        }
+
+        if (srcs.empty()) {
+            LLAMA_LOG_WARN("%s: BELLS requested but this model has no MoE layers\n", __func__);
+        } else {
+            // Multi-GPU works by giving each device its own cache, sized from the tightest, and
+            // pinning every layer's slice to the device that layer's graph runs on (set above).
+            // Any layer whose device could not be resolved falls back to the default buft below,
+            // which is only correct when there is one GPU - so refuse rather than guess.
+            size_t n_gpu = 0;
+            for (const auto & b : backends) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    n_gpu++;
+                }
+            }
+
+            if (n_gpu > 1) {
+                for (const auto & s : srcs) {
+                    if (!s.buft) {
+                        LLAMA_LOG_WARN("%s: BELLS could not resolve a device for MoE layer %d "
+                                       "with %zu GPUs in use - disabling rather than caching it "
+                                       "on the wrong card.\n", __func__, s.il, n_gpu);
+                        return;
+                    }
+                }
+                LLAMA_LOG_INFO("%s: BELLS spread over %zu GPUs\n", __func__, n_gpu);
+            }
+
+            bells_params bp;
+            bp.enabled      = true;
+            bp.n_slot       = params.bells_n_slot;
+            bp.passive      = params.bells_passive;
+
+            // the cache lives wherever the graph runs, i.e. next to the rest of the offload
+            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends.front().get());
+
+            // BELLS_COPY_STREAM=1 puts expert copies on a second backend, and therefore a second
+            // CUDA stream. ggml issues host-to-device copies on the compute stream
+            // (ggml-cuda.cu:2991), and streams are strictly ordered, so today a transfer can
+            // never overlap a kernel - which is why pinned staging, synchronous prefetch and
+            // threaded prefetch all failed. Ordering becomes explicit via an event instead.
+            ggml_backend_t copy_backend = nullptr;
+            if (const char * cs = getenv("BELLS_COPY_STREAM")) {
+                if (cs[0] && cs[0] != '0') {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(backends.front().get());
+                    if (dev) {
+                        copy_backend = ggml_backend_dev_init(dev, nullptr);
+                    }
+                    if (copy_backend) {
+                        bells_copy_backend.reset(copy_backend);
+                        LLAMA_LOG_INFO("%s: BELLS copies on a second stream\n", __func__);
+                    } else {
+                        LLAMA_LOG_WARN("%s: could not create a second backend for BELLS copies\n",
+                                       __func__);
+                    }
+                }
+            }
+
+            bells = std::make_unique<bells_runtime>();
+            if (!bells->init(bp, buft, srcs, model.hparams.n_expert,
+                             model.hparams.n_expert_used, backends.front().get(), copy_backend)) {
+                LLAMA_LOG_WARN("%s: BELLS disabled\n", __func__);
+                bells.reset();
+            }
         }
     }
 }
@@ -1330,6 +1455,219 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+bool llama_context::bells_eval(ggml_tensor * t, bool ask) {
+    static const char * prefix = "ffn_moe_topk-";
+    static const size_t plen   = strlen(prefix);
+
+    // the suffix must be digits and nothing else: ggml_cont names its output
+    // "ffn_moe_topk-<il> (cont)", which a plain prefix test would also accept
+    bool is_topk = strncmp(t->name, prefix, plen) == 0 && t->type == GGML_TYPE_I32;
+    if (is_topk) {
+        const char * s = t->name + plen;
+        if (*s == '\0') {
+            is_topk = false;
+        }
+        for (; *s && is_topk; ++s) {
+            is_topk = *s >= '0' && *s <= '9';
+        }
+    }
+
+    // BELLS_VERIFY_IDS=1 inspects the remapped ids actually handed to mul_mat_id. Copies, slot
+    // table, tensor geometry and kernel choice have all been verified correct on sm_86 while the
+    // output stayed garbage, so this is the last unobserved link: if these are raw expert ids
+    // rather than slot ids, every read runs off the end of a cache that only has n_slot+1 entries.
+    static const bool verify_ids = [] {
+        const char * s = getenv("BELLS_VERIFY_IDS");
+        return s && s[0] && s[0] != '0';
+    }();
+
+    // Match the op, not the name: cb() names the reshaped view, and a view is not an evaluated
+    // node, so a name test never fires. The id remap is the only I32 get_rows in the MoE path.
+    const bool is_bells_ids = verify_ids &&
+                              t->op   == GGML_OP_GET_ROWS &&
+                              t->type == GGML_TYPE_I32;
+
+    // chain to any user callback (imatrix, eval-callback). It may see nodes it did not ask
+    // for when BELLS wants them too, which is harmless for observation-only consumers.
+    const bool user = cparams.cb_eval ? cparams.cb_eval(t, ask, cparams.cb_eval_user_data) : false;
+
+    if (ask) {
+        return is_topk || is_bells_ids || user;
+    }
+
+    if (is_bells_ids && bells && bells->ready()) {
+        // Report the first few, then only anomalies. The corruption appears partway through a
+        // generation, so a fixed head of the log misses it entirely.
+        static int  n_seen    = 0;
+        static int  n_bad     = 0;
+        static long n_calls   = 0;
+        n_calls++;
+
+        bool want_log = n_seen < 3;
+        {
+            const int64_t nq = ggml_nelements(t);
+            if (nq > 1) {
+                std::vector<int32_t> q((size_t) nq);
+                for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                    ggml_backend_tensor_get(t, q.data() + r*t->ne[0], r*t->nb[1],
+                                            t->ne[0]*sizeof(int32_t));
+                }
+                bool all_same = true;
+                bool any_neg  = false;
+                for (int64_t i = 0; i < nq; ++i) {
+                    if (q[i] != q[0])  { all_same = false; }
+                    if (q[i] <  0)     { any_neg  = true;  }
+                }
+                if ((all_same || any_neg) && n_bad < 4) {
+                    n_bad++;
+                    want_log = true;
+                    LLAMA_LOG_INFO("%s: *** ANOMALY at call %ld: %s all_same=%d any_neg=%d\n",
+                                   __func__, n_calls, t->name, (int) all_same, (int) any_neg);
+                }
+            }
+        }
+
+        if (want_log) {
+            n_seen++;
+
+            const int64_t n = ggml_nelements(t);
+            std::vector<int32_t> ids((size_t) n);
+            for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                ggml_backend_tensor_get(t, ids.data() + r*t->ne[0], r*t->nb[1],
+                                        t->ne[0]*sizeof(int32_t));
+            }
+
+            int32_t lo = ids.empty() ? 0 : ids[0];
+            int32_t hi = ids.empty() ? 0 : ids[0];
+            size_t  neg = 0;
+            for (int32_t v : ids) {
+                lo = std::min(lo, v);
+                hi = std::max(hi, v);
+                if (v < 0) {
+                    neg++;
+                }
+            }
+
+            // Dump the op's inputs too. src[0] is the slot table, src[1] the expert ids being
+            // looked up. If src[0] is right and the output is zeros, the kernel is at fault; if
+            // src[0] is zeros at execution time, the graph is reading a stale or wrong tensor.
+            if (t->src[0]) {
+                ggml_tensor * s0 = t->src[0];
+                const int64_t n0 = std::min<int64_t>(ggml_nelements(s0), 16);
+                std::vector<int32_t> tbl((size_t) n0);
+                if (s0->type == GGML_TYPE_I32) {
+                    ggml_backend_tensor_get(s0, tbl.data(), 0, n0*sizeof(int32_t));
+                    LLAMA_LOG_INFO("%s:   src0 (slot table) %s type=%s ne=[%lld,%lld,%lld] "
+                                   "data=%p view_src=%p vs_data=%p "
+                                   "first16: %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
+                                   __func__, s0->name, ggml_type_name(s0->type),
+                                   (long long) s0->ne[0], (long long) s0->ne[1], (long long) s0->ne[2],
+                                   (void *) s0->data, (void *) s0->view_src,
+                                   (void *) (s0->view_src ? s0->view_src->data : nullptr),
+                                   tbl[0],  tbl[1],  tbl[2],  tbl[3],  tbl[4],  tbl[5],  tbl[6],  tbl[7],
+                                   tbl[8],  tbl[9],  tbl[10], tbl[11], tbl[12], tbl[13], tbl[14], tbl[15]);
+
+                    // read the underlying tensor too: if it holds the table while the view reads
+                    // zeros, the view is pointing at different memory
+                    if (s0->view_src && s0->view_src->type == GGML_TYPE_I32) {
+                        std::vector<int32_t> vs((size_t) n0);
+                        ggml_backend_tensor_get(s0->view_src, vs.data(), 0, n0*sizeof(int32_t));
+                        LLAMA_LOG_INFO("%s:   src0->view_src first16: "
+                                       "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
+                                       __func__,
+                                       vs[0], vs[1], vs[2],  vs[3],  vs[4],  vs[5],  vs[6],  vs[7],
+                                       vs[8], vs[9], vs[10], vs[11], vs[12], vs[13], vs[14], vs[15]);
+                    }
+                }
+            }
+            if (t->src[1]) {
+                ggml_tensor * s1 = t->src[1];
+                const int64_t n1 = std::min<int64_t>(ggml_nelements(s1), 8);
+                std::vector<int32_t> idx((size_t) n1);
+                if (s1->type == GGML_TYPE_I32) {
+                    ggml_backend_tensor_get(s1, idx.data(), 0, n1*sizeof(int32_t));
+                    LLAMA_LOG_INFO("%s:   src1 (expert ids) %s ne=[%lld,%lld] first8: "
+                                   "%d %d %d %d %d %d %d %d\n",
+                                   __func__, s1->name,
+                                   (long long) s1->ne[0], (long long) s1->ne[1],
+                                   idx[0], idx[1], idx[2], idx[3], idx[4], idx[5], idx[6], idx[7]);
+                }
+            }
+
+            // A slot id stays inside the cache (0..n_slot). An id in the hundreds is a raw
+            // expert id that never got remapped, and indexes off the end of the cache.
+            LLAMA_LOG_INFO("%s: %s -> %lld ids, range [%d..%d], %zu negative, "
+                           "first 8: %d %d %d %d %d %d %d %d\n",
+                           __func__, t->name, (long long) n, lo, hi, neg,
+                           n > 0 ? ids[0] : -1, n > 1 ? ids[1] : -1, n > 2 ? ids[2] : -1,
+                           n > 3 ? ids[3] : -1, n > 4 ? ids[4] : -1, n > 5 ? ids[5] : -1,
+                           n > 6 ? ids[6] : -1, n > 7 ? ids[7] : -1);
+        }
+    }
+
+    if (is_topk && bells && bells->ready()) {
+        const int il = atoi(t->name + plen);
+
+        // the topk tensor is a strided view of the argsort, so read it row by row
+        const int64_t k    = t->ne[0];
+        const int64_t rows = ggml_nrows(t);
+
+        std::vector<int32_t> ids((size_t) k*rows);
+
+        // This is the device->host sync that splits the graph at every MoE layer. Timed
+        // separately from the copies because it is paid whether or not anything misses.
+        const auto t_rb0 = std::chrono::steady_clock::now();
+        for (int64_t i = 0; i < rows; ++i) {
+            ggml_backend_tensor_get(t, ids.data() + i*k, i*t->nb[1], k*sizeof(int32_t));
+        }
+        const auto t_rb1 = std::chrono::steady_clock::now();
+
+        bells->add_readback_us(
+            std::chrono::duration_cast<std::chrono::microseconds>(t_rb1 - t_rb0).count());
+
+        if (!bells->on_routing(il, ids.data(), ids.size())) {
+            // Once, with the numbers. Every MoE layer hits this in the same ubatch, so the
+            // unconditional version printed 48 identical lines at llama-server startup and
+            // looked like a crash. It is also not actionable without knowing how far over the
+            // cache the request went, which is what the counts are for.
+            //
+            // Reaching here means active() admitted a ubatch whose routing wants more distinct
+            // experts than the cache has slots - so n_tokens*n_expert_used exceeded n_slot
+            // despite max_tokens being derived to prevent exactly that. Worth the numbers.
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+
+                std::vector<uint8_t> seen;
+                size_t n_distinct = 0;
+                for (int32_t e : ids) {
+                    if (e < 0) {
+                        continue;
+                    }
+                    if ((size_t) e >= seen.size()) {
+                        seen.resize((size_t) e + 1, 0);
+                    }
+                    if (!seen[e]) {
+                        seen[e] = 1;
+                        n_distinct++;
+                    }
+                }
+
+                LLAMA_LOG_ERROR("%s: layer %d wants %zu distinct experts from %lld tokens x %lld "
+                                "active, more than the cache holds - raise --bells-slots. "
+                                "Further occurrences suppressed.\n",
+                                __func__, il, n_distinct, (long long) rows, (long long) k);
+            }
+        }
+    }
+
+    return true;
+}
+
+static bool llama_bells_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
+    return ((llama_context *) user_data)->bells_eval(t, ask);
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1359,7 +1697,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        if (bells && bells->ready()) {
+            ggml_backend_sched_set_eval_callback(sched.get(), llama_bells_eval_cb, this);
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         //const auto t_start_us = ggml_time_us();
 
@@ -2478,6 +2820,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.bells       =*/ bells.get(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3619,6 +3962,9 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
+        /*.bells_enabled               =*/ false,
+        /*.bells_n_slot                =*/ 0,
+        /*.bells_passive               =*/ false,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,

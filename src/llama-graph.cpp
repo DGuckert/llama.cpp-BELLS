@@ -1486,6 +1486,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    bells            (params.bells),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1543,7 +1544,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
-          ggml_tensor * w_s) const {
+          ggml_tensor * w_s,
+          ggml_tensor * ids_s) const {
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
 
     if (w_s) {
@@ -1551,7 +1553,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const int64_t n_tokens = cur->ne[2];
         ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
         s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
-        s = ggml_get_rows(ctx0, s, ids);
+        s = ggml_get_rows(ctx0, s, ids_s ? ids_s : ids);
         res = ggml_mul(ctx0, res, s);
     }
     for (const auto & lora : *loras) {
@@ -2111,12 +2113,41 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
+    // BELLS: run the expert matmuls against the VRAM cache rather than the full expert
+    // stack. Only mul_mat_id is redirected - biases, per-expert scales and the router
+    // probabilities stay indexed by the original expert id.
+    ggml_tensor * bells_ids   = nullptr;
+    ggml_tensor * bells_gate  = nullptr;
+    ggml_tensor * bells_up    = nullptr;
+    ggml_tensor * bells_down  = nullptr;
+    ggml_tensor * bells_gu    = nullptr;
+
+    if (bells && bells->active(n_tokens) && bells->tensors().has(il)) {
+        ggml_tensor * slots = bells->tensors().slots(il);
+
+        ggml_tensor * flat = ggml_reshape_2d(ctx0, ggml_cont(ctx0, selected_experts),
+                                             selected_experts->ne[0]*selected_experts->ne[1], 1);
+        ggml_tensor * tbl  = ggml_reshape_3d(ctx0, slots, 1, slots->ne[0], 1);
+
+        bells_ids = ggml_get_rows(ctx0, tbl, flat);
+        bells_ids = ggml_reshape_2d(ctx0, bells_ids,
+                                    selected_experts->ne[0], selected_experts->ne[1]);
+        cb(bells_ids, "ffn_moe_bells_slots", il);
+
+        bells_gate = bells->tensors().gate(il);
+        bells_up   = bells->tensors().up(il);
+        bells_down = bells->tensors().down(il);
+        bells_gu   = bells->tensors().gate_up(il);
+    }
+
+    ggml_tensor * ids_exps = bells_ids ? bells_ids : selected_experts;
+
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(bells_gu ? bells_gu : gate_up_exps, cur, ids_exps, up_exps_s, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2135,7 +2166,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(bells_up ? bells_up : up_exps, cur, ids_exps, up_exps_s, selected_experts); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2148,7 +2179,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(bells_gate ? bells_gate : gate_exps, cur, ids_exps, gate_exps_s, selected_experts); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2252,7 +2283,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(bells_down ? bells_down : down_exps, cur, ids_exps, down_exps_s, selected_experts); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {

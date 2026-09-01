@@ -316,7 +316,17 @@ bool bells_tensors::init(ggml_backend_buffer_type_t buft, const std::vector<laye
         }
     }
 
-    // zero the spare slot in every layer
+    // Zero every slot, not just the spare one.
+    //
+    // Only slot n_slot was being initialised, so slots 0..n_slot-1 held whatever cudaMalloc
+    // returned until a copy happened to fill them. A read of a slot before its first copy
+    // dequantises uninitialised VRAM as q4_K/q5_K, which yields inf, and the accumulation then
+    // yields NaN. Zeroed weights are the safe value: a zeroed quant block contributes nothing,
+    // so a premature read degrades that expert's contribution instead of poisoning the pass.
+    //
+    // This is a latent defect, not the cause of the ///// corruption that prompted the search -
+    // that was a host hardware fault, and this fix measured 1 clean run in 40 against a 0-in-46
+    // baseline, i.e. no effect. Kept because reading never-written memory is wrong regardless.
     {
         std::vector<char> zeros(bytes_per_expert_, 0);
 
@@ -326,7 +336,9 @@ bool bells_tensors::init(ggml_backend_buffer_type_t buft, const std::vector<laye
                     continue;
                 }
                 const size_t stride = ggml_nbytes(t)/t->ne[2];
-                ggml_backend_tensor_set(t, zeros.data(), (size_t) n_slot*stride, stride);
+                for (int64_t s = 0; s < t->ne[2]; ++s) {
+                    ggml_backend_tensor_set(t, zeros.data(), (size_t) s*stride, stride);
+                }
             }
         }
     }
@@ -564,9 +576,44 @@ void bells_tensors::upload_slots(uint32_t il, const std::vector<int32_t> & table
 
     const size_t n = std::min<size_t>(table.size(), (size_t) t->ne[0]);
 
-    // NOTE: cannot go async here. table is a caller-owned vector that may be rewritten
-    // before an async copy drains, so the write has to complete before returning.
-    ggml_backend_tensor_set(t, table.data(), 0, n*sizeof(int32_t));
+    // Redirect non-resident experts to the spare zero slot instead of uploading -1.
+    //
+    // init() allocates n_slot+1 rows and keeps the last one zeroed for exactly this case, and
+    // zero_slot() names it, but nothing ever used it - a -1 went to the graph verbatim. What the
+    // matmul then does with it depends on the kernel: mul_mat_vec_q casts the id to unsigned and
+    // offsets src0 by it, so -1 reads far out of bounds.
+    //
+    // Latent, like the zeroing above: measured 1 clean run in 40 against a 0-in-46 baseline, so it
+    // is not what caused the ///// corruption (a host DMA fault was). Correct anyway.
+    slot_scratch_.assign(table.begin(), table.begin() + n);
+    for (size_t i = 0; i < n; ++i) {
+        if (slot_scratch_[i] < 0 || (uint32_t) slot_scratch_[i] > n_slot_) {
+            slot_scratch_[i] = (int32_t) n_slot_;
+        }
+    }
+
+    // NOTE: cannot go async here. slot_scratch_ is reused on the next call, so the write has to
+    // complete before returning.
+    ggml_backend_tensor_set(t, slot_scratch_.data(), 0, n*sizeof(int32_t));
+
+    // BELLS_TRACE_EVAL=1 also reports slot-table uploads. A cache that allocates and
+    // substitutes correctly still produces garbage if this never runs: the table stays
+    // zero, every expert remaps to slot 0, and the matmuls index it happily.
+    {
+        static const bool tr = [] {
+            const char * s = getenv("BELLS_TRACE_EVAL");
+            return s && s[0] && s[0] != '0';
+        }();
+        static int n_up = 0;
+        if (tr && n_up < 10) {
+            n_up++;
+            fprintf(stderr, "upload_slots: il=%u n=%zu table[0..5]=%d,%d,%d,%d,%d,%d\n",
+                    il, n,
+                    n > 0 ? table[0] : -1, n > 1 ? table[1] : -1, n > 2 ? table[2] : -1,
+                    n > 3 ? table[3] : -1, n > 4 ? table[4] : -1, n > 5 ? table[5] : -1);
+            fflush(stderr);
+        }
+    }
 
     // BELLS_VERIFY_SLOTS=1 reads the table back. The copies were proven byte-correct on sm_86
     // while the output was still garbage, so the remaining suspect is the mapping the matmul
@@ -715,6 +762,7 @@ bool bells_runtime::init(const bells_params & params,
     free();
 
     params_ = params;
+    n_expert_used_ = n_expert_used;
 
     if (!params.enabled || srcs.empty() || n_expert == 0) {
         return false;
@@ -830,8 +878,26 @@ bool bells_runtime::init(const bells_params & params,
         // Not re-tuned on the newer data because doing that honestly needs a slot sweep per
         // model per card, and every static rule this project has fitted to four models has had
         // to be retracted. A sweep beats this; --bells-slots N takes the result.
-        const size_t headroom = std::max<size_t>(1024ull*1024*1024, dev_free/3);
-        const size_t budget   = dev_free > headroom ? dev_free - headroom : 0;
+        // BELLS_VRAM_MB overrides the headroom rule with an explicit cache budget. The rule
+        // below is calibrated for large cards: a flat 1 GiB floor is a sixth of a 6 GB card, so
+        // it dominates whenever free VRAM drops under 3 GiB, which on a small card is most of
+        // the time. Sweeping bytes is also more portable than sweeping slots, because
+        // slots -> bytes depends on the model's expert size.
+        size_t budget;
+        size_t headroom = 0;
+
+        if (const char * vm = getenv("BELLS_VRAM_MB")) {
+            const long mb = atol(vm);
+            budget = mb > 0 ? (size_t) mb*1024*1024 : 0;
+            if (budget > dev_free) {
+                fprintf(stderr, "%s: BELLS_VRAM_MB=%ld exceeds %.2f GiB free, clamping\n",
+                        __func__, mb, dev_free/1024.0/1024.0/1024.0);
+                budget = dev_free;
+            }
+        } else {
+            headroom = std::max<size_t>(1024ull*1024*1024, dev_free/3);
+            budget   = dev_free > headroom ? dev_free - headroom : 0;
+        }
 
         n_slot = (uint32_t) std::min<size_t>(n_expert, budget/(per_expert*srcs.size()));
 
@@ -839,6 +905,22 @@ bool bells_runtime::init(const bells_params & params,
                         "(conservative, sweep --bells-slots to beat it)\n",
                 __func__, dev_free/1024.0/1024.0/1024.0,
                 headroom/1024.0/1024.0/1024.0, n_slot);
+
+        // What other budgets would buy, so a sweep can be aimed rather than guessed. Capacity
+        // is worth more than prediction on this workload: measured LRU hit rate goes 61.4% at
+        // 32 slots to 78.1% at 64, while Belady (perfect prediction) at 32 is only 78.3%. So
+        // doubling the cache matches a perfect oracle at the smaller size.
+        {
+            const size_t per_slot = per_expert*srcs.size();
+            fprintf(stderr, "%s: budget -> slots:", __func__);
+            for (size_t mb : { 512ull, 1024ull, 2048ull, 3072ull, 4096ull }) {
+                const size_t b = mb*1024*1024;
+                if (b <= dev_free) {
+                    fprintf(stderr, "  %zuMB=%zu", mb, std::min<size_t>(n_expert, b/per_slot));
+                }
+            }
+            fprintf(stderr, "   (BELLS_VRAM_MB=N to pick one)\n");
+        }
 
         // Auto-sizing is not merely suboptimal when it comes out thin - it can be slower than not
         // using BELLS at all, because the per-layer readback is charged on every layer of every

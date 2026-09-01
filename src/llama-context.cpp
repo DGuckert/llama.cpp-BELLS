@@ -13,6 +13,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -1459,6 +1460,28 @@ bool llama_context::bells_eval(ggml_tensor * t, bool ask) {
     static const char * prefix = "ffn_moe_topk-";
     static const size_t plen   = strlen(prefix);
 
+    // BELLS_TRACE_EVAL=1 reports whether this callback runs at all and what it sees.
+    // The cache can allocate correctly, the graph can substitute the cache tensors, and
+    // still produce nothing if residency never fires - which looks like instant EOS
+    // rather than garbage. Names every I32 node so a naming or fusion change is visible.
+    // BELLS_TRACE_EVAL=1 names every I32 node this callback sees. Useful when the cache
+    // allocates and the graph substitutes correctly but output is still wrong - it shows
+    // whether the topk node is reaching the callback and under what name and op.
+    static const bool trace = [] {
+        const char * s = getenv("BELLS_TRACE_EVAL");
+        return s && s[0] && s[0] != '0';
+    }();
+    // fprintf, not LLAMA_LOG_INFO: llama-cli filters info-level logging, so the
+    // trace would be silent in exactly the tool used to debug with.
+    if (trace && t->type == GGML_TYPE_I32) {
+        static int n_i32 = 0;
+        if (n_i32 < 25) {
+            n_i32++;
+            fprintf(stderr, "%s: ask=%d i32 '%s' op=%s\n", __func__, (int) ask, t->name, ggml_op_name(t->op));
+            fflush(stderr);
+        }
+    }
+
     // the suffix must be digits and nothing else: ggml_cont names its output
     // "ffn_moe_topk-<il> (cont)", which a plain prefix test would also accept
     bool is_topk = strncmp(t->name, prefix, plen) == 0 && t->type == GGML_TYPE_I32;
@@ -1471,6 +1494,16 @@ bool llama_context::bells_eval(ggml_tensor * t, bool ask) {
             is_topk = *s >= '0' && *s <= '9';
         }
     }
+
+    // This tensor is not always n_expert_used wide. Where ggml_argsort_top_k does not yield a
+    // separate view node, cb() names the full argsort "ffn_moe_topk-<il>", overwriting the
+    // "ffn_moe_argsort-<il>" set a line earlier, and it arrives n_expert wide. Reading all of it
+    // asks the cache for every expert at once, which no cache holds.
+    //
+    // Do not reject it: rejecting means on_routing never runs, the slot table stays zeroed, and
+    // build_moe_ffn substitutes the cache anyway because it gates on active() instead - so every
+    // expert maps to slot 0. The argsort is sorted descending, so the first n_expert_used entries
+    // of each row are exactly the routed experts, and clamping is correct for both shapes.
 
     // BELLS_VERIFY_IDS=1 inspects the remapped ids actually handed to mul_mat_id. Copies, slot
     // table, tensor geometry and kernel choice have all been verified correct on sm_86 while the
@@ -1605,7 +1638,8 @@ bool llama_context::bells_eval(ggml_tensor * t, bool ask) {
         }
     }
 
-    if (is_topk && bells && bells->ready()) {
+    // warmup builds its graph without the cache, so there is nothing here to make resident
+    if (is_topk && bells && bells->ready() && !cparams.warmup) {
         const int il = atoi(t->name + plen);
 
         // the topk tensor is a strided view of the argsort, so read it row by row
@@ -1624,6 +1658,23 @@ bool llama_context::bells_eval(ggml_tensor * t, bool ask) {
 
         bells->add_readback_us(
             std::chrono::duration_cast<std::chrono::microseconds>(t_rb1 - t_rb0).count());
+
+        // Report what routing actually saw. Valid expert ids are [0, n_expert); anything
+        // outside that means the read came back wrong, which would leave the cache holding
+        // whatever it was initialised with while the matmuls index it happily.
+        if (trace) {
+            static int n_rt = 0;
+            if (n_rt < 12) {
+                n_rt++;
+                int32_t lo = ids.empty() ? -1 : ids[0], hi = lo;
+                for (int32_t v : ids) { if (v < lo) lo = v; if (v > hi) hi = v; }
+                fprintf(stderr, "%s: routing il=%d rows=%lld k=%lld nb1=%zu ids[0..3]=%d,%d,%d,%d range=[%d,%d]\n",
+                        __func__, il, (long long) rows, (long long) k, (size_t) t->nb[1],
+                        ids.size() > 0 ? ids[0] : -1, ids.size() > 1 ? ids[1] : -1,
+                        ids.size() > 2 ? ids[2] : -1, ids.size() > 3 ? ids[3] : -1, lo, hi);
+                fflush(stderr);
+            }
+        }
 
         if (!bells->on_routing(il, ids.data(), ids.size())) {
             // Once, with the numbers. Every MoE layer hits this in the same ubatch, so the
@@ -1669,6 +1720,12 @@ static bool llama_bells_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (bells && bells->ready()) {
+        bells->begin_ubatch(ubatch.token && ubatch.n_tokens > 0 ? ubatch.token[0] : -1,
+                            ubatch.pos   && ubatch.n_tokens > 0 ? (int32_t) ubatch.pos[0] : -1,
+                            ubatch.n_tokens);
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -2820,7 +2877,13 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
-        /*.bells       =*/ bells.get(),
+        // Warmup routes to every expert on purpose - llm_graph_context sets
+        // n_expert_used = n_expert when cparams.warmup. A cache smaller than n_expert cannot
+        // serve that, so ensure() fails and leaves the slot table unset, and every later token
+        // reads the wrong slot. Hand the builder no cache instead, so it uses the full expert
+        // stack for this pass. Null here rather than a check inside build_moe_ffn so the graph
+        // gate and the runtime gate cannot disagree.
+        /*.bells       =*/ cparams.warmup ? nullptr : bells.get(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

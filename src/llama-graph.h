@@ -878,6 +878,10 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            // warmup builds with n_expert_used = n_expert so every expert gets touched, and
+            // that is baked into the MoE tensor shapes. Reusing such a graph for a normal
+            // decode routes to every expert instead of the top-k.
+            cparams.warmup                  == other.cparams.warmup                  &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&

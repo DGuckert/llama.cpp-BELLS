@@ -216,6 +216,11 @@ private:
     size_t   vram_bytes_       = 0;
     size_t   bytes_per_expert_ = 0;
     uint32_t n_slot_           = 0;
+
+    // Sanitised copy of the slot table, uploaded in place of the raw one so a non-resident
+    // expert is routed to the spare zero slot rather than handed to the graph as -1. Reused
+    // across uploads to keep this off the per-layer, per-token allocation path.
+    std::vector<int32_t> slot_scratch_;
 };
 
 // There was a bells_predictor here: a token id -> per-layer expert ranking, counted over a

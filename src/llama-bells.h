@@ -216,6 +216,11 @@ private:
     size_t   vram_bytes_       = 0;
     size_t   bytes_per_expert_ = 0;
     uint32_t n_slot_           = 0;
+
+    // Sanitised copy of the slot table, uploaded in place of the raw one so a non-resident
+    // expert is routed to the spare zero slot rather than handed to the graph as -1. Reused
+    // across uploads to keep this off the per-layer, per-token allocation path.
+    std::vector<int32_t> slot_scratch_;
 };
 
 // There was a bells_predictor here: a token id -> per-layer expert ranking, counted over a
@@ -342,6 +347,11 @@ public:
     // called once layer il's router has produced its selection; guarantees residency
     bool on_routing(uint32_t il, const int32_t * experts, size_t n);
 
+    // The routing tensor must be this wide. cb() names a view, and a view is not an evaluated
+    // node, so the name test can land on the 256-wide argsort behind it instead of the k-wide
+    // view. That asks the cache for every expert at once, which no cache holds.
+    uint32_t n_expert_used() const { return n_expert_used_; }
+
     uint64_t n_hit()       const { return cache_.n_hit();  }
     uint64_t n_miss()      const { return cache_.n_miss(); }
     uint64_t n_copied()    const { return n_copied_;       }
@@ -366,6 +376,8 @@ private:
     bells_cache   cache_;
     bells_tensors tensors_;
     bells_conf    conf_;
+
+    uint32_t n_expert_used_ = 0;
 
     float    conf_thresh_ = 0.9f;
     uint64_t n_prefetched_ = 0;

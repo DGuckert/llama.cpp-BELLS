@@ -12,22 +12,28 @@ compute buffers. **Expert**: per-expert granularity, as opposed to the layer gra
 `-ngl`. **LRU**: plain least-recently-used, which beat the predictive scheme this project was
 originally built around.
 
-> [!WARNING]
-> **Known broken on Ampere: verify your output before trusting any speedup.**
+> [!NOTE]
+> **The "Ampere corruption" was a faulty host, not Ampere and not BELLS. Resolved 2026-09-01.**
 >
-> On an RTX 3060 (sm_86), BELLS with the expert source in pinned host memory generates
-> garbage - one repeated token, indefinitely - while throughput and hit rate look perfect
-> (99.5% hit, 63 tok/s). The same model, quant, commit and flags produce correct text on an
-> RTX 2060 (sm_75). Reproduce and diagnosis in [RESULTS.md](RESULTS.md#sm_86-corruption).
+> This README previously warned that BELLS produced garbage on sm_86 with pinned expert weights.
+> That was a misattribution. The machine holding the RTX 3060 cannot reliably DMA out of
+> page-locked host memory: once a process holds more than ~512 MiB of it, some regions come back
+> to the GPU as all-`0xFF` (a PCIe read abort), reproducibly and at sticky addresses, while the
+> CPU reads the same bytes back perfectly.
 >
-> Ruled out: copy ordering (a forced synchronous copy still corrupts), CUDA graph capture,
-> the second copy stream, pinned-buffer chunking, graph placement, and CPU weight repacking.
-> The one discriminator is the expert buffer type - mmap'd experts are correct, `CUDA_Host`
-> pinned experts are not. Since `--cpu-moe-pinned` is also what makes BELLS fast, the broken
-> configuration is the fast one. Root cause is still open.
+> It reproduces in ~60 lines of CUDA with no llama.cpp involved, and the **same 3060 moved into a
+> different machine is clean** - 0 bad chunks from 512 MiB to 12 GiB - where BELLS with
+> `--cpu-moe-pinned` then measured 32/32 clean generations. The old sm_75-vs-sm_86 comparison
+> was confounded: those two GPUs were in two different machines, so the architecture was never
+> the variable being tested.
 >
-> Every number below was measured on hardware where output was checked. If you are on Ampere
-> or newer, run a prompt and read the reply before believing a benchmark.
+> Diagnosis and the full elimination table in [RESULTS.md](RESULTS.md#sm_86-corruption).
+>
+> The general lesson stands, so it is kept here: **BELLS moves weights over PCIe on every token,
+> so a host that corrupts DMA corrupts BELLS long before it corrupts anything else.** Run a
+> prompt and read the reply before believing a benchmark. If output is degenerate, test the
+> machine before suspecting the cache - `--cpu-moe` (mmap on) or `GGML_CUDA_NO_PINNED=1` both
+> avoid large pinned allocations and were 56/56 clean where pinned was 1/24.
 
 **A 235B model on one 24 GB card at 11.3 tok/s, up from 3.1.** An 80B on the same card at
 53.1 tok/s, up from 19.8. Both are models plain `-ngl` cannot load at all.

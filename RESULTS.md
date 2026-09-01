@@ -848,6 +848,12 @@ python bells_predict.py profile.trace.bin                      # LRU vs table vs
 
 ## sm_86 corruption
 
+> **RESOLVED 2026-09-01 - it was the host machine, not sm_86 and not BELLS.**
+> The section below is kept as the original investigation record; read
+> [the resolution](#resolution-the-host-cannot-dma-from-pinned-memory) first. Every elimination
+> here is still valid as a measurement, but they were all run on the faulty machine, so they were
+> testing BELLS mechanisms while the real fault sat underneath them in the transfer.
+
 **BELLS generates garbage on an RTX 3060 (sm_86) in the pinned configuration, and the
 instrumentation cannot see it.** Found 2026-08-15 on a Debian box (i7-4790K, 30 GB DDR3, driver
 595.84), building and running inside a `nvidia/cuda:12.4.1-devel` container, sm_86.
@@ -981,6 +987,78 @@ bytes byte-identical to the host source, slot table reading back exactly as writ
 valid and never negative, and the residency invariant holding on every token - and the output is
 still wrong. The untried tool is `--tool racecheck`, which detects the race class `memcheck`
 cannot. Any future work here should use repeated trials; a single clean run means nothing.
+
+### Resolution: the host cannot DMA from pinned memory
+
+Resolved 2026-09-01. **The fault is the machine, not the GPU and not the cache.**
+
+Reproduced with no llama.cpp involved - `cudaMallocHost`, write a pattern, copy 720 KB slices to
+the device and back, compare every byte:
+
+```
+                 4 GiB buffer   18 GiB buffer
+chunks swept          5957          26810
+device wrong             3              8     host byte-perfect
+host wrong               0              0
+sticky (4 retries)       3              8
+every bad byte reads 0xFF
+```
+
+`0xFF` is a PCIe read abort - nothing answered the request - not corrupted data. A CPU-only pass
+over the same buffer finds zero bad bytes before and after, so the RAM is sound. The bad regions
+are contiguous, and the failing **physical** addresses move between allocations, so there is no
+bad DIMM and nothing to exclude with `memmap=`.
+
+**The threshold is the process's total pinned footprint, ~512 MiB**, not the size of any one
+allocation - 72 separate 256 MiB buffers totalling 18 GiB failed just the same:
+
+| pinned | bad chunks |
+|---|---|
+| 64 / 256 / 512 MiB | 0 |
+| 1024 MiB | 4 |
+| 2048 MiB | 8 |
+| 3072 MiB | 8 |
+
+**The same RTX 3060, moved into a different machine, is clean**: 0 bad chunks from 512 MiB through
+12 GiB (~37,000 swept), and BELLS with `--cpu-moe-pinned --bells-slots 32` then produced **32/32
+clean generations across two processes at ~37 tok/s** - the exact configuration that was 0/46 on
+the original host. So the card is fine and `--cpu-moe-pinned` is a good flag.
+
+**Why this looked like an architecture bug for four months:** the sm_75 control was an RTX 2060 in
+a *different machine*. Two variables moved at once and only one was named. The correct control was
+the same card in a different host, which was never run until the fault was already isolated to the
+transfer.
+
+Also ruled out, all measured: `intel_iommu=on` in translation mode (still 7 and 11 bad; also
+bumped the kernel with no change), transparent huge pages (`AnonHugePages` was already 0 and
+`transparent_hugepage=never` changed nothing - the 2 MiB granularity of the bad regions is the
+NVIDIA driver's own pinned-allocation unit, not THP), and a fixed bad physical region.
+
+Correct configurations on an affected host, measured with matched controls - **56/56 clean without
+a large pinned allocation, 1/24 with one**:
+
+| config | clean |
+|---|---|
+| `--cpu-moe` (mmap on) | 32/32 |
+| `--cpu-moe-pinned` + `GGML_CUDA_NO_PINNED=1` | 12/12 |
+| `--cpu-moe --no-mmap` + `GGML_CUDA_NO_PINNED=1` | 12/12 |
+| `--cpu-moe --no-mmap` | 1/12 |
+| `--cpu-moe-pinned` | 0/12 |
+
+Note this also explains the "`--no-mmap` and pinned are not separable" observation above: they are
+separable, just not from the command line. `GGML_CUDA_NO_PINNED=1` separates them, and doing so
+shows the pinning is the trigger and mmap is incidental.
+
+Two latent defects were found during the search and are fixed, though neither caused the
+corruption - each measured 1 clean run in 40 against a 0-in-46 baseline:
+
+- `init()` zeroed only the spare cache slot, leaving slots `0..n_slot-1` holding whatever
+  `cudaMalloc` returned until a copy filled them.
+- `upload_slots()` uploaded `-1` verbatim for a non-resident expert, instead of the spare zero
+  slot that `init()` allocates and `zero_slot()` names for exactly that purpose.
+
+A third, `allow_reuse()` ignoring `cparams.warmup`, is a genuine upstream llama.cpp bug and is
+fixed separately.
 
 ## Model choice decides whether BELLS is worth using at all
 

@@ -26,10 +26,17 @@ weights of which 19.5 GB are experts):
 **BELLS is worth ~2x on this model, losslessly** — quality is identical to running without it,
 because every routed expert is made resident before the matmul reads it.
 
-It is **not** universally a win. On Qwen3.8-Flash-Next (177B, 512 experts per layer) a 12 GB card
-can only cover ~12% of the routing space, so nearly every token misses and pays a host→device copy
-that plain `--cpu-moe` never pays. BELLS measured *slower* than baseline there at every slot count
-tested. **The dividing line is cache coverage as a fraction of the routing space**, not model size.
+On Qwen3.8-Flash-Next (177B, 512 experts per layer) a 12 GB card covers only ~12% of the routing
+space, so most tokens miss. Historically BELLS measured *slower* than baseline there, because a
+miss paid a host→device copy **on top of** the same host read `--cpu-moe` would have done anyway —
+a miss cost more than having no cache at all.
+
+`--bells-split` fixes that by giving misses a CPU path, so a hit is faster and a miss costs exactly
+what `--cpu-moe` costs. With `--bells-slots 64 --bells-split 3` the 177B measures **12.17 tok/s
+against an 11.40 baseline (+6.8%)**, with copies falling from 1947 µs to 648 µs per layer-call.
+Modest, but it is the first configuration where the cache is net-positive on a model this size.
+
+**The dividing line is cache coverage as a fraction of the routing space**, not model size.
 
 ## Flags
 
@@ -40,6 +47,7 @@ tested. **The dividing line is cache coverage as a fraction of the routing space
 | `--bells-passive` | allocate the cache and take the readback, but never use it — isolates the fixed cost of the mechanism |
 | `--moe-stats FILE` | write a CSV of how often, and with how much routing weight, each expert is used |
 | `--pin-experts FILE` | seat the measured-hottest experts permanently, from a `--moe-stats` CSV |
+| `--bells-split K` | run K of each token's experts on the GPU from the cache and the rest on the CPU from host weights. Exact — splitting a weighted sum costs no quality |
 | `--bells-refresh N` | **research only, degrades output** — observe only every Nth layer |
 
 Working configuration for the model above:
@@ -68,6 +76,18 @@ placed after it is silently ignored.
 - **A better expert-selection heuristic does not exist.** Ranking a static table by summed routing
   weight instead of by occurrence count gains +0.9%; the two are near-perfectly correlated because
   every pick averages ~1/8 of the weight.
+- **Routing is not predictable across tokens.** Only 35–40% of a token's experts were used by the
+  previous token; over a 10-token window it is 63–70%. So experts *rotate* rather than repeat, and
+  retaining beats predicting — which is why LRU outperforms static frequency pinning, and why a
+  recency-driven prefetcher is not worth building.
+- **The CPU and GPU cannot be used at the same time within a token.** `ggml_backend_sched` executes
+  graph splits sequentially: with an MoE layer deliberately split across both devices, only 1 of 68
+  samples had both above 50%. Any "use the idle GPU alongside the CPU" scheme yields
+  `GPU + CPU` time, not `max(GPU, CPU)`.
+- **Pinned staging does not rescue pageable copies.** `cudaMemcpyAsync` from pageable memory blocks
+  (164.9 µs/layer-call against 5.3 µs from pinned), but staging through a pinned ring measured
+  *slower* on both models — the 177B's 1937 µs copies are dominated by NVMe page faults, not the
+  transfer path. Opt-in behind `BELLS_STAGE=1`, kept only for the record.
 
 Set `GGML_SCHED_DEBUG=2` with `-lv 10` to see per-node backend assignment — the fastest way to
 answer "where is this op actually running".

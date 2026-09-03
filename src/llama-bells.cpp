@@ -400,6 +400,49 @@ bool bells_tensors::init(ggml_backend_buffer_type_t buft, const std::vector<laye
         }
     }
 
+    // Pinned staging ring, OPT-IN via BELLS_STAGE=1. Measured slower on both models and kept only
+    // because the reasoning behind it is worth preserving.
+    //
+    // The premise: cudaMemcpyAsync from PAGEABLE memory is not async - the driver stages it
+    // internally and blocks - measured at 164.9 us per layer-call against 5.3 us from pinned on
+    // the same model at the same hit rate. So stage through pinned memory and recover the 31x.
+    //
+    // It does not work. Measured:            35B  62.92 -> 60.38   copy 154.6 -> 197.1 us
+    //                                       177B  12.08 -> 11.24   copy 1937 -> 2081 us
+    //
+    // The error was generalising a mechanism measured on the 35B to a model with a very different
+    // memory ratio. The 177B's copies cost 1937 us against the 35B's 154 - 12x more at a LOWER
+    // miss count - so the dominant cost there is not the transfer path at all, it is NVMe page
+    // faults: 73 GB of weights against 32 GB of RAM means a cache miss usually means the source
+    // page is not resident either. The memcpy into the ring faults on exactly those pages and adds
+    // its own cost on top.
+    if (backend_ && getenv("BELLS_STAGE")) {
+        if (ggml_backend_dev_t dev = ggml_backend_get_device(backend_)) {
+            host_buft_ = ggml_backend_dev_host_buffer_type(dev);
+        }
+
+        bool src_pinned = false;
+        for (const auto & e : entries_) {
+            ggml_tensor * t = e.src.gate ? e.src.gate : (e.src.up ? e.src.up : e.src.down);
+            if (t && t->buffer && host_buft_ &&
+                ggml_backend_buffer_get_type(t->buffer) == host_buft_) {
+                src_pinned = true;
+            }
+            break;
+        }
+
+        if (host_buft_ && !src_pinned) {
+            stage_cap_ = 64ull*1024*1024;
+            stage_buf_ = ggml_backend_buft_alloc_buffer(host_buft_, stage_cap_);
+            if (stage_buf_) {
+                stage_ptr_ = (char *) ggml_backend_buffer_get_base(stage_buf_);
+                stage_off_ = 0;
+                fprintf(stderr, "init: staging expert copies through %.0f MiB of pinned host "
+                                "memory (sources are pageable)\n", stage_cap_/1024.0/1024.0);
+            }
+        }
+    }
+
     return true;
 }
 
@@ -581,6 +624,19 @@ void bells_tensors::warm_lookahead(uint32_t il_next) {
 }
 
 void bells_tensors::free() {
+    if (stage_buf_) {
+        if (n_staged_ > 0) {
+            fprintf(stderr, "bells_tensors: staged %llu expert copies through pinned memory, "
+                            "%llu ring wraps\n",
+                    (unsigned long long) n_staged_, (unsigned long long) n_wraps_);
+        }
+        ggml_backend_buffer_free(stage_buf_);
+        stage_buf_ = nullptr;
+        stage_ptr_ = nullptr;
+        stage_cap_ = 0;
+        stage_off_ = 0;
+    }
+
     if (copy_event_) {
         ggml_backend_event_synchronize(copy_event_);
         ggml_backend_event_free(copy_event_);
@@ -633,6 +689,27 @@ void bells_tensors::copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t exper
     if (sync_copy) {
         ggml_backend_tensor_set(dst, base, (size_t) slot*stride, stride);
         return;
+    }
+
+    // Route through the pinned ring when the source is pageable. The memcpy costs real CPU time
+    // (~75 us for 1.88 MiB) but it is what lets the transfer overlap instead of blocking the
+    // stream, which measured 31x on the 35B.
+    if (stage_ptr_ && stride <= stage_cap_) {
+        if (stage_off_ + stride > stage_cap_) {
+            // A real host sync before reusing the ring. sync_copies() is only stream-ordered and
+            // returns before transfers drain, so overwriting here without this would corrupt
+            // copies still in flight.
+            if (ggml_backend_t sb = copy_backend_ ? copy_backend_ : backend) {
+                ggml_backend_synchronize(sb);
+            }
+            stage_off_ = 0;
+            n_wraps_++;
+        }
+
+        memcpy(stage_ptr_ + stage_off_, base, stride);
+        base        = stage_ptr_ + stage_off_;
+        stage_off_ += stride;
+        n_staged_++;
     }
 
     // copy_backend_ is only ever set in the single-device case; see init(). Otherwise the copy
@@ -1740,6 +1817,24 @@ bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
         pf_drain(il);
     }
 
+    // With --bells-split only the first K experts of each token are read through the cache; the
+    // rest are computed on the CPU from the host weights and need no residency at all. Halving K
+    // halves the copies AND doubles the effective cache coverage, because the cache now only has
+    // to hold K experts per token instead of all of them.
+    std::vector<int32_t> split_ids;
+    if (params_.split > 0 && params_.split < n_expert_used_ && n_expert_used_ > 0) {
+        const size_t k    = n_expert_used_;
+        const size_t rows = n / k;
+        split_ids.reserve(rows * params_.split);
+        for (size_t r = 0; r < rows; ++r) {
+            for (uint32_t j = 0; j < params_.split; ++j) {
+                split_ids.push_back(experts[r*k + j]);
+            }
+        }
+        experts = split_ids.data();
+        n       = split_ids.size();
+    }
+
     // Every expert this layer asked for must be resident before the matmul reads the slot
     // table, so this is a demand fetch with no lead time to hide it behind.
     const std::vector<uint8_t> * protect =
@@ -2090,6 +2185,9 @@ void moe_stats::init(uint32_t n_layer, uint32_t n_expert, const char * path) {
     count_.assign((size_t) n_layer * n_expert, 0);
     weight_.assign((size_t) n_layer * n_expert, 0.0);
     last_ids_.assign(n_layer, {});
+    hist_.assign(n_layer, std::vector<std::vector<int32_t>>(REC_WINDOW));
+    hist_pos_.assign(n_layer, 0);
+    rec1_hit_ = rec1_tot_ = recK_hit_ = recK_tot_ = 0;
     n_events_ = 0;
     path_      = path;
     last_dump_ = 0;
@@ -2110,6 +2208,36 @@ void moe_stats::note(uint32_t il, const int32_t * ids, size_t n) {
     // pairing is positional and matched on length.
     if (il < last_ids_.size()) {
         last_ids_[il].assign(ids, ids + n);
+    }
+
+    // Cross-token recency. Decode-sized calls only: a prefill ubatch carries every token's picks
+    // in one array, and there is no "previous token" within it to compare against.
+    if (n > 0 && n <= 32 && il < hist_.size()) {
+        auto & ring = hist_[il];
+        const uint32_t pos  = hist_pos_[il];
+        const auto &   prev = ring[(pos + REC_WINDOW - 1) % REC_WINDOW];
+
+        if (!prev.empty()) {
+            size_t h1 = 0, hk = 0;
+            for (size_t i = 0; i < n; ++i) {
+                const int32_t e = ids[i];
+                if (std::find(prev.begin(), prev.end(), e) != prev.end()) {
+                    h1++;
+                }
+                for (uint32_t w = 0; w < REC_WINDOW; ++w) {
+                    const auto & s = ring[w];
+                    if (!s.empty() && std::find(s.begin(), s.end(), e) != s.end()) {
+                        hk++;
+                        break;
+                    }
+                }
+            }
+            rec1_hit_ += h1; rec1_tot_ += n;
+            recK_hit_ += hk; recK_tot_ += n;
+        }
+
+        ring[pos].assign(ids, ids + n);
+        hist_pos_[il] = (pos + 1) % REC_WINDOW;
     }
     for (size_t i = 0; i < n; ++i) {
         const int32_t e = ids[i];
@@ -2185,5 +2313,14 @@ void moe_stats::write_locked() {
     fclose(f);
     fprintf(stderr, "moe_stats: %llu routing events written to %s\n",
             (unsigned long long) n_events_, path_.c_str());
+
+    if (rec1_tot_ > 0) {
+        // rec1 bounds a pure recency prefetcher; recK approximates a ~10-token LRU cache.
+        fprintf(stderr, "moe_stats: RECENCY  vs previous token %.1f%%  |  vs last %u tokens %.1f%%  "
+                        "(%llu decode picks)\n",
+                100.0*(double) rec1_hit_/(double) rec1_tot_, REC_WINDOW,
+                100.0*(double) recK_hit_/(double) recK_tot_,
+                (unsigned long long) rec1_tot_);
+    }
     fflush(stderr);
 }

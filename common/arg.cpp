@@ -2845,6 +2845,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_BELLS_SLOTS"));
     add_opt(common_arg(
+        {"--bells-refresh"}, "N",
+        "BELLS: observe a rotating 1/N of MoE layers per token instead of every layer. Each "
+        "observation point costs a graph split, measured at ~2.3 ms/token across 32 layers - more "
+        "than the readback, copy and upload combined. Layers not observed reuse their last slot "
+        "table and anything routed outside it is dropped via the zero slot, so this trades hit "
+        "rate for split cost (default: 1 = observe every layer)",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.bells_refresh = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_BELLS_REFRESH"));
+    add_opt(common_arg(
         {"--bells-passive"},
         "BELLS: research only. Allocate the cache and keep taking the per-layer graph split, but "
         "leave the matmuls on the full expert stack and copy nothing. Measures what the mechanism "
@@ -2853,6 +2867,69 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.bells_passive = true;
         }
     ).set_env("LLAMA_ARG_BELLS_PASSIVE"));
+    add_opt(common_arg(
+        {"--pin-experts"}, "FILE",
+        "seat the hottest experts per layer permanently in the BELLS cache, using a usage CSV "
+        "from --moe-stats, instead of admitting on demand. Routing is heavily skewed, so the same "
+        "VRAM covers far more traffic chosen by frequency than spent on whole layers via -ot. "
+        "Requires --bells-slots and --cpu-moe",
+        [](common_params & params, const std::string & value) {
+            params.pin_experts = value;
+        }
+    ).set_env("LLAMA_ARG_PIN_EXPERTS"));
+    add_opt(common_arg(
+        {"--pin-reserve"}, "N",
+        "dynamic slots to keep free per layer when using --pin-experts, for experts a token "
+        "routes to outside the pinned set (default: 0 = auto, 4x n_expert_used)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.pin_reserve = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_PIN_RESERVE"));
+    add_opt(common_arg(
+        {"--moe-stats"}, "FILE",
+        "write a CSV of how often routing picks each expert, per layer. Measurement only - it "
+        "changes nothing about execution. Used to decide whether pinning experts by frequency "
+        "beats pinning whole layers at the same VRAM budget",
+        [](common_params & params, const std::string & value) {
+            params.moe_stats = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_STATS"));
+    add_opt(common_arg(
+        {"--moe-prefetch"}, "N",
+        "keep the N hottest experts per layer hinted to the OS one layer ahead, as whole extents. "
+        "For a model larger than RAM the kernel pulls each missing expert in at its own readahead "
+        "granularity, one request at a time on the critical path; one expert is a single "
+        "contiguous extent, so asking for it as one asynchronous request collapses ~31 serialised "
+        "faults into 1. Independent of --bells: this is about NVMe request size and queue depth, "
+        "not VRAM (default: 0 = off)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_prefetch = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH"));
+    add_opt(common_arg(
+        {"--cold-tensors"}, "SUBSTR[,SUBSTR...]",
+        "keep tensors whose name contains any of these substrings out of the process working set, "
+        "so the page cache evicts them before anything else. For weights that are large and read "
+        "once per use - a per-token lookup table - plain LRU keeps them for the same reason it "
+        "keeps a hot expert, which is wrong when the model does not fit in RAM",
+        [](common_params & params, const std::string & value) {
+            params.cold_tensors = value;
+        }
+    ).set_env("LLAMA_ARG_COLD_TENSORS"));
+    add_opt(common_arg(
+        {"--cold-ple"},
+        "shorthand for --cold-tensors per_layer_token_embd. Gemma3n-style per-layer embeddings are "
+        "a large lookup table read one row per token, so they are the ideal eviction victim",
+        [](common_params & params) {
+            params.cold_tensors = "per_layer_token_embd";
+        }
+    ).set_env("LLAMA_ARG_COLD_PLE"));
     add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",

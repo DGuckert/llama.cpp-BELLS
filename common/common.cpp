@@ -1751,6 +1751,13 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.bells_enabled      = params.bells_enabled;
     cparams.bells_n_slot       = params.bells_n_slot;
     cparams.bells_passive      = params.bells_passive;
+    cparams.bells_refresh      = params.bells_refresh;
+    // points into params, which outlives the context in every caller here
+    cparams.cold_tensors       = params.cold_tensors.empty() ? nullptr : params.cold_tensors.c_str();
+    cparams.moe_prefetch       = params.moe_prefetch;
+    cparams.moe_stats          = params.moe_stats.empty() ? nullptr : params.moe_stats.c_str();
+    cparams.pin_experts        = params.pin_experts.empty() ? nullptr : params.pin_experts.c_str();
+    cparams.pin_reserve        = params.pin_reserve;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

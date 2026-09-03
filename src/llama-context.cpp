@@ -480,6 +480,140 @@ llama_context::llama_context(
         }
     }
 
+    if (params.cold_tensors && *params.cold_tensors) {
+        // Split the pattern list, then match tensor names by substring. Substring rather than
+        // regex on purpose: the names worth naming here are stable and literal
+        // ("per_layer_token_embd"), and a bad regex failing open would silently cool nothing.
+        std::vector<std::string> pats;
+        {
+            std::string all = params.cold_tensors;
+            size_t pos = 0;
+            while (pos <= all.size()) {
+                const size_t comma = all.find(',', pos);
+                std::string p = all.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                if (!p.empty()) {
+                    pats.push_back(p);
+                }
+                if (comma == std::string::npos) {
+                    break;
+                }
+                pos = comma + 1;
+            }
+        }
+
+        std::vector<std::pair<void *, size_t>> ranges;
+        uint64_t bytes = 0;
+        std::string matched;
+        for (const auto & kv : model.tensors_by_name) {
+            ggml_tensor * t = kv.second;
+            if (!t || !t->data || !t->buffer) {
+                continue;
+            }
+            // only host memory can be paged; a device tensor has no page cache behind it
+            if (!ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            bool hit = false;
+            for (const auto & p : pats) {
+                if (kv.first.find(p) != std::string::npos) {
+                    hit = true;
+                    break;
+                }
+            }
+            if (!hit) {
+                continue;
+            }
+            const size_t nb = ggml_nbytes(t);
+            ranges.emplace_back(t->data, nb);
+            bytes += nb;
+            if (matched.size() < 200) {
+                matched += (matched.empty() ? "" : ", ") + kv.first;
+            }
+        }
+
+        if (ranges.empty()) {
+            LLAMA_LOG_WARN("%s: --cold-tensors matched nothing (host-resident tensors only)\n", __func__);
+        } else {
+            bells_cold_start(ranges, bytes, matched.c_str());
+        }
+    }
+
+    if (params.moe_stats && *params.moe_stats) {
+        moe_st = std::make_unique<moe_stats>();
+        moe_st->init(model.hparams.n_layer(), model.hparams.n_expert, params.moe_stats);
+    }
+
+    if (params.moe_prefetch > 0) {
+        // Collect the routed-expert tensors per layer. Host tensors only: a device-resident
+        // expert has no page cache behind it and nothing to prefetch.
+        auto pf = std::make_unique<moe_prefetch>();
+        pf->init(model.hparams.n_layer(), model.hparams.n_expert, params.moe_prefetch);
+
+        // Take the tensors straight off the layer, the way the expert cache does. Matching by
+        // name string found nothing at all - it wired 0 layers and every --moe-prefetch number in
+        // two sweeps measured an inert flag.
+        uint32_t n_wired = 0;
+        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            const auto & layer = model.layers[il];
+
+            if (!layer.ffn_gate_exps && !layer.ffn_up_exps && !layer.ffn_gate_up_exps) {
+                continue;   // dense layer
+            }
+
+            ggml_tensor * t[4] = { layer.ffn_gate_exps, layer.ffn_up_exps,
+                                   layer.ffn_down_exps, layer.ffn_gate_up_exps };
+
+            // Only host memory can fault. A layer placed on the device by -ot has no page cache
+            // behind it, so prefetching it is meaningless - and this is exactly the composition
+            // that matters, since -ot + --cpu-moe is the configuration worth running.
+            uint32_t n_host = 0;
+            for (int k = 0; k < 4; ++k) {
+                if (!t[k]) {
+                    continue;
+                }
+                const bool has_data = t[k]->data   != nullptr;
+                const bool has_buf  = t[k]->buffer != nullptr;
+                const bool is_host  = has_buf && ggml_backend_buffer_is_host(t[k]->buffer);
+
+                // Say why, once, for the first MoE layer. Two rounds of this feature measured an
+                // inert flag because it reported only that it had wired nothing, never which of
+                // the three conditions rejected the tensor.
+                static bool explained = false;
+                if (!explained && il < 4) {
+                    fprintf(stderr, "moe_prefetch: il=%u k=%d %s data=%d buf=%d host=%d buft=%s\n",
+                            il, k, ggml_get_name(t[k]), (int) has_data, (int) has_buf, (int) is_host,
+                            has_buf ? ggml_backend_buffer_name(t[k]->buffer) : "(none)");
+                    if (k == 3 && il == 3) {
+                        explained = true;
+                    }
+                }
+
+                if (!has_data || !is_host) {
+                    t[k] = nullptr;
+                } else {
+                    n_host++;
+                }
+            }
+            if (n_host == 0) {
+                continue;
+            }
+
+            pf->add_layer(il, t[0], t[1], t[2], t[3]);
+            n_wired++;
+        }
+
+        // fprintf, not LLAMA_LOG_*: the server's log filter drops INFO/WARN from here, and an
+        // arm whose activation cannot be confirmed cannot be interpreted
+        if (n_wired == 0) {
+            fprintf(stderr, "moe_prefetch: wired 0 layers - no host-resident expert tensors, disabled\n");
+        } else {
+            fprintf(stderr, "moe_prefetch: wired %u layers, %u experts/layer hinted one layer ahead\n",
+                    n_wired, params.moe_prefetch);
+            fflush(stderr);
+            moe_pf = std::move(pf);
+        }
+    }
+
     if (params.bells_enabled) {
         std::vector<bells_tensors::layer_src> srcs;
 
@@ -568,6 +702,11 @@ llama_context::llama_context(
             bp.enabled      = true;
             bp.n_slot       = params.bells_n_slot;
             bp.passive      = params.bells_passive;
+            bp.refresh      = params.bells_refresh ? params.bells_refresh : 1;
+            if (params.pin_experts && *params.pin_experts) {
+                bp.pin_file = params.pin_experts;
+            }
+            bp.pin_reserve = params.pin_reserve;
 
             // the cache lives wherever the graph runs, i.e. next to the rest of the offload
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends.front().get());
@@ -1495,6 +1634,22 @@ bool llama_context::bells_eval(ggml_tensor * t, bool ask) {
         }
     }
 
+    // Do not split the graph during prefill. BELLS cannot serve a prefill ubatch, so the routing
+    // read there is discarded - the splits were pure overhead, worth ~17% of prefill throughput.
+    if (is_topk && bells && bells->ready() && !bells->active_now()) {
+        is_topk = false;
+    }
+
+    // --bells-refresh: only ask for this layer's routing on its turn. Returning false here means
+    // the scheduler does not split the graph at this node, which is the whole point - the split,
+    // not the readback, is the dominant cost of the mechanism.
+    if (is_topk && bells && bells->ready()) {
+        const int il_ask = atoi(t->name + plen);
+        if (il_ask >= 0 && !bells->should_observe((uint32_t) il_ask)) {
+            is_topk = false;
+        }
+    }
+
     // This tensor is not always n_expert_used wide. Where ggml_argsort_top_k does not yield a
     // separate view node, cb() names the full argsort "ffn_moe_topk-<il>", overwriting the
     // "ffn_moe_argsort-<il>" set a line earlier, and it arrives n_expert wide. Reading all of it
@@ -1520,12 +1675,29 @@ bool llama_context::bells_eval(ggml_tensor * t, bool ask) {
                               t->op   == GGML_OP_GET_ROWS &&
                               t->type == GGML_TYPE_I32;
 
+    // --moe-stats also wants the routing weights, which arrive as a separate node just after the
+    // topk for the same layer. Only observed while profiling; it adds a split per layer, which is
+    // irrelevant for a measurement run and never happens in normal use.
+    static const char * wprefix = "ffn_moe_weights_norm-";
+    static const size_t wplen   = strlen(wprefix);
+    bool is_weights = moe_st && moe_st->enabled() &&
+                      strncmp(t->name, wprefix, wplen) == 0 && t->type == GGML_TYPE_F32;
+    if (is_weights) {
+        const char * s = t->name + wplen;
+        if (*s == '\0') {
+            is_weights = false;
+        }
+        for (; *s && is_weights; ++s) {
+            is_weights = *s >= '0' && *s <= '9';
+        }
+    }
+
     // chain to any user callback (imatrix, eval-callback). It may see nodes it did not ask
     // for when BELLS wants them too, which is harmless for observation-only consumers.
     const bool user = cparams.cb_eval ? cparams.cb_eval(t, ask, cparams.cb_eval_user_data) : false;
 
     if (ask) {
-        return is_topk || is_bells_ids || user;
+        return is_topk || is_bells_ids || is_weights || user;
     }
 
     if (is_bells_ids && bells && bells->ready()) {
@@ -1712,6 +1884,45 @@ bool llama_context::bells_eval(ggml_tensor * t, bool ask) {
         }
     }
 
+    if (is_weights && !ask && !cparams.warmup) {
+        const int il_w = atoi(t->name + wplen);
+        const int64_t nw = ggml_nelements(t);
+        std::vector<float> wv((size_t) nw);
+        ggml_backend_tensor_get(t, wv.data(), 0, nw*sizeof(float));
+        moe_st->note_weights((uint32_t) il_w, wv.data(), wv.size());
+    }
+
+    // Measurement path: count routing without touching any tensor. Runs alongside whatever else
+    // is enabled, including the expert cache, so the histogram reflects the real workload.
+    if (is_topk && moe_st && moe_st->enabled() && !cparams.warmup) {
+        const int     il   = atoi(t->name + plen);
+        const int64_t k    = t->ne[0];
+        const int64_t rows = ggml_nrows(t);
+
+        std::vector<int32_t> sids((size_t) k*rows);
+        for (int64_t i = 0; i < rows; ++i) {
+            ggml_backend_tensor_get(t, sids.data() + i*k, i*t->nb[1], k*sizeof(int32_t));
+        }
+        moe_st->note(il, sids.data(), sids.size());
+    }
+
+    // Prefetch-only path: no VRAM cache involved. Read which experts routing picked, then ask the
+    // OS for the next layers' likely extents while this layer is still computing on the GPU - the
+    // only point in the schedule with lead time to hide a fault behind.
+    if (is_topk && moe_pf && !(bells && bells->ready()) && !cparams.warmup) {
+        const int     il   = atoi(t->name + plen);
+        const int64_t k    = t->ne[0];
+        const int64_t rows = ggml_nrows(t);
+
+        std::vector<int32_t> ids((size_t) k*rows);
+        for (int64_t i = 0; i < rows; ++i) {
+            ggml_backend_tensor_get(t, ids.data() + i*k, i*t->nb[1], k*sizeof(int32_t));
+        }
+
+        moe_pf->note(il, ids.data(), ids.size());
+        moe_pf->lookahead(il + 1);
+    }
+
     return true;
 }
 
@@ -1754,7 +1965,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        if (bells && bells->ready()) {
+        if ((bells && bells->ready()) || moe_pf || moe_st) {
             ggml_backend_sched_set_eval_callback(sched.get(), llama_bells_eval_cb, this);
         } else {
             ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
@@ -4028,6 +4239,12 @@ llama_context_params llama_context_default_params() {
         /*.bells_enabled               =*/ false,
         /*.bells_n_slot                =*/ 0,
         /*.bells_passive               =*/ false,
+        /*.bells_refresh               =*/ 1,
+        /*.cold_tensors                =*/ nullptr,
+        /*.moe_prefetch                =*/ 0,
+        /*.moe_stats                   =*/ nullptr,
+        /*.pin_experts                 =*/ nullptr,
+        /*.pin_reserve                 =*/ 0,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,

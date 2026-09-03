@@ -2845,6 +2845,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_BELLS_SLOTS"));
     add_opt(common_arg(
+        {"--bells-split"}, "K",
+        "BELLS: run K of each token's experts on the GPU from the VRAM cache and the remaining "
+        "n_expert_used-K on the CPU from the host weights, concurrently. The MoE output is a "
+        "weighted sum over experts, so splitting it is exact - no quality cost. Only K experts per "
+        "token need to be resident, so the cache covers proportionally more, and a miss costs what "
+        "--cpu-moe costs instead of costing more (default: 0 = all experts through the cache)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.bells_split = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_BELLS_SPLIT"));
+    add_opt(common_arg(
         {"--bells-refresh"}, "N",
         "BELLS: observe a rotating 1/N of MoE layers per token instead of every layer. Each "
         "observation point costs a graph split, measured at ~2.3 ms/token across 32 layers - more "

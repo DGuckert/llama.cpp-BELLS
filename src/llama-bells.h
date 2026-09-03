@@ -233,6 +233,18 @@ private:
     // across uploads to keep this off the per-layer, per-token allocation path.
     std::vector<int32_t> slot_scratch_;
 
+    // Pinned staging ring for expert copies. cudaMemcpyAsync from pageable memory blocks; from
+    // pinned memory it returns immediately and overlaps. Measured 164.9 us vs 5.3 us per
+    // layer-call, so for any model too large to load with --cpu-moe-pinned this is the single
+    // largest cost in the cache path.
+    ggml_backend_buffer_type_t host_buft_  = nullptr;   // pinned host buffer type, if any
+    ggml_backend_buffer_t      stage_buf_  = nullptr;
+    char *                     stage_ptr_  = nullptr;
+    size_t                     stage_cap_  = 0;
+    size_t                     stage_off_  = 0;
+    uint64_t                   n_staged_   = 0;
+    uint64_t                   n_wraps_    = 0;
+
 public:
     // BELLS_MMAP_WARM: keep the hot expert working set faulted into the page cache.
     //
@@ -341,6 +353,10 @@ struct bells_params {
     // which is more than the readback, copy and upload put together.
     uint32_t    refresh = 1;   // 1 = observe every layer every token (original behaviour)
 
+    // --bells-split: how many of each token's experts run on the GPU via the cache. The rest run
+    // on the CPU from the host weights, concurrently. 0 = all through the cache (original).
+    uint32_t    split = 0;
+
     // --pin-experts: CSV of layer,expert,count from --moe-stats. The hottest experts per layer
     // are seated permanently, the rest of the slots stay dynamic so residency is still
     // guaranteed for whatever a token routes to outside the pinned set.
@@ -378,6 +394,9 @@ public:
     }
 
     bool passive() const { return params_.passive; }
+
+    // experts per token routed to the GPU cache; the remainder go to the CPU path
+    uint32_t split() const { return params_.split; }
 
     // Is the CURRENT ubatch one the cache will serve? Set by begin_ubatch.
     //
@@ -615,5 +634,12 @@ private:
     uint64_t              n_events_ = 0;
     std::string           path_;
     uint64_t              last_dump_ = 0;
+
+    // cross-token recency predictability, decode-sized calls only
+    static const uint32_t REC_WINDOW = 10;                  // ~64 slots / 6 experts per token
+    std::vector<std::vector<std::vector<int32_t>>> hist_;   // [layer][ring slot] -> ids
+    std::vector<uint32_t> hist_pos_;
+    uint64_t rec1_hit_ = 0, rec1_tot_ = 0;                  // vs previous token
+    uint64_t recK_hit_ = 0, recK_tot_ = 0;                  // vs union of last REC_WINDOW
     std::mutex            mu_;
 };

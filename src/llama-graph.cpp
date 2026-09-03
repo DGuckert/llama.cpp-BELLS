@@ -2142,6 +2142,71 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_tensor * ids_exps = bells_ids ? bells_ids : selected_experts;
 
+    // --bells-split: the first K experts of each token on the GPU out of the cache, the remainder
+    // on the CPU out of the host weights. The MoE output is a weighted sum over selected experts,
+    // so splitting the sum is exact - this costs no quality, unlike dropping experts.
+    //
+    // The two mul_mat_id chains have no data dependency on each other, so the backend scheduler is
+    // free to run the CPU half while the GPU half executes. That is the entire point: the model is
+    // CPU-bound with the GPU at ~34%, and this is what puts the idle silicon to work.
+    if (bells_ids && bells && bells->split() > 0 &&
+        (int64_t) bells->split() < n_expert_used &&
+        !gate_up_exps && gate_exps && up_exps && down_exps &&
+        !up_exps_b && !gate_exps_b && !down_exps_b &&
+        !up_exps_s && !gate_exps_s && !down_exps_s &&
+        !weight_before_ffn && type_op == LLM_FFN_SILU) {
+
+        const int64_t kg = (int64_t) bells->split();   // GPU share, via the cache
+        const int64_t kc = n_expert_used - kg;         // CPU share, via host weights
+
+        // ggml_cont on the id slices: mul_mat_id reads ids densely, and the surrounding code
+        // already conts selected_experts before reshaping it for the same reason.
+        auto id_slice = [&](ggml_tensor * t, int64_t off, int64_t k) {
+            return ggml_cont(ctx0, ggml_view_2d(ctx0, t, k, t->ne[1], t->nb[1], off*t->nb[0]));
+        };
+
+        ggml_tensor * ids_g = id_slice(bells_ids,       0,  kg);
+        ggml_tensor * ids_c = id_slice(selected_experts, kg, kc);
+        cb(ids_g, "ffn_moe_ids_gpu", il);
+        cb(ids_c, "ffn_moe_ids_cpu", il);
+
+        auto chain = [&](ggml_tensor * wg_, ggml_tensor * wu_, ggml_tensor * wd_, ggml_tensor * ids) {
+            ggml_tensor * u_ = build_lora_mm_id(wu_, cur, ids, nullptr, ids);
+            ggml_tensor * g_ = build_lora_mm_id(wg_, cur, ids, nullptr, ids);
+            ggml_tensor * s_ = ggml_swiglu_split(ctx0, g_, u_);
+            return build_lora_mm_id(wd_, s_, ids, nullptr, ids);
+        };
+
+        ggml_tensor * e_gpu = chain(bells_gate, bells_up, bells_down, ids_g);
+        ggml_tensor * e_cpu = chain(gate_exps,  up_exps,  down_exps,  ids_c);
+        cb(e_gpu, "ffn_moe_down_gpu", il);
+        cb(e_cpu, "ffn_moe_down_cpu", il);
+
+        ggml_tensor * w_gpu = ggml_cont(ctx0, ggml_view_3d(ctx0, weights, 1, kg, n_tokens,
+                                                           weights->nb[1], weights->nb[2], 0));
+        ggml_tensor * w_cpu = ggml_cont(ctx0, ggml_view_3d(ctx0, weights, 1, kc, n_tokens,
+                                                           weights->nb[1], weights->nb[2], kg*weights->nb[1]));
+
+        e_gpu = ggml_mul(ctx0, e_gpu, w_gpu);
+        e_cpu = ggml_mul(ctx0, e_cpu, w_cpu);
+        ggml_build_forward_expand(gf, e_gpu);
+        ggml_build_forward_expand(gf, e_cpu);
+
+        ggml_tensor * moe_out = nullptr;
+        for (int64_t i = 0; i < n_expert_used; ++i) {
+            ggml_tensor * src = (i < kg) ? e_gpu : e_cpu;
+            const int64_t  j  = (i < kg) ? i     : i - kg;
+            ggml_tensor * v = ggml_view_2d(ctx0, src, n_embd, n_tokens, src->nb[2], j*src->nb[1]);
+            ggml_build_forward_expand(gf, v);
+            moe_out = moe_out ? ggml_add(ctx0, moe_out, v) : v;
+        }
+        if (n_expert_used == 1) {
+            moe_out = ggml_cont(ctx0, moe_out);
+        }
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
+    }
+
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 

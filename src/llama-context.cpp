@@ -703,6 +703,7 @@ llama_context::llama_context(
             bp.n_slot       = params.bells_n_slot;
             bp.passive      = params.bells_passive;
             bp.refresh      = params.bells_refresh ? params.bells_refresh : 1;
+            bp.split        = params.bells_split;
             if (params.pin_experts && *params.pin_experts) {
                 bp.pin_file = params.pin_experts;
             }
@@ -4240,6 +4241,7 @@ llama_context_params llama_context_default_params() {
         /*.bells_n_slot                =*/ 0,
         /*.bells_passive               =*/ false,
         /*.bells_refresh               =*/ 1,
+        /*.bells_split                 =*/ 0,
         /*.cold_tensors                =*/ nullptr,
         /*.moe_prefetch                =*/ 0,
         /*.moe_stats                   =*/ nullptr,

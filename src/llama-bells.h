@@ -26,6 +26,7 @@
 struct bells_copy {
     int32_t expert;
     int32_t slot;
+    int32_t evicted = -1;  // expert that was in this slot before, -1 if empty
 };
 
 class bells_cache {
@@ -267,6 +268,52 @@ private:
     std::vector<uint64_t> warm_used_;           // [layer*n_expert + expert] -> last routed clock
     uint64_t              warm_clock_    = 0;
     std::mutex            warm_mu_;
+
+public:
+    // L2 cache: a secondary GPU's VRAM used as extra expert storage. All compute stays on the
+    // primary GPU; the secondary just holds expert data that was recently evicted from L1. On
+    // a miss, checking L2 first avoids a host copy that might page-fault from NVMe.
+    bool init_l2(ggml_backend_buffer_type_t buft, uint32_t n_l2_slot,
+                 ggml_backend_t l2_backend, uint32_t n_expert);
+    void free_l2();
+
+    bool   has_l2()        const { return l2_n_slot_ > 0 && l2_buf_; }
+    size_t l2_vram_bytes() const { return l2_vram_bytes_; }
+
+    int32_t l2_lookup(uint32_t il, int32_t expert) const;
+    void    l2_admit_from_l1(uint32_t il, int32_t expert, int32_t l1_slot);
+    void    l2_promote(uint32_t il, int32_t expert, int32_t l1_slot);
+
+    uint64_t l2_n_admit()  const { return l2_n_admit_;  }
+    uint64_t l2_n_promote() const { return l2_n_promote_; }
+
+private:
+    struct l2_entry {
+        ggml_tensor * gate    = nullptr;
+        ggml_tensor * up      = nullptr;
+        ggml_tensor * down    = nullptr;
+        ggml_tensor * gate_up = nullptr;
+    };
+
+    struct l2_layer_info {
+        std::vector<int32_t> expert_slot;  // [n_expert] -> l2 slot, -1 if absent
+        std::vector<int32_t> slot_expert;  // [n_l2_slot] -> expert, -1 if empty
+        std::vector<int64_t> last_used;    // [n_l2_slot] LRU clock
+    };
+
+    int32_t l2_victim(const l2_layer_info & info) const;
+
+    ggml_context *              l2_ctx_        = nullptr;
+    ggml_backend_buffer_t       l2_buf_        = nullptr;
+    ggml_backend_t              l2_backend_    = nullptr;
+    std::vector<l2_entry>       l2_entries_;
+    std::vector<l2_layer_info>  l2_info_;
+    uint32_t                    l2_n_slot_     = 0;
+    int64_t                     l2_clock_      = 0;
+    size_t                      l2_vram_bytes_ = 0;
+    uint64_t                    l2_n_admit_    = 0;
+    uint64_t                    l2_n_promote_  = 0;
+    std::vector<char>           l2_stage_;
 };
 
 // There was a bells_predictor here: a token id -> per-layer expert ranking, counted over a
@@ -362,6 +409,8 @@ struct bells_params {
     // guaranteed for whatever a token routes to outside the pinned set.
     std::string pin_file;
     uint32_t    pin_reserve = 0;   // dynamic slots to keep per layer, 0 = auto
+
+    uint32_t    n_l2_slot  = 0;   // L2 cache slots on secondary GPU, 0 = off
 };
 
 // Ties the pieces together for the inference path.
@@ -377,6 +426,9 @@ public:
               uint32_t n_expert_used,
               ggml_backend_t backend = nullptr,
               ggml_backend_t copy_backend = nullptr);
+
+    bool init_l2(ggml_backend_buffer_type_t buft, ggml_backend_t l2_backend,
+                 uint32_t n_l2_slot);
 
     ~bells_runtime() { free(); }
 
@@ -546,6 +598,9 @@ private:
     uint64_t us_copy_       = 0;
     uint64_t us_upload_     = 0;
     uint64_t n_layer_calls_ = 0;
+
+    uint64_t l2_n_hit_      = 0;
+    uint64_t l2_n_miss_     = 0;
 };
 
 // Keep a set of address ranges out of the process working set.

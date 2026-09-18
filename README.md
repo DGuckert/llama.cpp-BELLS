@@ -51,6 +51,78 @@ llama-server -m model.gguf -ngl 99 --cpu-moe-pinned --bells-slots 80 -fa -c 4096
 
 BELLS only helps MoE models (Qwen3-30B-A3B, Qwen3.6-35B, DeepSeek-V3, Flash-Next, etc). Dense models are unaffected.
 
+### Multi-GPU (L2 cache)
+
+Got a second GPU? BELLS can use its VRAM as overflow cache space. All compute stays on GPU 1 — the second GPU just donates its memory.
+
+```sh
+# auto-size from GPU 2's free VRAM
+llama-server -m model.gguf -ngl 99 --cpu-moe --bells-slots 80 --bells-l2-slots -1 -fa
+
+# or set L2 size explicitly
+llama-server -m model.gguf -ngl 99 --cpu-moe --bells-slots 80 --bells-l2-slots 200 -fa
+```
+
+When an expert gets evicted from the primary cache (L1), it goes to L2 on the second GPU instead of being thrown away. Next time that expert is needed, it comes back from GPU 2 VRAM — a deterministic copy, not a page fault from NVMe. On a system where the model is streaming from disk, this is the difference between microseconds and milliseconds.
+
+### How it works
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │              BELLS cache                │
+                    │                                         │
+  Router picks   ┌──────────┐  evict   ┌──────────┐         │
+  expert E       │ L1 cache │ ──────── │ L2 cache │         │
+  ─────────────▶ │  GPU 1   │ ◀─────── │  GPU 2   │         │
+                 │ (compute)│ promote  │ (storage)│         │
+                 └──────────┘          └──────────┘         │
+                      │ miss               │ miss            │
+                      │                    │                 │
+                      ▼                    ▼                 │
+                 ┌──────────┐        ┌──────────┐           │
+                 │ Host RAM │        │  (skip)  │           │
+                 │ or NVMe  │        │          │           │
+                 └──────────┘        └──────────┘           │
+                 (may page fault)                            │
+                 └─────────────────────────────────────────┘
+```
+
+**BELLS is a per-layer VRAM expert cache.** MoE models have hundreds of expert weight matrices spread across dozens of layers, but the router only picks 2–8 per token. Most experts sit idle. BELLS keeps the hot ones in GPU VRAM and streams the rest on demand.
+
+#### The cache hierarchy
+
+1. **L1 (primary GPU)** — the working cache. Experts are loaded here for compute. Sized by `--bells-slots`. Uses LRU eviction with per-layer clock counters.
+
+2. **L2 (secondary GPU)** — a victim cache. When L1 evicts an expert, it goes to L2 instead of being discarded. L2 uses its own LRU policy. Sized by `--bells-l2-slots` (or `-1` for auto, which leaves 512 MB headroom on GPU 2).
+
+3. **Host memory** — the cold tier. Models backed by mmap. Page faults here are the most expensive operation — especially when the model doesn't fit in RAM and pages from NVMe.
+
+#### Data flow for a single expert load
+
+```
+Token arrives → Router selects experts → For each expert not in L1:
+
+  1. EVICTION:  Read victim from L1 slot → staging buffer → write to L2 slot
+                (GPU1 VRAM → host pinned → GPU2 VRAM)
+
+  2. L2 CHECK:  Look up requested expert in L2 index
+                  HIT  → read from L2 → staging → write to L1 slot → done
+                  MISS → fall through to cold path
+
+  3. COLD PATH: Read from host mmap → write to L1 slot
+                (may page fault from NVMe — this is what L2 eliminates)
+```
+
+The staging buffer is a host-side pinned allocation sized to one expert. The eviction read happens **before** the slot is overwritten, so it's always a clean VRAM read — no page faults, no blocking.
+
+#### Key design decisions
+
+- **No compute on GPU 2.** The matmul graph only ever references L1 slots. GPU 2 is invisible to the compute path — it's a dumb buffer with a lookup table.
+- **Per-layer indexing.** Each layer maintains its own L2 slot map (`expert → slot`). This matches the L1 design and avoids cross-layer eviction interference.
+- **Victim cache semantics.** L2 only receives data evicted from L1 (or promoted back). It never loads directly from host. This keeps the L2 population naturally tuned to the model's access pattern.
+- **Backward compatible.** On a single-GPU system, L2 is a no-op. The `bells_copy` struct gained an `evicted` field with a default of `-1`, so all existing code paths are unchanged.
+- **Stats tracking.** BELLS reports L1 hit rate, L2 hit rate, total admits, and total promotions. When L2 is enabled, the periodic timing output shows both tiers.
+
 ---
 
 # llama.cpp

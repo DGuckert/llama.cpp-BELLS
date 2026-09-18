@@ -219,7 +219,7 @@ bool bells_cache::ensure(uint32_t il, const int32_t * experts, size_t n,
         l.expert_slot[e] = s;
         l.last_used[s]   = clock_;
 
-        out.push_back({ e, s });
+        out.push_back({ e, s, evicted });
     }
 
     return true;
@@ -624,6 +624,8 @@ void bells_tensors::warm_lookahead(uint32_t il_next) {
 }
 
 void bells_tensors::free() {
+    free_l2();
+
     if (stage_buf_) {
         if (n_staged_ > 0) {
             fprintf(stderr, "bells_tensors: staged %llu expert copies through pinned memory, "
@@ -665,6 +667,211 @@ void bells_tensors::free() {
 
     vram_bytes_       = 0;
     bytes_per_expert_ = 0;
+}
+
+//
+// L2 cache on secondary GPU
+//
+
+bool bells_tensors::init_l2(ggml_backend_buffer_type_t buft, uint32_t n_l2_slot,
+                            ggml_backend_t l2_backend, uint32_t n_expert) {
+    free_l2();
+
+    if (entries_.empty() || n_l2_slot == 0 || !l2_backend || !buft) {
+        return false;
+    }
+
+    l2_backend_ = l2_backend;
+    l2_n_slot_  = n_l2_slot;
+
+    ggml_init_params ip = { ggml_tensor_overhead() * entries_.size() * 5, nullptr, true };
+    l2_ctx_ = ggml_init(ip);
+    if (!l2_ctx_) {
+        l2_n_slot_ = 0;
+        return false;
+    }
+
+    l2_entries_.resize(entries_.size());
+    l2_info_.resize(entries_.size());
+
+    for (size_t i = 0; i < entries_.size(); ++i) {
+        const entry & e = entries_[i];
+        l2_entry & l2e  = l2_entries_[i];
+
+        l2e.gate    = bells_make_slice(l2_ctx_, e.src.gate,    n_l2_slot);
+        l2e.up      = bells_make_slice(l2_ctx_, e.src.up,      n_l2_slot);
+        l2e.down    = bells_make_slice(l2_ctx_, e.src.down,    n_l2_slot);
+        l2e.gate_up = bells_make_slice(l2_ctx_, e.src.gate_up, n_l2_slot);
+
+        l2_info_[i].expert_slot.assign(n_expert, -1);
+        l2_info_[i].slot_expert.assign(n_l2_slot, -1);
+        l2_info_[i].last_used.assign(n_l2_slot, 0);
+    }
+
+    l2_buf_ = ggml_backend_alloc_ctx_tensors_from_buft(l2_ctx_, buft);
+    if (!l2_buf_) {
+        ggml_free(l2_ctx_);
+        l2_ctx_ = nullptr;
+        l2_entries_.clear();
+        l2_info_.clear();
+        l2_n_slot_ = 0;
+        return false;
+    }
+
+    l2_vram_bytes_ = ggml_backend_buffer_get_size(l2_buf_);
+
+    // zero all L2 slots
+    if (bytes_per_expert_ > 0) {
+        std::vector<char> zeros(bytes_per_expert_, 0);
+        for (auto & l2e : l2_entries_) {
+            for (ggml_tensor * t : { l2e.gate, l2e.up, l2e.down, l2e.gate_up }) {
+                if (!t) continue;
+                const size_t stride = ggml_nbytes(t) / t->ne[2];
+                for (int64_t s = 0; s < t->ne[2]; ++s) {
+                    ggml_backend_tensor_set(t, zeros.data(), (size_t)s * stride, stride);
+                }
+            }
+        }
+    }
+
+    l2_stage_.resize(bytes_per_expert_);
+    l2_clock_ = 0;
+
+    return true;
+}
+
+void bells_tensors::free_l2() {
+    if (l2_n_admit_ > 0 || l2_n_promote_ > 0) {
+        fprintf(stderr, "bells_l2: %llu admits, %llu promotes to L1\n",
+                (unsigned long long)l2_n_admit_, (unsigned long long)l2_n_promote_);
+    }
+
+    if (l2_buf_) {
+        ggml_backend_buffer_free(l2_buf_);
+        l2_buf_ = nullptr;
+    }
+    if (l2_ctx_) {
+        ggml_free(l2_ctx_);
+        l2_ctx_ = nullptr;
+    }
+    l2_entries_.clear();
+    l2_info_.clear();
+    l2_stage_.clear();
+    l2_n_slot_     = 0;
+    l2_vram_bytes_ = 0;
+    l2_backend_    = nullptr;
+    l2_n_admit_    = 0;
+    l2_n_promote_  = 0;
+}
+
+int32_t bells_tensors::l2_victim(const l2_layer_info & info) const {
+    int32_t best     = -1;
+    int64_t best_age = INT64_MAX;
+
+    for (uint32_t s = 0; s < l2_n_slot_; ++s) {
+        if (info.slot_expert[s] < 0) {
+            return (int32_t)s;
+        }
+        if (info.last_used[s] < best_age) {
+            best_age = info.last_used[s];
+            best     = (int32_t)s;
+        }
+    }
+    return best;
+}
+
+int32_t bells_tensors::l2_lookup(uint32_t il, int32_t expert) const {
+    if (!has_l2() || !has(il)) return -1;
+    const int32_t idx = index_[il];
+    if (idx < 0 || (size_t)idx >= l2_info_.size()) return -1;
+    const l2_layer_info & info = l2_info_[idx];
+    if (expert < 0 || (size_t)expert >= info.expert_slot.size()) return -1;
+    return info.expert_slot[expert];
+}
+
+void bells_tensors::l2_admit_from_l1(uint32_t il, int32_t expert, int32_t l1_slot) {
+    if (!has_l2() || !has(il) || expert < 0) return;
+
+    const int32_t idx = index_[il];
+    l2_layer_info & info = l2_info_[idx];
+
+    if ((size_t)expert >= info.expert_slot.size()) return;
+
+    // already in L2 — just touch
+    if (info.expert_slot[expert] >= 0) {
+        info.last_used[info.expert_slot[expert]] = ++l2_clock_;
+        return;
+    }
+
+    const int32_t l2s = l2_victim(info);
+    if (l2s < 0) return;
+
+    // evict current L2 occupant
+    const int32_t old = info.slot_expert[l2s];
+    if (old >= 0) {
+        info.expert_slot[old] = -1;
+    }
+
+    // copy L1 (GPU1) → staging → L2 (GPU2)
+    const entry & e   = entries_[idx];
+    l2_entry & l2e    = l2_entries_[idx];
+
+    struct pair { ggml_tensor * l1; ggml_tensor * l2; };
+    pair pairs[] = {
+        { e.gate,    l2e.gate    },
+        { e.up,      l2e.up      },
+        { e.down,    l2e.down    },
+        { e.gate_up, l2e.gate_up },
+    };
+
+    for (auto & p : pairs) {
+        if (!p.l1 || !p.l2) continue;
+        const size_t stride = ggml_nbytes(p.l1) / p.l1->ne[2];
+        ggml_backend_tensor_get(p.l1, l2_stage_.data(), (size_t)l1_slot * stride, stride);
+        ggml_backend_tensor_set(p.l2, l2_stage_.data(), (size_t)l2s * stride, stride);
+    }
+
+    info.slot_expert[l2s] = expert;
+    info.expert_slot[expert] = l2s;
+    info.last_used[l2s] = ++l2_clock_;
+    l2_n_admit_++;
+}
+
+void bells_tensors::l2_promote(uint32_t il, int32_t expert, int32_t l1_slot) {
+    if (!has_l2() || !has(il) || expert < 0) return;
+
+    const int32_t idx = index_[il];
+    l2_layer_info & info = l2_info_[idx];
+
+    if ((size_t)expert >= info.expert_slot.size()) return;
+
+    const int32_t l2s = info.expert_slot[expert];
+    if (l2s < 0) return;
+
+    const entry & e   = entries_[idx];
+    l2_entry & l2e    = l2_entries_[idx];
+
+    // L2 (GPU2) → staging → L1 (GPU1)
+    struct pair { ggml_tensor * l2; ggml_tensor * l1; };
+    pair pairs[] = {
+        { l2e.gate,    e.gate    },
+        { l2e.up,      e.up      },
+        { l2e.down,    e.down    },
+        { l2e.gate_up, e.gate_up },
+    };
+
+    for (auto & p : pairs) {
+        if (!p.l2 || !p.l1) continue;
+        const size_t stride = ggml_nbytes(p.l2) / p.l2->ne[2];
+        ggml_backend_tensor_get(p.l2, l2_stage_.data(), (size_t)l2s * stride, stride);
+        ggml_backend_tensor_set(p.l1, l2_stage_.data(), (size_t)l1_slot * stride, stride);
+    }
+
+    // remove from L2
+    info.expert_slot[expert] = -1;
+    info.slot_expert[l2s]    = -1;
+    info.last_used[l2s]      = 0;
+    l2_n_promote_++;
 }
 
 void bells_tensors::copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t expert, int32_t slot,
@@ -1569,6 +1776,51 @@ bool bells_runtime::init(const bells_params & params,
     return true;
 }
 
+bool bells_runtime::init_l2(ggml_backend_buffer_type_t buft, ggml_backend_t l2_backend,
+                            uint32_t n_l2_slot) {
+    if (!ready_ || !l2_backend) return false;
+
+    uint32_t n_expert = cache_.n_expert();
+
+    if (n_l2_slot == 0) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(l2_backend);
+        if (!dev) return false;
+
+        size_t free_mem = 0, total_mem = 0;
+        ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+
+        const size_t headroom = 512ull * 1024 * 1024;
+        const size_t budget   = free_mem > headroom ? free_mem - headroom : 0;
+        const size_t per_slot = tensors_.bytes_per_expert() * tensors_.layers().size();
+        if (per_slot == 0) return false;
+
+        n_l2_slot = (uint32_t)std::min<size_t>(n_expert, budget / per_slot);
+
+        fprintf(stderr, "%s: L2 auto-sized to %u slots from %.1f GiB free on %s\n",
+                __func__, n_l2_slot, free_mem / 1024.0 / 1024.0 / 1024.0,
+                ggml_backend_dev_name(dev));
+    }
+
+    n_l2_slot = std::min(n_l2_slot, n_expert);
+
+    if (n_l2_slot == 0) {
+        fprintf(stderr, "%s: L2 disabled, not enough VRAM on secondary GPU\n", __func__);
+        return false;
+    }
+
+    if (!tensors_.init_l2(buft, n_l2_slot, l2_backend, n_expert)) {
+        fprintf(stderr, "%s: failed to allocate L2 cache (%u slots)\n", __func__, n_l2_slot);
+        return false;
+    }
+
+    fprintf(stderr, "%s: L2 cache: %u slots on %s, %.2f GiB VRAM\n",
+            __func__, n_l2_slot,
+            ggml_backend_dev_name(ggml_backend_get_device(l2_backend)),
+            tensors_.l2_vram_bytes() / 1024.0 / 1024.0 / 1024.0);
+
+    return true;
+}
+
 void bells_runtime::free() {
     pf_stop();
 
@@ -1597,6 +1849,19 @@ void bells_runtime::free() {
                 __func__, us_readback_*per, us_copy_*per, us_upload_*per,
                 (unsigned long long) n_layer_calls_,
                 (us_readback_ + us_copy_ + us_upload_)/1000.0);
+    }
+
+    if (tensors_.has_l2()) {
+        const uint64_t l2_tot = l2_n_hit_ + l2_n_miss_;
+        if (l2_tot > 0) {
+            fprintf(stderr, "%s: L2: hit %.1f%% (%llu of %llu L1 misses), "
+                            "%llu admits, %llu promotes\n",
+                    __func__,
+                    100.0 * l2_n_hit_ / l2_tot,
+                    (unsigned long long)l2_n_hit_, (unsigned long long)l2_tot,
+                    (unsigned long long)tensors_.l2_n_admit(),
+                    (unsigned long long)tensors_.l2_n_promote());
+        }
     }
 
     tensors_.free();
@@ -1802,11 +2067,19 @@ bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
     // mattered.
     if ((n_layer_calls_ % 2000) == 0) {
         const double per = 1.0/(double) n_layer_calls_;
-        fprintf(stderr, "bells_timing: per layer-call: readback %.1f us, copy %.1f us, "
-                        "upload %.1f us, hit %.1f%% (%llu calls)\n",
-                us_readback_*per, us_copy_*per, us_upload_*per,
-                100.0*(double) cache_.n_hit()/std::max<uint64_t>(1, cache_.n_hit() + cache_.n_miss()),
-                (unsigned long long) n_layer_calls_);
+        const double l1_rate = 100.0*(double) cache_.n_hit()/std::max<uint64_t>(1, cache_.n_hit() + cache_.n_miss());
+        if (tensors_.has_l2()) {
+            const double l2_rate = 100.0*(double) l2_n_hit_/std::max<uint64_t>(1, l2_n_hit_ + l2_n_miss_);
+            fprintf(stderr, "bells_timing: per layer-call: readback %.1f us, copy %.1f us, "
+                            "upload %.1f us, L1 hit %.1f%%, L2 hit %.1f%% (%llu calls)\n",
+                    us_readback_*per, us_copy_*per, us_upload_*per,
+                    l1_rate, l2_rate, (unsigned long long) n_layer_calls_);
+        } else {
+            fprintf(stderr, "bells_timing: per layer-call: readback %.1f us, copy %.1f us, "
+                            "upload %.1f us, hit %.1f%% (%llu calls)\n",
+                    us_readback_*per, us_copy_*per, us_upload_*per,
+                    l1_rate, (unsigned long long) n_layer_calls_);
+        }
         fflush(stderr);
     }
 
@@ -1867,6 +2140,21 @@ bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
     // concurrency 1-4 became 0.88/0.94/0.93x. Its only win was GPT-OSS-120B, a configuration
     // BELLS loses at anyway, so it never converted a loss into a win. See RESULTS.md.
     for (const auto & c : copies_) {
+        // demote evicted expert to L2 before its L1 slot is overwritten
+        if (tensors_.has_l2() && c.evicted >= 0) {
+            tensors_.l2_admit_from_l1(il, c.evicted, c.slot);
+        }
+
+        // check L2 before falling back to a host copy
+        if (tensors_.has_l2()) {
+            if (tensors_.l2_lookup(il, c.expert) >= 0) {
+                tensors_.l2_promote(il, c.expert, c.slot);
+                l2_n_hit_++;
+                continue;
+            }
+            l2_n_miss_++;
+        }
+
         tensors_.copy_expert(il, c.expert, c.slot);
     }
     n_copied_ += copies_.size();

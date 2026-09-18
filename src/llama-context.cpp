@@ -771,6 +771,38 @@ llama_context::llama_context(
                 LLAMA_LOG_WARN("%s: BELLS disabled\n", __func__);
                 bells.reset();
             }
+
+            // L2 cache on a secondary GPU
+            if (bells && bells->ready() && params.bells_l2_n_slot != 0) {
+                ggml_backend_dev_t primary_dev = ggml_backend_get_device(backends.front().get());
+                ggml_backend_dev_t l2_dev = nullptr;
+
+                for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                    ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                    auto dt = ggml_backend_dev_type(dev);
+                    if ((dt == GGML_BACKEND_DEVICE_TYPE_GPU || dt == GGML_BACKEND_DEVICE_TYPE_IGPU)
+                        && dev != primary_dev) {
+                        l2_dev = dev;
+                        break;
+                    }
+                }
+
+                if (l2_dev) {
+                    ggml_backend_t l2_be = ggml_backend_dev_init(l2_dev, nullptr);
+                    if (l2_be) {
+                        ggml_backend_buffer_type_t l2_buft = ggml_backend_get_default_buffer_type(l2_be);
+                        uint32_t l2_slots = params.bells_l2_n_slot == UINT32_MAX ? 0 : params.bells_l2_n_slot;
+                        if (bells->init_l2(l2_buft, l2_be, l2_slots)) {
+                            bells_l2_backend.reset(l2_be);
+                            LLAMA_LOG_INFO("%s: BELLS L2 cache on %s\n", __func__, ggml_backend_dev_name(l2_dev));
+                        } else {
+                            ggml_backend_free(l2_be);
+                        }
+                    }
+                } else {
+                    LLAMA_LOG_WARN("%s: --bells-l2-slots requires a second GPU, none found\n", __func__);
+                }
+            }
         }
     }
 }

@@ -402,6 +402,7 @@ extern "C" {
         bool         bells_passive; // research: allocate and split, but do not use the cache
         uint32_t     bells_refresh; // observe a rotating 1/N of MoE layers per token, 1 = all
         uint32_t     bells_split;   // experts per token on the GPU cache; rest run on the CPU
+        uint32_t     bells_l2_n_slot; // L2 cache slots on a secondary GPU, 0 = off
 
         // comma-separated tensor-name substrings to keep out of the working set, NULL = none.
         // for weights read once per use (a per-token lookup table), the page cache's LRU keeps

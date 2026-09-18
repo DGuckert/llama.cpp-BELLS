@@ -2856,6 +2856,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_BELLS_PASSIVE"));
     add_opt(common_arg(
+        {"--bells-l2-slots"}, "N",
+        "BELLS: use a secondary GPU's VRAM as an L2 expert cache. N experts per layer are cached "
+        "on the secondary GPU; evicted L1 experts are demoted there instead of discarded. On a "
+        "future miss, data is copied from GPU2 (guaranteed resident) instead of host RAM (which may "
+        "page-fault from NVMe). Use -1 to auto-size from the secondary GPU's free VRAM",
+        [](common_params & params, int value) {
+            params.bells_enabled    = true;
+            // -1 means auto-size from free VRAM; 0 is stored as UINT32_MAX so the
+            // context code knows L2 was requested and passes 0 to init_l2 for auto-sizing
+            params.bells_l2_n_slot  = value > 0 ? (uint32_t) value : UINT32_MAX;
+        }
+    ).set_env("LLAMA_ARG_BELLS_L2_SLOTS"));
+    add_opt(common_arg(
         {"--pin-experts"}, "FILE",
         "seat the hottest experts per layer permanently in the BELLS cache, using a usage CSV "
         "from --moe-stats, instead of admitting on demand. Routing is heavily skewed, so the same "

@@ -1,124 +1,55 @@
-# BELLS — per-expert VRAM caching for MoE models
+# BELLS
 
-> Fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). Upstream README follows below.
+**Run 177B models on a single GPU. No quality loss.**
 
-Mixture-of-Experts models activate a few experts per token but store hundreds. BELLS keeps the
-**N hottest experts per layer cached in VRAM** and streams misses from host memory (RAM or NVMe
-via mmap). Every routed expert is computed — no quality loss.
+BELLS is a [llama.cpp](https://github.com/ggml-org/llama.cpp) fork that adds a per-layer VRAM expert cache for Mixture-of-Experts models. Instead of keeping all experts in VRAM (impossible) or running them on the CPU (slow), BELLS caches the hot experts on your GPU and streams the rest from RAM or NVMe on demand. Every expert the router picks still gets computed — nothing is skipped or approximated.
 
-Works on **NVIDIA (CUDA)**, **AMD / Intel / any Vulkan GPU**, and CPU. Models larger than both
-VRAM and RAM run from NVMe transparently.
+### What you get
 
-## Results
+| model | GPU | without BELLS | with BELLS |
+|---|---|---:|---:|
+| Qwen3.6-35B Q4 | RTX 3060 12 GB | 32.5 tok/s | **60.9 tok/s** |
+| Qwen3.6-35B Q4 | RTX 2060 6 GB | — | **36.3 tok/s** |
+| Flash-Next 177B Q2 | RTX 3060 12 GB | 14.7 tok/s | **32.9 tok/s** |
 
-All measurements are median of 3 runs, warmed, temperature 0, verified non-repeating output.
-
-### Qwen3.6-35B-A3B Q4_K_M — RTX 3060 12 GB, 32 GB DDR4
-
-| configuration | decode tok/s |
-|---|---:|
-| `--cpu-moe-pinned`, no BELLS | 32.5 |
-| BELLS 64 slots | 43.5 |
-| **BELLS 112 slots** | **60.9** |
-| BELLS 112 slots + n-gram speculation + snapshots | 141.4 (repeated pattern) |
-
-### Qwen3.6-35B-A3B Q4_K_M — RTX 2060 6 GB, 32 GB DDR4
-
-| configuration | decode tok/s |
-|---|---:|
-| **BELLS 48 slots, LRU** | **36.3** |
-
-### Qwen3.8-Flash-Next 177B UD-Q2_K_XL — RTX 3060 12 GB, 32 GB DDR4
-
-Model is ~60 GB on disk, streamed from NVMe. Does not fit in RAM.
-
-| configuration | decode tok/s |
-|---|---:|
-| BELLS off | 14.7 |
-| **BELLS 64 slots, LRU** | **26.3** |
-| BELLS 64 slots + speculative retention | 32.9 |
-
-## Quick start
+32 GB DDR4, models streamed from NVMe. The 177B doesn't even fit in RAM.
 
 ### Build
 
 ```sh
-# NVIDIA (CUDA)
-cmake -B build -DGGML_CUDA=ON
-cmake --build build --config Release
+# NVIDIA
+cmake -B build -DGGML_CUDA=ON && cmake --build build --config Release
 
-# AMD / Intel / any GPU (Vulkan)
-cmake -B build -DGGML_VULKAN=ON
-cmake --build build --config Release
+# AMD / Intel / any Vulkan GPU
+cmake -B build -DGGML_VULKAN=ON && cmake --build build --config Release
 ```
 
-### Run
+### Use
 
 ```sh
-# Automatic cache sizing
-llama-cli -m model.gguf -ngl 99 --cpu-moe-pinned --bells -fa
+# just works — auto-sizes the cache to your VRAM
+llama-server -m model.gguf -ngl 99 --cpu-moe --bells -fa
 
-# Manual cache sizing
-llama-cli -m model.gguf -ngl 99 --cpu-moe-pinned --bells-slots 80 -fa
+# or set the cache size yourself
+llama-server -m model.gguf -ngl 99 --cpu-moe --bells-slots 80 -fa -c 4096
 
-# API server
+# pinned memory is faster when the model fits in RAM
 llama-server -m model.gguf -ngl 99 --cpu-moe-pinned --bells-slots 80 -fa -c 4096
-
-# NVMe streaming (model larger than RAM)
-llama-cli -m model.gguf -ngl 99 --cpu-moe --bells-slots 60 -fa
 ```
 
-Use `--cpu-moe-pinned` when the model fits in RAM (faster transfers). Use `--cpu-moe` when it
-doesn't (falls back to pageable/mmap).
+`--bells-slots` controls how many experts per layer stay resident on the GPU. More slots = more VRAM = fewer misses = faster. Start high and lower it if you run out of memory.
 
-## Flags
+**Note:** `-ot` rules must come **before** `--cpu-moe` on the command line. The first matching override wins, so an `-ot` placed after `--cpu-moe` is silently ignored.
 
-| flag | what it does |
+| VRAM | start with |
 |---|---|
-| `--bells-slots N` | cache N experts per layer in VRAM |
-| `--bells` | auto-size from free VRAM |
-| `--bells-retention` | speculative retention using draft hints and routing history |
-| `--bells-passive` | allocate cache but don't use it (overhead measurement) |
-| `--cpu-moe-pinned` | host experts in pinned memory (faster H2D, needs RAM) |
-| `--cpu-moe` | host experts in pageable memory (works with mmap/NVMe) |
-| `--pin-experts FILE` | pin hot experts from a `--moe-stats` CSV |
-| `-ot "pattern=Backend"` | route specific tensors to a backend (e.g. Vulkan0) |
+| 6 GB | `--bells-slots 30` |
+| 8 GB | `--bells-slots 60` |
+| 12 GB | `--bells-slots 100` |
+| 16 GB | `--bells-slots 120` |
+| 24 GB | `--bells-slots 200` |
 
-### Tuning
-
-More slots = more VRAM = fewer cache misses = faster. Start high and lower if you OOM.
-
-| GPU VRAM | suggested `--bells-slots` |
-|---|---|
-| 4 GB | 20–30 |
-| 6 GB | 30–50 |
-| 8 GB | 50–80 |
-| 12 GB | 80–120 |
-| 16 GB | 100–150 |
-| 24 GB | 150–256 |
-
-These are starting points. Actual fit depends on model size, quant, and context length.
-
-## Recommended models
-
-BELLS benefits MoE (Mixture-of-Experts) models only. Dense models see no effect.
-
-| model | size on disk (Q4) | active params | notes |
-|---|---|---|---|
-| Qwen3-30B-A3B | ~17 GB | 3B | fast, fits most GPUs without BELLS |
-| Qwen3.6-35B-A3B | ~19 GB | 3B | best quality/speed, sweet spot for 6–12 GB |
-| Qwen3.8-Flash-Next 177B | ~60–100 GB | — | needs NVMe streaming on consumer hardware |
-
-## How it works
-
-1. Model loads with experts in host memory (`--cpu-moe` / `--cpu-moe-pinned`)
-2. BELLS allocates a fixed-size GPU cache of N expert slots per layer
-3. At each MoE layer, routing is read back from the GPU
-4. Cache hits: expert runs from GPU cache (fast)
-5. Cache misses: expert is copied host→GPU, evicting the least-recently-used slot
-6. A slot table is uploaded so `mul_mat_id` indexes the cache, not the full expert array
-
-Every expert selected by the router is computed. The cache is lossless.
+BELLS only helps MoE models (Qwen3-30B-A3B, Qwen3.6-35B, DeepSeek-V3, Flash-Next, etc). Dense models are unaffected.
 
 ---
 

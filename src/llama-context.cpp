@@ -340,6 +340,37 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
+        // add GPU backends for devices used by tensor overrides (-ot) but not in model.devices
+        if (model.has_tensor_overrides()) {
+            auto mem = model.memory_breakdown();
+            for (const auto & [buft, size] : mem) {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                if (!dev) {
+                    continue;
+                }
+                auto dev_type = ggml_backend_dev_type(dev);
+                if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU && dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    continue;
+                }
+                bool already_added = false;
+                for (const auto & existing : backends) {
+                    if (ggml_backend_get_device(existing.get()) == dev) {
+                        already_added = true;
+                        break;
+                    }
+                }
+                if (!already_added) {
+                    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+                    if (backend == nullptr) {
+                        LLAMA_LOG_WARN("%s: failed to initialize %s backend for tensor override\n", __func__, ggml_backend_dev_name(dev));
+                    } else {
+                        LLAMA_LOG_INFO("%s: adding %s backend for tensor overrides\n", __func__, ggml_backend_dev_name(dev));
+                        backends.emplace_back(backend);
+                    }
+                }
+            }
+        }
+
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -736,7 +767,7 @@ llama_context::llama_context(
 
             bells = std::make_unique<bells_runtime>();
             if (!bells->init(bp, buft, srcs, model.hparams.n_expert,
-                             model.hparams.n_expert_used, backends.front().get(), copy_backend)) {
+                             model.hparams.n_expert_used(), backends.front().get(), copy_backend)) {
                 LLAMA_LOG_WARN("%s: BELLS disabled\n", __func__);
                 bells.reset();
             }

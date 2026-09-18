@@ -49,6 +49,19 @@ llama-server -m model.gguf -ngl 99 --cpu-moe-pinned --bells-slots 80 -fa -c 4096
 | 16 GB | `--bells-slots 120` |
 | 24 GB | `--bells-slots 200` |
 
+### All flags
+
+| flag | description |
+|---|---|
+| `--cpu-moe` | Keep all MoE expert weights on the CPU. Required for BELLS. |
+| `--cpu-moe-pinned` | Like `--cpu-moe`, but pin expert weights in host memory (no mmap). Faster copies, but the model must fit in RAM. Don't use when streaming from NVMe. |
+| `--bells` | Enable BELLS with auto-sized cache (equivalent to `--bells-slots -1`). |
+| `--bells-slots N` | Cache N experts per layer in VRAM. `-1` to auto-size from free VRAM. More slots = more VRAM = fewer misses. |
+| `--bells-l2-slots N` | Use a secondary GPU's VRAM as L2 victim cache. N experts per layer on GPU 2. `-1` to auto-size. Single-GPU systems ignore this. |
+| `--bells-split K` | Run K of each token's experts on GPU, the rest on CPU concurrently. The MoE output is a weighted sum, so splitting is exact — no quality loss. Fewer experts need to be resident, so the cache covers more. Default: 0 (all experts through the cache). |
+| `--bells-refresh N` | Observe a rotating 1/N of MoE layers per token instead of every layer. Reduces graph split overhead (~2.3 ms/token across 32 layers). Default: 1 (observe every layer). |
+| `--bells-passive` | Research only. Allocate the cache and take the graph splits, but copy nothing and leave matmuls on the full expert stack. Measures mechanism overhead in isolation. |
+
 BELLS only helps MoE models (Qwen3-30B-A3B, Qwen3.6-35B, DeepSeek-V3, Flash-Next, etc). Dense models are unaffected.
 
 ### Multi-GPU (L2 cache)

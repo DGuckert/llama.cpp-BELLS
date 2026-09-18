@@ -1,96 +1,124 @@
-# BELLS — a per-expert VRAM cache for MoE models
+# BELLS — per-expert VRAM caching for MoE models
 
-> This is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). The upstream README follows
-> below. Everything in this section is specific to the fork.
+> Fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). Upstream README follows below.
 
-A Mixture-of-Experts model activates a few experts per token but has to *store* all of them. When
-the expert weights do not fit in VRAM, llama.cpp keeps them in host memory (`--cpu-moe`) and the
-expert matmuls run on the CPU. BELLS instead keeps the **N hottest experts per layer resident in
-VRAM** and rewrites the routing ids to index that small cache, so most expert work runs on the GPU
-and only misses are fetched.
+Mixture-of-Experts models activate a few experts per token but store hundreds. BELLS keeps the
+**N hottest experts per layer cached in VRAM** and streams misses from host memory (RAM or NVMe
+via mmap). Every routed expert is computed — no quality loss.
 
-Routing is read back at each MoE layer, the cache is updated, and an expert→slot table is uploaded
-for the graph to index through. Non-resident experts are redirected to a spare zeroed slot rather
-than out of bounds.
+Works on **NVIDIA (CUDA)**, **AMD / Intel / any Vulkan GPU**, and CPU. Models larger than both
+VRAM and RAM run from NVMe transparently.
 
-## Measured results
+## Results
 
-RTX 3060 12 GB, 32 GB RAM, Qwen3.6-35B-A3B Q4_K_M (40 layers, 256 experts, 8 active, 21 GB of
-weights of which 19.5 GB are experts):
+All measurements are median of 3 runs, warmed, temperature 0, verified non-repeating output.
 
-| configuration | decode | prefill |
-|---|---|---|
-| `--cpu-moe-pinned` alone | 35.7 tok/s | — |
-| **+ BELLS 88 slots + 8 layers via `-ot`** | **~70 tok/s** | **~545 tok/s** |
+### Qwen3.6-35B-A3B Q4_K_M — RTX 3060 12 GB, 32 GB DDR4
 
-**BELLS is worth ~2x on this model, losslessly** — quality is identical to running without it,
-because every routed expert is made resident before the matmul reads it.
+| configuration | decode tok/s |
+|---|---:|
+| `--cpu-moe-pinned`, no BELLS | 32.5 |
+| BELLS 64 slots | 43.5 |
+| **BELLS 112 slots** | **60.9** |
+| BELLS 112 slots + n-gram speculation + snapshots | 141.4 (repeated pattern) |
 
-On Qwen3.8-Flash-Next (177B, 512 experts per layer) a 12 GB card covers only ~12% of the routing
-space, so most tokens miss. Historically BELLS measured *slower* than baseline there, because a
-miss paid a host→device copy **on top of** the same host read `--cpu-moe` would have done anyway —
-a miss cost more than having no cache at all.
+### Qwen3.6-35B-A3B Q4_K_M — RTX 2060 6 GB, 32 GB DDR4
 
-`--bells-split` fixes that by giving misses a CPU path, so a hit is faster and a miss costs exactly
-what `--cpu-moe` costs. With `--bells-slots 64 --bells-split 3` the 177B measures **12.17 tok/s
-against an 11.40 baseline (+6.8%)**, with copies falling from 1947 µs to 648 µs per layer-call.
-Modest, but it is the first configuration where the cache is net-positive on a model this size.
+| configuration | decode tok/s |
+|---|---:|
+| **BELLS 48 slots, LRU** | **36.3** |
 
-**The dividing line is cache coverage as a fraction of the routing space**, not model size.
+### Qwen3.8-Flash-Next 177B UD-Q2_K_XL — RTX 3060 12 GB, 32 GB DDR4
+
+Model is ~60 GB on disk, streamed from NVMe. Does not fit in RAM.
+
+| configuration | decode tok/s |
+|---|---:|
+| BELLS off | 14.7 |
+| **BELLS 64 slots, LRU** | **26.3** |
+| BELLS 64 slots + speculative retention | 32.9 |
+
+## Quick start
+
+### Build
+
+```sh
+# NVIDIA (CUDA)
+cmake -B build -DGGML_CUDA=ON
+cmake --build build --config Release
+
+# AMD / Intel / any GPU (Vulkan)
+cmake -B build -DGGML_VULKAN=ON
+cmake --build build --config Release
+```
+
+### Run
+
+```sh
+# Automatic cache sizing
+llama-cli -m model.gguf -ngl 99 --cpu-moe-pinned --bells -fa
+
+# Manual cache sizing
+llama-cli -m model.gguf -ngl 99 --cpu-moe-pinned --bells-slots 80 -fa
+
+# API server
+llama-server -m model.gguf -ngl 99 --cpu-moe-pinned --bells-slots 80 -fa -c 4096
+
+# NVMe streaming (model larger than RAM)
+llama-cli -m model.gguf -ngl 99 --cpu-moe --bells-slots 60 -fa
+```
+
+Use `--cpu-moe-pinned` when the model fits in RAM (faster transfers). Use `--cpu-moe` when it
+doesn't (falls back to pageable/mmap).
 
 ## Flags
 
 | flag | what it does |
 |---|---|
-| `--bells-slots N` | keep N experts per layer resident. Use with `--cpu-moe` / `--cpu-moe-pinned` |
-| `--bells` | same, sized automatically from free VRAM |
-| `--bells-passive` | allocate the cache and take the readback, but never use it — isolates the fixed cost of the mechanism |
-| `--moe-stats FILE` | write a CSV of how often, and with how much routing weight, each expert is used |
-| `--pin-experts FILE` | seat the measured-hottest experts permanently, from a `--moe-stats` CSV |
-| `--bells-split K` | run K of each token's experts on the GPU from the cache and the rest on the CPU from host weights. Exact — splitting a weighted sum costs no quality |
-| `--bells-refresh N` | **research only, degrades output** — observe only every Nth layer |
+| `--bells-slots N` | cache N experts per layer in VRAM |
+| `--bells` | auto-size from free VRAM |
+| `--bells-retention` | speculative retention using draft hints and routing history |
+| `--bells-passive` | allocate cache but don't use it (overhead measurement) |
+| `--cpu-moe-pinned` | host experts in pinned memory (faster H2D, needs RAM) |
+| `--cpu-moe` | host experts in pageable memory (works with mmap/NVMe) |
+| `--pin-experts FILE` | pin hot experts from a `--moe-stats` CSV |
+| `-ot "pattern=Backend"` | route specific tensors to a backend (e.g. Vulkan0) |
 
-Working configuration for the model above:
+### Tuning
 
-```sh
-llama-server -m model.gguf -ngl 99 -c 65536 -t 8 \
-  -ot "blk\.[0-7]\.ffn_.*_exps=CUDA0" --cpu-moe-pinned --bells-slots 88 \
-  -fa on -ctk q8_0 -ctv q8_0
-```
+More slots = more VRAM = fewer cache misses = faster. Start high and lower if you OOM.
 
-`-ot` **must come before** `--cpu-moe`: the first matching tensor-override rule wins, so an `-ot`
-placed after it is silently ignored.
+| GPU VRAM | suggested `--bells-slots` |
+|---|---|
+| 4 GB | 20–30 |
+| 6 GB | 30–50 |
+| 8 GB | 50–80 |
+| 12 GB | 80–120 |
+| 16 GB | 100–150 |
+| 24 GB | 150–256 |
 
-## Things worth knowing
+These are starting points. Actual fit depends on model size, quant, and context length.
 
-- **Context allocation is nearly free, until it isn't.** `-c` of 8k/32k/64k all keep the full cache
-  and decode identically. At `-c 131072` the KV allocation squeezes the cache out entirely and
-  decode halves. After changing `-c`, check the `slots/layer of` line still appears.
-- **Decode degrades with *used* context, prefill barely does** — 69 tok/s empty, 61 at 16k, 51 at
-  40k, against prefill 545 → 517. Decode re-reads the whole KV every token.
-- **Prefill takes no graph splits.** BELLS only serves small ubatches, so the routing read during
-  prefill was discarded; skipping it is worth ~20% prefill and costs nothing.
-- **Prefetching cannot help much here.** Instrumented per layer-call: readback ~13 µs, copy ~7 µs,
-  upload ~13 µs. Copy is the only part that scales with misses and it is ~0.25 ms/token of a
-  ~14.7 ms budget, so a perfect predictor buys under 2%.
-- **A better expert-selection heuristic does not exist.** Ranking a static table by summed routing
-  weight instead of by occurrence count gains +0.9%; the two are near-perfectly correlated because
-  every pick averages ~1/8 of the weight.
-- **Routing is not predictable across tokens.** Only 35–40% of a token's experts were used by the
-  previous token; over a 10-token window it is 63–70%. So experts *rotate* rather than repeat, and
-  retaining beats predicting — which is why LRU outperforms static frequency pinning, and why a
-  recency-driven prefetcher is not worth building.
-- **The CPU and GPU cannot be used at the same time within a token.** `ggml_backend_sched` executes
-  graph splits sequentially: with an MoE layer deliberately split across both devices, only 1 of 68
-  samples had both above 50%. Any "use the idle GPU alongside the CPU" scheme yields
-  `GPU + CPU` time, not `max(GPU, CPU)`.
-- **Pinned staging does not rescue pageable copies.** `cudaMemcpyAsync` from pageable memory blocks
-  (164.9 µs/layer-call against 5.3 µs from pinned), but staging through a pinned ring measured
-  *slower* on both models — the 177B's 1937 µs copies are dominated by NVMe page faults, not the
-  transfer path. Opt-in behind `BELLS_STAGE=1`, kept only for the record.
+## Recommended models
 
-Set `GGML_SCHED_DEBUG=2` with `-lv 10` to see per-node backend assignment — the fastest way to
-answer "where is this op actually running".
+BELLS benefits MoE (Mixture-of-Experts) models only. Dense models see no effect.
+
+| model | size on disk (Q4) | active params | notes |
+|---|---|---|---|
+| Qwen3-30B-A3B | ~17 GB | 3B | fast, fits most GPUs without BELLS |
+| Qwen3.6-35B-A3B | ~19 GB | 3B | best quality/speed, sweet spot for 6–12 GB |
+| Qwen3.8-Flash-Next 177B | ~60–100 GB | — | needs NVMe streaming on consumer hardware |
+
+## How it works
+
+1. Model loads with experts in host memory (`--cpu-moe` / `--cpu-moe-pinned`)
+2. BELLS allocates a fixed-size GPU cache of N expert slots per layer
+3. At each MoE layer, routing is read back from the GPU
+4. Cache hits: expert runs from GPU cache (fast)
+5. Cache misses: expert is copied host→GPU, evicting the least-recently-used slot
+6. A slot table is uploaded so `mul_mat_id` indexes the cache, not the full expert array
+
+Every expert selected by the router is computed. The cache is lossless.
 
 ---
 

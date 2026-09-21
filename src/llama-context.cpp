@@ -4331,6 +4331,7 @@ llama_context_params llama_context_default_params() {
         /*.bells_passive               =*/ false,
         /*.bells_refresh               =*/ 1,
         /*.bells_split                 =*/ 0,
+        /*.bells_l2_n_slot             =*/ 0,
         /*.cold_tensors                =*/ nullptr,
         /*.moe_prefetch                =*/ 0,
         /*.moe_stats                   =*/ nullptr,

@@ -582,6 +582,7 @@ struct common_params {
     uint32_t    bells_refresh = 1;  // observe a rotating 1/N of MoE layers per token
     uint32_t    bells_split = 0;    // experts per token on the GPU cache; rest on the CPU
     uint32_t    bells_l2_n_slot = 0; // L2 cache slots on a secondary GPU, 0 = off
+    ggml_type   bells_cache_type = GGML_TYPE_COUNT; // cache quant override, COUNT = same as model
     std::string cold_tensors = "";  // tensor-name substrings to keep out of the working set
     uint32_t    moe_prefetch = 0;   // routing-informed expert prefetch, experts/layer, 0 = off
     std::string moe_stats = "";     // CSV path for expert usage counts, measurement only

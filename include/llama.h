@@ -403,6 +403,10 @@ extern "C" {
         uint32_t     bells_refresh; // observe a rotating 1/N of MoE layers per token, 1 = all
         uint32_t     bells_split;   // experts per token on the GPU cache; rest run on the CPU
         uint32_t     bells_l2_n_slot; // L2 cache slots on a secondary GPU, 0 = off
+        enum ggml_type bells_cache_type; // store cached experts at this quant type instead of the
+                                         // model's own type. A smaller type fits more experts in the
+                                         // same VRAM at the cost of some precision on cached experts.
+                                         // GGML_TYPE_COUNT = use the model's type (default)
 
         // comma-separated tensor-name substrings to keep out of the working set, NULL = none.
         // for weights read once per use (a per-token lookup table), the page cache's LRU keeps

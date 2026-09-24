@@ -1,0 +1,674 @@
+{
+  "model": "A:\\bells-models\\Qwen3.6-35B-A3B-abliterated-v4-Q4_K_M.gguf",
+  "context": 65536,
+  "profile": "long",
+  "timestamp": "20260922_002359",
+  "results": [
+    {
+      "label": "baseline",
+      "flags": [
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": true,
+      "error": "OOM",
+      "duration_s": 50.9
+    },
+    {
+      "label": "cpu-moe-pinned",
+      "flags": [
+        "--cpu-moe-pinned",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.2
+    },
+    {
+      "label": "cpu-moe (mmap)",
+      "flags": [
+        "--cpu-moe",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.2
+    },
+    {
+      "label": "-ot 1 experts",
+      "flags": [
+        "-ot",
+        "blk\\.(0)\\.ffn_.*_exps=CUDA0",
+        "--cpu-moe-pinned",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.1
+    },
+    {
+      "label": "-ot 2 experts",
+      "flags": [
+        "-ot",
+        "blk\\.(0|1)\\.ffn_.*_exps=CUDA0",
+        "--cpu-moe-pinned",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 300.9
+    },
+    {
+      "label": "-ot 3 experts",
+      "flags": [
+        "-ot",
+        "blk\\.(0|1|2)\\.ffn_.*_exps=CUDA0",
+        "--cpu-moe-pinned",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 300.9
+    },
+    {
+      "label": "-ot 4 experts",
+      "flags": [
+        "-ot",
+        "blk\\.(0|1|2|3)\\.ffn_.*_exps=CUDA0",
+        "--cpu-moe-pinned",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 300.9
+    },
+    {
+      "label": "-ot 5 experts",
+      "flags": [
+        "-ot",
+        "blk\\.(0|1|2|3|4)\\.ffn_.*_exps=CUDA0",
+        "--cpu-moe-pinned",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 300.9
+    },
+    {
+      "label": "-ot 6 experts",
+      "flags": [
+        "-ot",
+        "blk\\.(0|1|2|3|4|5)\\.ffn_.*_exps=CUDA0",
+        "--cpu-moe-pinned",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.0
+    },
+    {
+      "label": "-ot 7 experts",
+      "flags": [
+        "-ot",
+        "blk\\.(0|1|2|3|4|5|6)\\.ffn_.*_exps=CUDA0",
+        "--cpu-moe-pinned",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.0
+    },
+    {
+      "label": "-ot 8 experts",
+      "flags": [
+        "-ot",
+        "blk\\.(0|1|2|3|4|5|6|7)\\.ffn_.*_exps=CUDA0",
+        "--cpu-moe-pinned",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.1
+    },
+    {
+      "label": "-ot 10 experts",
+      "flags": [
+        "-ot",
+        "blk\\.(0|1|2|3|4|5|6|7|8|9)\\.ffn_.*_exps=CUDA0",
+        "--cpu-moe-pinned",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.1
+    },
+    {
+      "label": "-ot 12 experts",
+      "flags": [
+        "-ot",
+        "blk\\.(0|1|2|3|4|5|6|7|8|9|10|11)\\.ffn_.*_exps=CUDA0",
+        "--cpu-moe-pinned",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.2
+    },
+    {
+      "label": "-ot 16 experts",
+      "flags": [
+        "-ot",
+        "blk\\.(0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15)\\.ffn_.*_exps=CUDA0",
+        "--cpu-moe-pinned",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.2
+    },
+    {
+      "label": "bells 10 slots",
+      "flags": [
+        "--cpu-moe-pinned",
+        "--bells-slots",
+        "10",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.1
+    },
+    {
+      "label": "bells 15 slots",
+      "flags": [
+        "--cpu-moe-pinned",
+        "--bells-slots",
+        "15",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.0
+    },
+    {
+      "label": "bells 20 slots",
+      "flags": [
+        "--cpu-moe-pinned",
+        "--bells-slots",
+        "20",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.0
+    },
+    {
+      "label": "bells 25 slots",
+      "flags": [
+        "--cpu-moe-pinned",
+        "--bells-slots",
+        "25",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.0
+    },
+    {
+      "label": "bells 30 slots",
+      "flags": [
+        "--cpu-moe-pinned",
+        "--bells-slots",
+        "30",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.0
+    },
+    {
+      "label": "bells 33 slots",
+      "flags": [
+        "--cpu-moe-pinned",
+        "--bells-slots",
+        "33",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.0
+    },
+    {
+      "label": "bells 40 slots",
+      "flags": [
+        "--cpu-moe-pinned",
+        "--bells-slots",
+        "40",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.1
+    },
+    {
+      "label": "bells 48 slots",
+      "flags": [
+        "--cpu-moe-pinned",
+        "--bells-slots",
+        "48",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.1
+    },
+    {
+      "label": "bells 56 slots",
+      "flags": [
+        "--cpu-moe-pinned",
+        "--bells-slots",
+        "56",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 305.7
+    },
+    {
+      "label": "bells 64 slots",
+      "flags": [
+        "--cpu-moe-pinned",
+        "--bells-slots",
+        "64",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.2
+    },
+    {
+      "label": "bells 80 slots",
+      "flags": [
+        "--cpu-moe-pinned",
+        "--bells-slots",
+        "80",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.4
+    },
+    {
+      "label": "bells 96 slots",
+      "flags": [
+        "--cpu-moe-pinned",
+        "--bells-slots",
+        "96",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.5
+    },
+    {
+      "label": "bells 128 slots",
+      "flags": [
+        "--cpu-moe-pinned",
+        "--bells-slots",
+        "128",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.9
+    },
+    {
+      "label": "bells 40 refresh 2",
+      "flags": [
+        "--cpu-moe-pinned",
+        "--bells-slots",
+        "40",
+        "--bells-refresh",
+        "2",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.0
+    },
+    {
+      "label": "bells 40 refresh 4",
+      "flags": [
+        "--cpu-moe-pinned",
+        "--bells-slots",
+        "40",
+        "--bells-refresh",
+        "4",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 300.9
+    },
+    {
+      "label": "bells 40 refresh 8",
+      "flags": [
+        "--cpu-moe-pinned",
+        "--bells-slots",
+        "40",
+        "--bells-refresh",
+        "8",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.1
+    },
+    {
+      "label": "eu 6 (was 8)",
+      "flags": [
+        "--cpu-moe-pinned",
+        "--override-kv",
+        "general.expert_used_count=int:6",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.0
+    },
+    {
+      "label": "eu 4 (was 8)",
+      "flags": [
+        "--cpu-moe-pinned",
+        "--override-kv",
+        "general.expert_used_count=int:4",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 301.0
+    },
+    {
+      "label": "kv q8_0",
+      "flags": [
+        "--cpu-moe-pinned",
+        "-ctk",
+        "q8_0",
+        "-ctv",
+        "q8_0",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 300.9
+    },
+    {
+      "label": "kv q4_0",
+      "flags": [
+        "--cpu-moe-pinned",
+        "-ctk",
+        "q4_0",
+        "-ctv",
+        "q4_0",
+        "-fa",
+        "on",
+        "-t",
+        "8"
+      ],
+      "context": 65536,
+      "prompt_tps": 0.0,
+      "gen_tps": 0.0,
+      "load_time_ms": 0.0,
+      "oom": false,
+      "error": "timeout",
+      "duration_s": 300.9
+    }
+  ],
+  "best": {
+    "label": "cpu-moe-pinned",
+    "flags": [
+      "--cpu-moe-pinned",
+      "-fa",
+      "on",
+      "-t",
+      "8"
+    ],
+    "context": 65536,
+    "prompt_tps": 0.0,
+    "gen_tps": 0.0,
+    "load_time_ms": 0.0,
+    "oom": false,
+    "error": "timeout",
+    "duration_s": 301.2
+  }
+}

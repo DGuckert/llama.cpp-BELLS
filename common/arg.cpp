@@ -2794,6 +2794,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CPU_MOE_PINNED"));
     add_opt(common_arg(
+        {"--auto"},
+        "detect MoE models and automatically enable --cpu-moe-pinned and --bells with auto-sizing. "
+        "For dense models this is a harmless no-op. Combine with -m and -c; everything else is "
+        "figured out from the hardware",
+        [](common_params & params) {
+            params.bells_enabled = true;
+            params.bells_n_slot  = 0;
+
+            const auto ov = llm_ffn_exps_pinned_override();
+            if (ov.buft == nullptr) {
+                params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+            } else {
+                params.tensor_buft_overrides.push_back(ov);
+                params.load_mode = LLAMA_LOAD_MODE_NONE;
+            }
+        }
+    ).set_env("LLAMA_ARG_AUTO"));
+    add_opt(common_arg(
         {"--bells"},
         "enable the BELLS expert cache, sizing it automatically from free VRAM. Equivalent to "
         "--bells-slots -1. Use with --cpu-moe, which keeps the expert weights on the host",
@@ -2868,6 +2886,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.bells_l2_n_slot  = value > 0 ? (uint32_t) value : UINT32_MAX;
         }
     ).set_env("LLAMA_ARG_BELLS_L2_SLOTS"));
+    add_opt(common_arg(
+        {"--bells-cache-type"}, "TYPE",
+        "BELLS: store cached experts at a different quant type than the model (e.g. q2_K when "
+        "the model is q4_K). Fits more experts in the same VRAM at the cost of some precision "
+        "on cached experts. The host weights stay at the model's original type; only the VRAM "
+        "cache is re-quantized on admission",
+        [](common_params & params, const std::string & value) {
+            ggml_type found = GGML_TYPE_COUNT;
+            for (int i = 0; i < (int) GGML_TYPE_COUNT; i++) {
+                const char * name = ggml_type_name((ggml_type) i);
+                if (name && value == name) {
+                    found = (ggml_type) i;
+                    break;
+                }
+            }
+            if (found == GGML_TYPE_COUNT) {
+                throw std::runtime_error("unknown type: " + value);
+            }
+            params.bells_cache_type = found;
+        }
+    ).set_env("LLAMA_ARG_BELLS_CACHE_TYPE"));
     add_opt(common_arg(
         {"--pin-experts"}, "FILE",
         "seat the hottest experts per layer permanently in the BELLS cache, using a usage CSV "

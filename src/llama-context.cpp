@@ -738,7 +738,8 @@ llama_context::llama_context(
             if (params.pin_experts && *params.pin_experts) {
                 bp.pin_file = params.pin_experts;
             }
-            bp.pin_reserve = params.pin_reserve;
+            bp.pin_reserve  = params.pin_reserve;
+            bp.cache_type   = params.bells_cache_type;
 
             // the cache lives wherever the graph runs, i.e. next to the rest of the offload
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends.front().get());
@@ -787,7 +788,12 @@ llama_context::llama_context(
                     }
                 }
 
-                if (l2_dev) {
+                if (!l2_dev) {
+                    LLAMA_LOG_WARN("%s: --bells-l2-slots requires a second GPU, none found\n", __func__);
+                } else if (bells->uses_device(l2_dev)) {
+                    LLAMA_LOG_INFO("%s: skipping L2 on %s — it already hosts BELLS cache layers\n",
+                                  __func__, ggml_backend_dev_name(l2_dev));
+                } else {
                     ggml_backend_t l2_be = ggml_backend_dev_init(l2_dev, nullptr);
                     if (l2_be) {
                         ggml_backend_buffer_type_t l2_buft = ggml_backend_get_default_buffer_type(l2_be);
@@ -799,8 +805,6 @@ llama_context::llama_context(
                             ggml_backend_free(l2_be);
                         }
                     }
-                } else {
-                    LLAMA_LOG_WARN("%s: --bells-l2-slots requires a second GPU, none found\n", __func__);
                 }
             }
         }
@@ -4332,6 +4336,7 @@ llama_context_params llama_context_default_params() {
         /*.bells_refresh               =*/ 1,
         /*.bells_split                 =*/ 0,
         /*.bells_l2_n_slot             =*/ 0,
+        /*.bells_cache_type            =*/ GGML_TYPE_COUNT,
         /*.cold_tensors                =*/ nullptr,
         /*.moe_prefetch                =*/ 0,
         /*.moe_stats                   =*/ nullptr,

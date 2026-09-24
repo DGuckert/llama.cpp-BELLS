@@ -20,17 +20,30 @@
 #include <string>
 
 void bells_cache::init(uint32_t n_layer, uint32_t n_expert, uint32_t n_slot) {
+    std::vector<uint32_t> per_layer(n_layer, std::min(n_slot, n_expert));
+    init(n_layer, n_expert, per_layer);
+}
+
+void bells_cache::init(uint32_t n_layer, uint32_t n_expert, const std::vector<uint32_t> & per_layer_slots) {
     n_layer_  = n_layer;
     n_expert_ = n_expert;
-    n_slot_   = std::min(n_slot, n_expert);
+
+    n_slot_per_layer_.resize(n_layer);
+    max_slot_ = 0;
+    for (uint32_t i = 0; i < n_layer; ++i) {
+        n_slot_per_layer_[i] = std::min(i < (uint32_t) per_layer_slots.size() ? per_layer_slots[i] : 0u, n_expert);
+        max_slot_ = std::max(max_slot_, n_slot_per_layer_[i]);
+    }
 
     layers_.assign(n_layer, layer());
 
-    for (auto & l : layers_) {
+    for (uint32_t i = 0; i < n_layer; ++i) {
+        auto & l = layers_[i];
+        const uint32_t ns = n_slot_per_layer_[i];
         l.expert_slot.assign(n_expert_, -1);
-        l.slot_expert.assign(n_slot_,   -1);
-        l.last_used.assign(n_slot_,      0);
-        l.pinned.assign(n_slot_,         0);
+        l.slot_expert.assign(ns,        -1);
+        l.last_used.assign(ns,           0);
+        l.pinned.assign(ns,              0);
     }
 
     clock_    = 0;
@@ -55,10 +68,11 @@ void bells_cache::pin_experts(uint32_t il, const std::vector<int32_t> & experts,
         return;
     }
     layer & l = layers_[il];
+    const uint32_t ns = n_slot_per_layer_[il];
 
     uint32_t s = 0;
     for (int32_t e : experts) {
-        if (s >= n_slot_) {
+        if (s >= ns) {
             break;
         }
         if (e < 0 || (uint32_t) e >= n_expert_) {
@@ -86,17 +100,15 @@ void bells_cache::pin_experts(uint32_t il, const std::vector<int32_t> & experts,
     n_pinned_ = std::max(n_pinned_, s);
 }
 
-int32_t bells_cache::victim(layer & l, const int32_t * keep, size_t n_keep,
+int32_t bells_cache::victim(layer & l, uint32_t n_slots, const int32_t * keep, size_t n_keep,
                             const std::vector<uint8_t> * protect) const {
     int32_t best     = -1;
     int64_t best_age = 0;
 
-    // Second choice, used only when everything unprotected is spoken for. Keeping it means a
-    // wrong prediction costs a worse eviction rather than a failed ensure().
     int32_t fallback     = -1;
     int64_t fallback_age = 0;
 
-    for (uint32_t s = 0; s < n_slot_; ++s) {
+    for (uint32_t s = 0; s < n_slots; ++s) {
         const int32_t held = l.slot_expert[s];
 
         if (held < 0) {
@@ -159,10 +171,7 @@ void bells_cache::prefetch(uint32_t il, const int32_t * experts, size_t n, std::
             continue;
         }
 
-        // Only the other members of this prefetch are protected. What the token will actually
-        // want is unknown here, so a wrong guess can evict something needed - that cost is real
-        // and is why the confidence threshold matters.
-        const int32_t s = victim(l, experts, n);
+        const int32_t s = victim(l, n_slot_per_layer_[il], experts, n);
         if (s < 0) {
             break;
         }
@@ -204,7 +213,7 @@ bool bells_cache::ensure(uint32_t il, const int32_t * experts, size_t n,
 
         n_miss_++;
 
-        const int32_t s = victim(l, experts, n, protect);
+        const int32_t s = victim(l, n_slot_per_layer_[il], experts, n, protect);
         if (s < 0) {
             // more distinct experts requested than the cache can hold
             return false;
@@ -234,18 +243,43 @@ const bells_tensors::entry & bells_tensors::empty() {
     return e;
 }
 
-static ggml_tensor * bells_make_slice(ggml_context * ctx, ggml_tensor * src, uint32_t n_slot) {
+static ggml_tensor * bells_make_slice(ggml_context * ctx, ggml_tensor * src, uint32_t n_slot,
+                                      ggml_type override_type = GGML_TYPE_COUNT) {
     if (!src) {
         return nullptr;
     }
 
-    // same layout and quant type as the full expert stack, just fewer experts
-    return ggml_new_tensor_3d(ctx, src->type, src->ne[0], src->ne[1], n_slot);
+    ggml_type type = (override_type != GGML_TYPE_COUNT) ? override_type : src->type;
+    return ggml_new_tensor_3d(ctx, type, src->ne[0], src->ne[1], n_slot);
 }
 
 bool bells_tensors::init(ggml_backend_buffer_type_t buft, const std::vector<layer_src> & srcs,
-                         uint32_t n_slot, ggml_backend_t backend, ggml_backend_t copy_backend) {
+                         uint32_t n_slot, ggml_backend_t backend, ggml_backend_t copy_backend,
+                         ggml_type cache_type) {
+    int32_t max_il = -1;
+    for (const auto & s : srcs) {
+        max_il = std::max(max_il, s.il);
+    }
+    std::vector<uint32_t> per_layer(max_il + 1, n_slot);
+    return init(buft, srcs, per_layer, backend, copy_backend, cache_type);
+}
+
+bool bells_tensors::init(ggml_backend_buffer_type_t buft, const std::vector<layer_src> & srcs,
+                         const std::vector<uint32_t> & per_layer_slots,
+                         ggml_backend_t backend, ggml_backend_t copy_backend,
+                         ggml_type cache_type) {
     free();
+
+    if (cache_type != GGML_TYPE_COUNT) {
+        const auto * traits = ggml_get_type_traits(cache_type);
+        if (!traits->from_float_ref) {
+            fprintf(stderr, "%s: type %s has no from_float_ref, cannot re-quantize\n",
+                    __func__, ggml_type_name(cache_type));
+            return false;
+        }
+    }
+
+    cache_type_ = cache_type;
 
     backend_      = backend;
     copy_backend_ = copy_backend;
@@ -254,13 +288,20 @@ bool bells_tensors::init(ggml_backend_buffer_type_t buft, const std::vector<laye
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
         copy_event_ = dev ? ggml_backend_event_new(dev) : nullptr;
         if (!copy_event_) {
-            // without an event there is no way to order the two streams, and guessing would
-            // mean the graph reading half-written experts
             copy_backend_ = nullptr;
         }
     }
 
-    if (srcs.empty() || n_slot == 0) {
+    if (srcs.empty()) {
+        return false;
+    }
+
+    bool any_slots = false;
+    for (const auto & s : srcs) {
+        uint32_t ns = (uint32_t) s.il < per_layer_slots.size() ? per_layer_slots[s.il] : 0;
+        if (ns > 0) { any_slots = true; break; }
+    }
+    if (!any_slots) {
         return false;
     }
 
@@ -273,17 +314,8 @@ bool bells_tensors::init(ggml_backend_buffer_type_t buft, const std::vector<laye
     entries_.clear();
     entries_.reserve(srcs.size());
 
-    n_slot_ = n_slot;
-
-    // one spare slot beyond the cache, kept zeroed, so a non-resident expert can be routed
-    // somewhere harmless rather than out of bounds
-    const uint32_t n_alloc = n_slot + 1;
-
-    // Group the layers by the device they run on. A cache slice has to live where the matmul
-    // that reads it runs, so with a layer split across cards each device needs its own context
-    // and buffer. One device is the ordinary case and falls out of this unchanged.
     std::vector<ggml_backend_buffer_type_t> bufts;
-    std::vector<std::vector<size_t>>        by_buft;   // indices into srcs
+    std::vector<std::vector<size_t>>        by_buft;
 
     for (size_t i = 0; i < srcs.size(); ++i) {
         ggml_backend_buffer_type_t b = srcs[i].buft ? srcs[i].buft : buft;
@@ -302,9 +334,6 @@ bool bells_tensors::init(ggml_backend_buffer_type_t buft, const std::vector<laye
         by_buft[g].push_back(i);
     }
 
-    // The second stream orders one copy backend against one compute backend with a single event.
-    // Across devices that is no longer a well-defined pairing, and it has never been worth
-    // anything anyway - measured 1.005x, because the per-layer readback is the real barrier.
     if (bufts.size() > 1 && copy_backend_) {
         if (copy_event_) {
             ggml_backend_event_free(copy_event_);
@@ -316,7 +345,6 @@ bool bells_tensors::init(ggml_backend_buffer_type_t buft, const std::vector<laye
     vram_bytes_ = 0;
 
     for (size_t g = 0; g < bufts.size(); ++g) {
-        // 5 tensors per layer at most, plus overhead
         ggml_init_params ip = { ggml_tensor_overhead()*by_buft[g].size()*8, nullptr, true };
         ggml_context * ctx = ggml_init(ip);
         if (!ctx) {
@@ -327,15 +355,18 @@ bool bells_tensors::init(ggml_backend_buffer_type_t buft, const std::vector<laye
 
         for (size_t i : by_buft[g]) {
             const layer_src & s = srcs[i];
+            const uint32_t ns = (uint32_t) s.il < per_layer_slots.size() ? per_layer_slots[s.il] : 0;
+            const uint32_t n_alloc = ns + 1;
 
             entry e;
             e.src     = s;
+            e.n_slot  = ns;
             e.backend = s.backend ? s.backend : backend;
 
-            e.gate    = bells_make_slice(ctx, s.gate,    n_alloc);
-            e.up      = bells_make_slice(ctx, s.up,      n_alloc);
-            e.down    = bells_make_slice(ctx, s.down,    n_alloc);
-            e.gate_up = bells_make_slice(ctx, s.gate_up, n_alloc);
+            e.gate    = bells_make_slice(ctx, s.gate,    n_alloc, cache_type_);
+            e.up      = bells_make_slice(ctx, s.up,      n_alloc, cache_type_);
+            e.down    = bells_make_slice(ctx, s.down,    n_alloc, cache_type_);
+            e.gate_up = bells_make_slice(ctx, s.gate_up, n_alloc, cache_type_);
 
             ggml_tensor * any = s.gate ? s.gate : (s.gate_up ? s.gate_up : s.up);
             if (!any) {
@@ -441,6 +472,91 @@ bool bells_tensors::init(ggml_backend_buffer_type_t buft, const std::vector<laye
                                 "memory (sources are pageable)\n", stage_cap_/1024.0/1024.0);
             }
         }
+    }
+
+    // Pre-compute all re-quantized experts at startup.
+    //
+    // from_float_ref for K-quant types is scalar and costs ~6 ms per expert on an i3-13100F.
+    // With 12k+ expert-tensor pairs that is minutes of warm-up spread across the first tokens.
+    // Converting everything up front on N threads pays a fixed startup cost (~18 s on 4 cores
+    // for Qwen3-30B-A3B Q4_K->Q2_K) and then generation runs at full speed with no per-miss
+    // conversion overhead.
+    if (cache_type_ != GGML_TYPE_COUNT) {
+        for (const auto & e : entries_) {
+            auto setup = [&](ggml_tensor * t) {
+                if (!t) return;
+                rq_precomp rq;
+                rq.stride = ggml_row_size(cache_type_, t->ne[0]) * t->ne[1];
+                rq.experts.resize(t->ne[2]);
+                rq_cache_[t] = std::move(rq);
+            };
+            setup(e.src.gate);
+            setup(e.src.up);
+            setup(e.src.down);
+            setup(e.src.gate_up);
+        }
+
+        struct rq_job {
+            const ggml_tensor * src;
+            rq_precomp *        rq;
+            int32_t             expert;
+        };
+        std::vector<rq_job> jobs;
+        for (auto & [src, rq] : rq_cache_) {
+            for (int32_t e = 0; e < (int32_t) rq.experts.size(); ++e) {
+                jobs.push_back({ src, &rq, e });
+            }
+        }
+
+        const unsigned n_threads = std::max(1u, std::thread::hardware_concurrency());
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        auto worker = [&](size_t start, size_t end) {
+            std::vector<float> f32_buf;
+            const auto * dst_traits = ggml_get_type_traits(cache_type_);
+
+            for (size_t i = start; i < end; ++i) {
+                const auto & job   = jobs[i];
+                const ggml_tensor * src = job.src;
+                rq_precomp & rq    = *job.rq;
+                const int32_t expert = job.expert;
+
+                const size_t src_stride = ggml_nbytes(src) / src->ne[2];
+                const char * base = (const char *) src->data + (size_t) expert * src_stride;
+
+                const auto * src_traits = ggml_get_type_traits(src->type);
+                const int64_t n_elements = src->ne[0] * src->ne[1];
+                if (f32_buf.size() < (size_t) n_elements) {
+                    f32_buf.resize(n_elements);
+                }
+
+                rq.experts[expert].resize(rq.stride);
+                src_traits->to_float(base, f32_buf.data(), n_elements);
+                dst_traits->from_float_ref(f32_buf.data(), rq.experts[expert].data(), n_elements);
+            }
+        };
+
+        if (n_threads <= 1 || jobs.size() < 4) {
+            worker(0, jobs.size());
+        } else {
+            std::vector<std::thread> threads;
+            const size_t per = (jobs.size() + n_threads - 1) / n_threads;
+            for (unsigned t = 0; t < n_threads; ++t) {
+                size_t s = t * per;
+                size_t e = std::min(s + per, jobs.size());
+                if (s < e) {
+                    threads.emplace_back(worker, s, e);
+                }
+            }
+            for (auto & th : threads) {
+                th.join();
+            }
+        }
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double sec = std::chrono::duration<double>(t1 - t0).count();
+        fprintf(stderr, "init: pre-computed %zu re-quantized experts in %.1f s (%u threads)\n",
+                jobs.size(), sec, n_threads);
     }
 
     return true;
@@ -664,6 +780,7 @@ void bells_tensors::free() {
     entries_.clear();
     index_.clear();
     layer_ids_.clear();
+    rq_cache_.clear();
 
     vram_bytes_       = 0;
     bytes_per_expert_ = 0;
@@ -880,10 +997,33 @@ void bells_tensors::copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t exper
         return;
     }
 
-    const size_t stride = ggml_nbytes(src)/src->ne[2];
+    const size_t src_stride = ggml_nbytes(src)/src->ne[2];
+    const size_t dst_stride = ggml_nbytes(dst)/dst->ne[2];
 
-    // the source expert stack is host resident, which is the whole premise of offloading
-    const char * base = (const char *) src->data + (size_t) expert*stride;
+    const char * base = (const char *) src->data + (size_t) expert*src_stride;
+
+    // Re-quantization: convert to cache_type_ on first miss, reuse on subsequent ones.
+    if (cache_type_ != GGML_TYPE_COUNT && dst->type != src->type) {
+        auto it = rq_cache_.find(src);
+        if (it != rq_cache_.end()) {
+            rq_precomp & rq = it->second;
+            if (rq.experts[expert].empty()) {
+                const auto * src_traits = ggml_get_type_traits(src->type);
+                const auto * dst_traits = ggml_get_type_traits(dst->type);
+                const int64_t n_elements = src->ne[0] * src->ne[1];
+                if (requant_f32_.size() < (size_t) n_elements) {
+                    requant_f32_.resize(n_elements);
+                }
+                rq.experts[expert].resize(dst_stride);
+                src_traits->to_float(base, requant_f32_.data(), n_elements);
+                dst_traits->from_float_ref(requant_f32_.data(), rq.experts[expert].data(), n_elements);
+            }
+            base = (const char *) rq.experts[expert].data();
+        }
+    }
+
+    const size_t xfer_stride = (cache_type_ != GGML_TYPE_COUNT && dst->type != src->type)
+                             ? dst_stride : src_stride;
 
     // BELLS_SYNC_COPY=1 forces the fully blocking copy. Diagnostic for the sm_86 corruption:
     // if garbage survives a synchronous copy then the defect is in the data or the indexing,
@@ -894,18 +1034,15 @@ void bells_tensors::copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t exper
     }();
 
     if (sync_copy) {
-        ggml_backend_tensor_set(dst, base, (size_t) slot*stride, stride);
+        ggml_backend_tensor_set(dst, base, (size_t) slot*dst_stride, xfer_stride);
         return;
     }
 
     // Route through the pinned ring when the source is pageable. The memcpy costs real CPU time
     // (~75 us for 1.88 MiB) but it is what lets the transfer overlap instead of blocking the
     // stream, which measured 31x on the 35B.
-    if (stage_ptr_ && stride <= stage_cap_) {
-        if (stage_off_ + stride > stage_cap_) {
-            // A real host sync before reusing the ring. sync_copies() is only stream-ordered and
-            // returns before transfers drain, so overwriting here without this would corrupt
-            // copies still in flight.
+    if (stage_ptr_ && xfer_stride <= stage_cap_) {
+        if (stage_off_ + xfer_stride > stage_cap_) {
             if (ggml_backend_t sb = copy_backend_ ? copy_backend_ : backend) {
                 ggml_backend_synchronize(sb);
             }
@@ -913,22 +1050,21 @@ void bells_tensors::copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t exper
             n_wraps_++;
         }
 
-        memcpy(stage_ptr_ + stage_off_, base, stride);
+        memcpy(stage_ptr_ + stage_off_, base, xfer_stride);
         base        = stage_ptr_ + stage_off_;
-        stage_off_ += stride;
+        stage_off_ += xfer_stride;
         n_staged_++;
     }
 
     // copy_backend_ is only ever set in the single-device case; see init(). Otherwise the copy
     // has to be issued against the device the destination actually lives on.
     if (copy_backend_) {
-        // second stream: this can genuinely overlap the graph, which is the entire point
-        ggml_backend_tensor_set_async(copy_backend_, dst, base, (size_t) slot*stride, stride);
+        ggml_backend_tensor_set_async(copy_backend_, dst, base, (size_t) slot*dst_stride, xfer_stride);
         copies_pending_ = true;
     } else if (backend) {
-        ggml_backend_tensor_set_async(backend, dst, base, (size_t) slot*stride, stride);
+        ggml_backend_tensor_set_async(backend, dst, base, (size_t) slot*dst_stride, xfer_stride);
     } else {
-        ggml_backend_tensor_set(dst, base, (size_t) slot*stride, stride);
+        ggml_backend_tensor_set(dst, base, (size_t) slot*dst_stride, xfer_stride);
     }
 }
 
@@ -966,7 +1102,7 @@ void bells_tensors::copy_expert(uint32_t il, int32_t expert, int32_t slot) {
         return s && s[0] && s[0] != '0';
     }();
 
-    if (!verify) {
+    if (!verify || cache_type_ != GGML_TYPE_COUNT) {
         return;
     }
 
@@ -1103,10 +1239,11 @@ void bells_tensors::upload_slots(uint32_t il, const std::vector<int32_t> & table
     //
     // Latent, like the zeroing above: measured 1 clean run in 40 against a 0-in-46 baseline, so it
     // is not what caused the ///// corruption (a host DMA fault was). Correct anyway.
+    const uint32_t ns = get(il).n_slot;
     slot_scratch_.assign(table.begin(), table.begin() + n);
     for (size_t i = 0; i < n; ++i) {
-        if (slot_scratch_[i] < 0 || (uint32_t) slot_scratch_[i] > n_slot_) {
-            slot_scratch_[i] = (int32_t) n_slot_;
+        if (slot_scratch_[i] < 0 || (uint32_t) slot_scratch_[i] > ns) {
+            slot_scratch_[i] = (int32_t) ns;
         }
     }
 
@@ -1160,14 +1297,14 @@ void bells_tensors::upload_slots(uint32_t il, const std::vector<int32_t> & table
         if (got[i] != table[i]) {
             n_diff++;
         }
-        if (got[i] < 0 || (uint32_t) got[i] > n_slot_) {
+        if (got[i] < 0 || (uint32_t) got[i] > ns) {
             n_oob++;
         }
     }
 
     fprintf(stderr, "%s: layer %u slots: tensor=%p data=%p %zu entries, %zu readback mismatches, "
                     "%zu out of range (n_slot=%u), first 8: %d %d %d %d %d %d %d %d\n",
-            __func__, il, (void *) t, (void *) t->data, n, n_diff, n_oob, n_slot_,
+            __func__, il, (void *) t, (void *) t->data, n, n_diff, n_oob, ns,
             n > 0 ? got[0] : -1, n > 1 ? got[1] : -1, n > 2 ? got[2] : -1, n > 3 ? got[3] : -1,
             n > 4 ? got[4] : -1, n > 5 ? got[5] : -1, n > 6 ? got[6] : -1, n > 7 ? got[7] : -1);
 }
@@ -1346,11 +1483,19 @@ bool bells_runtime::init(const bells_params & params,
     // everything below sizes and allocates against the layers actually being cached
     const std::vector<bells_tensors::layer_src> & srcs = host_srcs;
 
-    // bytes one expert occupies, summed over whatever projections this arch uses
+    // bytes one expert occupies in the CACHE, summed over whatever projections this arch uses.
+    // When cache_type overrides the model's quant, size each tensor at the cache type.
+    const ggml_type ct = params.cache_type;
     size_t per_expert = 0;
+    size_t per_expert_src = 0;
     for (ggml_tensor * t : { srcs[0].gate, srcs[0].up, srcs[0].down, srcs[0].gate_up }) {
         if (t && t->ne[2] > 0) {
-            per_expert += ggml_nbytes(t)/t->ne[2];
+            per_expert_src += ggml_nbytes(t)/t->ne[2];
+            if (ct != GGML_TYPE_COUNT) {
+                per_expert += ggml_row_size(ct, t->ne[0]) * t->ne[1];
+            } else {
+                per_expert += ggml_nbytes(t)/t->ne[2];
+            }
         }
     }
 
@@ -1359,152 +1504,203 @@ bool bells_runtime::init(const bells_params & params,
         return false;
     }
 
+    if (ct != GGML_TYPE_COUNT && per_expert != per_expert_src) {
+        fprintf(stderr, "%s: cache re-quantizes to %s: %.2f MiB/expert -> %.2f MiB/expert (%.1fx)\n",
+                __func__, ggml_type_name(ct),
+                per_expert_src/1024.0/1024.0, per_expert/1024.0/1024.0,
+                (double) per_expert_src / per_expert);
+    }
+
     const size_t working_set = (size_t) srcs.size()*std::max(1u, n_expert_used)*per_expert;
 
-    uint32_t n_slot = params.n_slot;
+    uint32_t n_layer = 0;
+    for (const auto & s : srcs) {
+        n_layer = std::max(n_layer, (uint32_t) s.il + 1);
+    }
 
-    // Free VRAM on the *tightest* device, expressed as though every layer lived there.
-    //
-    // With the layers split across cards, each device holds only its own share, so the slot
-    // count that fits is set by whichever device has the least room per layer it carries - not
-    // by the total across all of them. Scaling that back up to a whole-model figure lets the
-    // sizing arithmetic below stay as written.
-    size_t dev_free = 0, dev_total = 0;
-    {
-        std::vector<ggml_backend_dev_t> devs;
-        std::vector<size_t>             n_layer_on;
+    // Per-device info for multi-GPU auto-sizing
+    struct dev_info {
+        ggml_backend_dev_t dev;
+        size_t free_bytes;
+        size_t total_bytes;
+        std::vector<int32_t> layer_ids;
+    };
 
-        for (const auto & s : srcs) {
-            ggml_backend_dev_t d = ggml_backend_buft_get_device(s.buft ? s.buft : buft);
-            size_t i = 0;
-            while (i < devs.size() && devs[i] != d) {
-                i++;
-            }
-            if (i == devs.size()) {
-                devs.push_back(d);
-                n_layer_on.push_back(0);
-            }
-            n_layer_on[i]++;
+    std::vector<dev_info> devices;
+    for (const auto & s : srcs) {
+        ggml_backend_dev_t d = ggml_backend_buft_get_device(s.buft ? s.buft : buft);
+        size_t i = 0;
+        while (i < devices.size() && devices[i].dev != d) {
+            i++;
         }
-
-        double tightest_free = 0.0, tightest_total = 0.0;
-
-        for (size_t i = 0; i < devs.size(); ++i) {
+        if (i == devices.size()) {
             size_t f = 0, t = 0;
-            if (devs[i]) {
-                ggml_backend_dev_memory(devs[i], &f, &t);
+            if (d) {
+                ggml_backend_dev_memory(d, &f, &t);
             }
-
-            // per-layer room on this device, scaled to the whole model
-            const double share = (double) srcs.size()/std::max<size_t>(1, n_layer_on[i]);
-            const double f_eq  = (double) f*share;
-            const double t_eq  = (double) t*share;
-
-            if (i == 0 || f_eq < tightest_free) {
-                tightest_free  = f_eq;
-                tightest_total = t_eq;
-            }
+            devices.push_back({ d, f, t, {} });
         }
-
-        dev_free  = (size_t) tightest_free;
-        dev_total = (size_t) tightest_total;
-
-        if (devs.size() > 1) {
-            fprintf(stderr, "%s: cache split over %zu devices, sizing from the tightest\n",
-                    __func__, devs.size());
-        }
+        devices[i].layer_ids.push_back(s.il);
     }
 
-    if (n_slot == 0) {
-        // A third of the free VRAM, floored at 1 GiB of headroom.
-        //
-        // Deliberately conservative, and NOT tuned. It was originally fitted to one model on a
-        // 6 GB card - a configuration since measured at 0.94-0.97x, i.e. one where BELLS does
-        // not help at all - so it is a safe starting point rather than an optimum.
-        //
-        // It errs small because oversizing is punished much harder than undersizing. The cache
-        // and the compute buffers come out of the same VRAM: a 19.9 GB cache on a 24 GB card
-        // took the 235B from 1.81x to 1.02x, and 22.4 GB took it to 0.73x. An 81-slot cache on
-        // a 6 GB card measured 25% slower than 48.
-        //
-        // Not re-tuned on the newer data because doing that honestly needs a slot sweep per
-        // model per card, and every static rule this project has fitted to four models has had
-        // to be retracted. A sweep beats this; --bells-slots N takes the result.
-        // BELLS_VRAM_MB overrides the headroom rule with an explicit cache budget. The rule
-        // below is calibrated for large cards: a flat 1 GiB floor is a sixth of a 6 GB card, so
-        // it dominates whenever free VRAM drops under 3 GiB, which on a small card is most of
-        // the time. Sweeping bytes is also more portable than sweeping slots, because
-        // slots -> bytes depends on the model's expert size.
-        size_t budget;
-        size_t headroom = 0;
+    std::vector<uint32_t> per_layer_slots(n_layer, 0);
 
-        if (const char * vm = getenv("BELLS_VRAM_MB")) {
-            const long mb = atol(vm);
-            budget = mb > 0 ? (size_t) mb*1024*1024 : 0;
-            if (budget > dev_free) {
-                fprintf(stderr, "%s: BELLS_VRAM_MB=%ld exceeds %.2f GiB free, clamping\n",
-                        __func__, mb, dev_free/1024.0/1024.0/1024.0);
-                budget = dev_free;
-            }
-        } else {
-            headroom = std::max<size_t>(1024ull*1024*1024, dev_free/3);
-            budget   = dev_free > headroom ? dev_free - headroom : 0;
+    if (params.n_slot > 0) {
+        // Explicit --bells-slots: uniform across all layers
+        const uint32_t ns = std::min(params.n_slot, n_expert);
+        for (const auto & s : srcs) {
+            per_layer_slots[s.il] = ns;
+        }
+    } else {
+        // Per-device auto-sizing: each GPU gets slots sized to its own free VRAM.
+        //
+        // Previous headroom of max(1 GiB, free/3) was far too conservative: on a 6 GiB GPU
+        // with 3.6 GiB free it reserved 1.2 GiB and picked 17 slots when 26 actually fit.
+        // Compute scratch and runtime VRAM rarely exceeds 256 MiB. Keep 5% or 256 MiB,
+        // whichever is larger, and fall back if the allocation fails.
+        if (devices.size() > 1) {
+            fprintf(stderr, "%s: cache split over %zu devices, sizing each independently\n",
+                    __func__, devices.size());
         }
 
-        n_slot = (uint32_t) std::min<size_t>(n_expert, budget/(per_expert*srcs.size()));
+        for (const auto & di : devices) {
+            size_t budget;
+            size_t headroom = 0;
 
-        fprintf(stderr, "%s: auto-sizing from %.1f GiB free, %.1f GiB headroom -> %u slots "
-                        "(conservative, sweep --bells-slots to beat it)\n",
-                __func__, dev_free/1024.0/1024.0/1024.0,
-                headroom/1024.0/1024.0/1024.0, n_slot);
-
-        // What other budgets would buy, so a sweep can be aimed rather than guessed. Capacity
-        // is worth more than prediction on this workload: measured LRU hit rate goes 61.4% at
-        // 32 slots to 78.1% at 64, while Belady (perfect prediction) at 32 is only 78.3%. So
-        // doubling the cache matches a perfect oracle at the smaller size.
-        {
-            const size_t per_slot = per_expert*srcs.size();
-            fprintf(stderr, "%s: budget -> slots:", __func__);
-            for (size_t mb : { 512ull, 1024ull, 2048ull, 3072ull, 4096ull }) {
-                const size_t b = mb*1024*1024;
-                if (b <= dev_free) {
-                    fprintf(stderr, "  %zuMB=%zu", mb, std::min<size_t>(n_expert, b/per_slot));
+            if (const char * vm = getenv("BELLS_VRAM_MB")) {
+                const long mb = atol(vm);
+                const double share = (double) di.layer_ids.size() / srcs.size();
+                budget = mb > 0 ? (size_t)(mb*1024*1024*share) : 0;
+                if (budget > di.free_bytes) {
+                    budget = di.free_bytes;
                 }
+            } else {
+                headroom = std::max<size_t>(256ull*1024*1024, di.free_bytes / 20);
+                budget   = di.free_bytes > headroom ? di.free_bytes - headroom : 0;
             }
-            fprintf(stderr, "   (BELLS_VRAM_MB=N to pick one)\n");
-        }
 
-        // Auto-sizing is not merely suboptimal when it comes out thin - it can be slower than not
-        // using BELLS at all, because the per-layer readback is charged on every layer of every
-        // token whether or not the cache saves anything. Measured on Qwen3-30B-A3B Q4_K_M on a
-        // 6 GB card: --bells picked 17 slots and ran at 11.07 tok/s against an 11.37 tok/s
-        // --cpu-moe baseline, while an explicit 26 slots reached 13.75. Below roughly 3x
-        // n_expert_used there is not enough reuse to pay for the round-trip, so say so.
-        if (n_expert_used > 0 && n_slot < 3*n_expert_used) {
-            fprintf(stderr, "%s: WARNING %u slots is only %.1fx n_expert_used (%u). BELLS is "
-                            "likely to be SLOWER than plain --cpu-moe at this size. Raise "
-                            "--bells-slots, or drop BELLS and try partial expert offload "
-                            "(-ot 'blk\\.(0|1|...)\\.ffn_.*_exps\\.weight=CPU') instead.\n",
-                    __func__, n_slot, (double) n_slot/n_expert_used, n_expert_used);
+            // per_expert from source tensor dimensions overestimates cache allocation
+            // by up to 10% (ggml row sizes vs actual buffer packing). Don't subtract
+            // the zero slot — the overestimate roughly compensates.
+            const size_t n_dev_layers = di.layer_ids.size();
+            const uint32_t dev_slots = n_dev_layers > 0
+                ? (uint32_t) std::min<size_t>(n_expert, budget / (per_expert * n_dev_layers))
+                : 0;
+
+            const char * dev_name = di.dev ? ggml_backend_dev_name(di.dev) : "unknown";
+            fprintf(stderr, "%s: %s: %.1f GiB free, %.1f GiB headroom, %zu layers -> %u slots\n",
+                    __func__, dev_name,
+                    di.free_bytes/1024.0/1024.0/1024.0,
+                    headroom/1024.0/1024.0/1024.0,
+                    n_dev_layers, dev_slots);
+
+            for (int32_t il : di.layer_ids) {
+                per_layer_slots[il] = dev_slots;
+            }
         }
     }
 
-    n_slot = std::min(n_slot, n_expert);
+    // Try to allocate. If auto-sized and it fails, back off and retry — the headroom estimate
+    // may be slightly off due to backend alignment or fragmentation.
+    bool allocated = false;
+    for (int attempt = 0; ; ++attempt) {
+        if (tensors_.init(buft, srcs, per_layer_slots, backend, copy_backend, ct)) {
+            allocated = true;
+            break;
+        }
+        if (params.n_slot > 0 || attempt >= 4) {
+            break;
+        }
+        bool any_reduced = false;
+        for (const auto & s : srcs) {
+            uint32_t & ns = per_layer_slots[s.il];
+            if (ns > n_expert_used) {
+                ns -= std::max(1u, ns / 10);
+                any_reduced = true;
+            }
+        }
+        if (!any_reduced) {
+            break;
+        }
+        tensors_.free();
+        fprintf(stderr, "%s: VRAM allocation failed, retrying with %u slots (attempt %d)\n",
+                __func__, per_layer_slots[srcs[0].il], attempt + 2);
+    }
 
-    // A cache below the per-token working set cannot hold even one token's experts, so every
-    // access misses and BELLS is strictly worse than not caching at all.
-    if (n_slot < n_expert_used) {
-        fprintf(stderr, "%s: %u slots is below n_expert_used (%u), BELLS cannot help here\n",
-                __func__, n_slot, n_expert_used);
+    if (!allocated) {
+        fprintf(stderr, "%s: failed to allocate expert slots\n", __func__);
         return false;
     }
 
-    // The fit verdict.
+    // Upward probe: the per_expert estimate from source tensor dimensions can overestimate
+    // cache allocation by up to 10%, leaving VRAM unused. Free the initial allocation and
+    // probe upward to find the actual maximum.
     //
-    // A high ratio does NOT mean BELLS will help - GPT-OSS-120B measured 6.1x slower at 4x -
-    // so this only says whether a cache is physically worth attempting. A low ratio does
-    // reliably mean it will not: 1.2x measured 0.83x against --cpu-moe.
-    const double ratio = (double) n_slot/std::max(1u, n_expert_used);
+    // The CUDA allocator can succeed beyond physical VRAM via managed memory, which OOMs
+    // during compute. So each probe checks vram_bytes() against actual free VRAM, not just
+    // whether the allocation call returned non-null.
+    if (params.n_slot == 0) {
+        uint32_t initial_slots = per_layer_slots[srcs[0].il];
+
+        size_t vram_cap = 0;
+        for (const auto & di : devices) {
+            const size_t probe_headroom = 128ull * 1024 * 1024;
+            vram_cap += di.free_bytes > probe_headroom ? di.free_bytes - probe_headroom : 0;
+        }
+
+        tensors_.free();
+
+        uint32_t best = initial_slots;
+        for (uint32_t ns = initial_slots + 1; ns <= std::min(n_expert, initial_slots + 8); ++ns) {
+            std::vector<uint32_t> probe_slots(n_layer, 0);
+            for (const auto & s : srcs) {
+                probe_slots[s.il] = ns;
+            }
+
+            bells_tensors probe;
+            if (probe.init(buft, srcs, probe_slots, backend, nullptr, GGML_TYPE_COUNT)) {
+                size_t probed_vram = probe.vram_bytes();
+                probe.free();
+                if (probed_vram <= vram_cap) {
+                    best = ns;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        for (const auto & s : srcs) {
+            per_layer_slots[s.il] = best;
+        }
+        if (!tensors_.init(buft, srcs, per_layer_slots, backend, copy_backend, ct)) {
+            fprintf(stderr, "%s: failed to allocate at probed size %u\n", __func__, best);
+            return false;
+        }
+
+        if (best > initial_slots) {
+            fprintf(stderr, "%s: auto-sizer probed up from %u to %u slots\n",
+                    __func__, initial_slots, best);
+        }
+    }
+
+    // Recompute slot bounds after any retry/growth adjustments
+    uint32_t min_slot = n_expert;
+    uint32_t max_slot_count = 0;
+    for (const auto & s : srcs) {
+        min_slot = std::min(min_slot, per_layer_slots[s.il]);
+        max_slot_count = std::max(max_slot_count, per_layer_slots[s.il]);
+    }
+
+    if (min_slot < n_expert_used) {
+        fprintf(stderr, "%s: %u slots (on tightest device) is below n_expert_used (%u), "
+                        "BELLS cannot help here\n", __func__, min_slot, n_expert_used);
+        tensors_.free();
+        return false;
+    }
+
+    const double ratio = (double) min_slot/std::max(1u, n_expert_used);
     {
         const char * verdict =
             ratio >= 4.0 ? "enough to try, but measure - a high ratio does not predict a speedup" :
@@ -1515,45 +1711,40 @@ bool bells_runtime::init(const bells_params & params,
                         "cache holds %.1fx it -> %s\n",
                 __func__, working_set/1024.0/1024.0/1024.0, srcs.size(), n_expert_used,
                 per_expert/1024.0/1024.0, ratio, verdict);
+
+        if (min_slot != max_slot_count) {
+            fprintf(stderr, "%s: slot range %u..%u across devices\n",
+                    __func__, min_slot, max_slot_count);
+        }
     }
 
-    // Refuse rather than warn. Below 1.5x the cache thrashes and BELLS is a measured loss -
-    // 1.2x on a 6 GB card gave 0.83x - and it still costs its VRAM the whole time, which
-    // squeezes the compute buffers even for the ubatches it declines to serve. Printing
-    // "poor fit, expect a slowdown" and enabling anyway just meant users ate the slowdown
-    // without reading the line.
-    //
-    // Auto-sizing lands here mostly because the KV cache got the VRAM first, so say that: the
-    // actionable fix is a shorter context, not a different flag. An explicit --bells-slots is
-    // taken as deliberate and honoured, since research needs to be able to measure bad configs.
     if (ratio < 1.5) {
         if (params.n_slot == 0) {
             fprintf(stderr,
-                    "%s: only %u slots fit (%.1fx the working set), which is slower than plain "
-                    "--cpu-moe. BELLS disabled.\n"
+                    "%s: only %u slots fit on tightest device (%.1fx the working set), which is "
+                    "slower than plain --cpu-moe. BELLS disabled.\n"
                     "%s: the expert cache and the KV cache come out of the same VRAM and the KV "
                     "cache is allocated first, so a shorter -c leaves room for a bigger cache. "
                     "Pass --bells-slots N to force it anyway.\n",
-                    __func__, n_slot, ratio, __func__);
+                    __func__, min_slot, ratio, __func__);
+            tensors_.free();
             return false;
         }
 
         fprintf(stderr, "%s: %u slots is only %.1fx the working set and measured slower than "
                         "--cpu-moe at this ratio; continuing because it was requested "
-                        "explicitly\n", __func__, n_slot, ratio);
+                        "explicitly\n", __func__, min_slot, ratio);
     }
 
-    if (!tensors_.init(buft, srcs, n_slot, backend, copy_backend)) {
-        fprintf(stderr, "%s: failed to allocate %u expert slots per layer\n", __func__, n_slot);
-        return false;
+    if (n_expert_used > 0 && min_slot < 3*n_expert_used && params.n_slot == 0) {
+        fprintf(stderr, "%s: WARNING %u slots is only %.1fx n_expert_used (%u). BELLS is "
+                        "likely to be SLOWER than plain --cpu-moe at this size. Raise "
+                        "--bells-slots, or drop BELLS and try partial expert offload "
+                        "(-ot 'blk\\.(0|1|...)\\.ffn_.*_exps\\.weight=CPU') instead.\n",
+                __func__, min_slot, (double) min_slot/n_expert_used, n_expert_used);
     }
 
-    uint32_t n_layer = 0;
-    for (const auto & s : srcs) {
-        n_layer = std::max(n_layer, (uint32_t) s.il + 1);
-    }
-
-    cache_.init(n_layer, n_expert, n_slot);
+    cache_.init(n_layer, n_expert, per_layer_slots);
 
     // --pin-experts: seat the measured hot set permanently.
     //
@@ -1610,16 +1801,8 @@ bool bells_runtime::init(const bells_params & params,
             // Keep some slots dynamic. The residency invariant still has to hold: a token can
             // route to n_expert_used experts that are not in the pinned set, and ensure() has no
             // way to fail safely mid-graph.
-            uint32_t reserve = params_.pin_reserve ? params_.pin_reserve
-                                                   : std::max(4u*n_expert_used, 16u);
-            if (reserve >= n_slot) {
-                reserve = std::max(1u, n_slot/2);
-            }
-            // Dynamic layers keep a reserve so LRU can still admit what a token actually routes
-            // to. Static layers never get another chance to admit anything, so every slot they
-            // have should hold a measured-hot expert.
-            const uint32_t n_pin_dynamic = n_slot - reserve;
-            const uint32_t n_pin_static  = n_slot;
+            const uint32_t reserve_base = params_.pin_reserve ? params_.pin_reserve
+                                                             : std::max(4u*n_expert_used, 16u);
 
             // only layers the cache actually holds
             std::vector<uint8_t> is_moe(n_layer, 0);
@@ -1636,7 +1819,12 @@ bool bells_runtime::init(const bells_params & params,
                     continue;
                 }
                 auto & v = hot[il];
-                const uint32_t n_pin = is_static_layer(il) ? n_pin_static : n_pin_dynamic;
+                const uint32_t layer_slots = per_layer_slots[il];
+                uint32_t reserve = reserve_base;
+                if (reserve >= layer_slots) {
+                    reserve = std::max(1u, layer_slots/2);
+                }
+                const uint32_t n_pin = is_static_layer(il) ? layer_slots : layer_slots - reserve;
                 const size_t keep = std::min<size_t>(n_pin, v.size());
                 std::partial_sort(v.begin(), v.begin() + keep, v.end(),
                                   [](const std::pair<uint64_t, int32_t> & a,
@@ -1661,9 +1849,8 @@ bool bells_runtime::init(const bells_params & params,
             tensors_.sync_copies();
 
             // Only dynamic layers are ever ensure()d, so only THEIR free slots bound the ubatch.
-            // cache_.n_pinned() is the max across all layers, which for a fully-pinned static
-            // layer is n_slot - using that made the bound nonsense.
-            n_pinned = std::min(n_pin_dynamic, n_slot);
+            // With per-device slots, find the tightest dynamic layer's free slots.
+            n_pinned = cache_.n_pinned();
             uint32_t n_static = 0, n_dyn = 0;
             for (uint32_t il = 0; il < n_layer; ++il) {
                 if (!is_moe[il]) {
@@ -1674,7 +1861,7 @@ bool bells_runtime::init(const bells_params & params,
             fprintf(stderr, "%s: pinned up to %u of %u slots/layer from %llu rows "
                             "(%llu experts copied); %u layers dynamic, %u layers static "
                             "(never observed, no graph split)\n",
-                    __func__, n_pinned, n_slot, (unsigned long long) n_rows,
+                    __func__, n_pinned, min_slot, (unsigned long long) n_rows,
                     (unsigned long long) n_copies, n_dyn, n_static);
         }
     }
@@ -1689,7 +1876,7 @@ bool bells_runtime::init(const bells_params & params,
         // the truth. It let BELLS accept 9-token ubatches while a dynamic layer had 32 free slots
         // against a worst case of 9*8 = 72 distinct experts, and the resulting ensure() failure
         // faulted in CUDA. Zero free slots means single-token only, not unlimited.
-        const uint32_t free_slots = n_slot > n_pinned ? n_slot - n_pinned : 0;
+        const uint32_t free_slots = min_slot > n_pinned ? min_slot - n_pinned : 0;
         params_.max_tokens = std::max(1u, free_slots/std::max(1u, n_expert_used));
     }
 
@@ -1748,29 +1935,42 @@ bool bells_runtime::init(const bells_params & params,
         }
     }
 
-    params_.n_slot = n_slot;
+    params_.n_slot = min_slot;
     ready_         = true;
     n_copied_      = 0;
     n_prefetched_  = 0;
     n_pf_used_     = 0;
 
-    const double vram_gib  = tensors_.vram_bytes()/1024.0/1024.0/1024.0;
-    const double vram_frac = dev_total > 0 ? (double) tensors_.vram_bytes()/dev_total : 0.0;
+    const double vram_gib = tensors_.vram_bytes()/1024.0/1024.0/1024.0;
 
-    fprintf(stderr, "%s: %u slots/layer of %u experts, %.2f GiB VRAM (%.0f%% of the card), "
-                    "serves ubatch <= %u%s\n",
-            __func__, n_slot, n_expert, vram_gib, 100.0*vram_frac,
-            params_.max_tokens,
-            params_.passive ? "  [PASSIVE: cache allocated but unused, research mode]" : "");
+    if (min_slot == max_slot_count) {
+        fprintf(stderr, "%s: %u slots/layer of %u experts, %.2f GiB VRAM, "
+                        "serves ubatch <= %u%s\n",
+                __func__, min_slot, n_expert, vram_gib,
+                params_.max_tokens,
+                params_.passive ? "  [PASSIVE: cache allocated but unused, research mode]" : "");
+    } else {
+        fprintf(stderr, "%s: %u..%u slots/layer of %u experts, %.2f GiB VRAM, "
+                        "serves ubatch <= %u%s\n",
+                __func__, min_slot, max_slot_count, n_expert, vram_gib,
+                params_.max_tokens,
+                params_.passive ? "  [PASSIVE: cache allocated but unused, research mode]" : "");
+    }
 
-    // Measured danger zone. The cache competes with the compute buffers, and past roughly
-    // four fifths of the card that competition dominates: on a 24 GB card the 235B fell to
-    // 1.02x at 19.9 GB of cache (83%) and 0.73x at 22.4 GB (93%), having peaked at 17.4 GB.
-    // Only a warning, since the exact threshold is model dependent and this is one data point.
-    if (vram_frac > 0.75) {
-        fprintf(stderr, "%s: that is most of the card, and past ~80%% the cache starts starving "
-                        "the compute buffers - measured 1.02x at 83%% and 0.73x at 93%% on one "
-                        "model. Try fewer slots if it is slow.\n", __func__);
+    // Per-device danger zone: warn if any device's cache uses more than 75% of its VRAM
+    for (const auto & di : devices) {
+        if (di.total_bytes == 0) continue;
+        size_t cache_on_dev = 0;
+        for (int32_t il : di.layer_ids) {
+            cache_on_dev += per_layer_slots[il] * per_expert;
+        }
+        const double frac = (double) cache_on_dev / di.total_bytes;
+        if (frac > 0.75) {
+            const char * dev_name = di.dev ? ggml_backend_dev_name(di.dev) : "unknown";
+            fprintf(stderr, "%s: %s: cache uses %.0f%% of VRAM. Past ~80%% the cache starts "
+                            "starving the compute buffers. Try fewer slots if it is slow.\n",
+                    __func__, dev_name, 100.0*frac);
+        }
     }
 
     return true;

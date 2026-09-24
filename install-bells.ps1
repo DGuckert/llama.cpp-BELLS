@@ -14,17 +14,26 @@ Write-Host ""
 Write-Host " Per-layer VRAM expert cache for MoE models" -ForegroundColor Gray
 Write-Host ""
 
-# Check Python
-$py = Get-Command python -ErrorAction SilentlyContinue
-if (-not $py) {
-    $py = Get-Command python3 -ErrorAction SilentlyContinue
+# Check Python — try py launcher first (always real on Windows), then python3, then python.
+# The Windows Store stubs for python/python3 resolve via Get-Command but fail at runtime.
+$pyExe = $null
+foreach ($candidate in @("py", "python3", "python")) {
+    $cmd = Get-Command $candidate -ErrorAction SilentlyContinue
+    if ($cmd) {
+        try {
+            $testVer = & $cmd.Source --version 2>&1
+            if ($testVer -match "Python \d+\.\d+") {
+                $pyExe = $cmd.Source
+                break
+            }
+        } catch {}
+    }
 }
-if (-not $py) {
+if (-not $pyExe) {
     Write-Host "[BELLS] Python 3.10+ required. Install from https://python.org" -ForegroundColor Red
     exit 1
 }
 
-$pyExe = $py.Source
 $ver = & $pyExe --version 2>&1
 Write-Host "[BELLS] Found $ver" -ForegroundColor Green
 

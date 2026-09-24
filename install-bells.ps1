@@ -37,12 +37,17 @@ if (-not $pyExe) {
 $ver = & $pyExe --version 2>&1
 Write-Host "[BELLS] Found $ver" -ForegroundColor Green
 
-# Check if we're inside the repo already
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$repoDir = $scriptDir
+# Check if we're inside the repo already (MyCommand.Path is null when run via iex)
+$scriptPath = $MyInvocation.MyCommand.Path
+$repoDir = $null
+if ($scriptPath) {
+    $scriptDir = Split-Path -Parent $scriptPath
+    if (Test-Path (Join-Path $scriptDir "tools\bells-manager\install.py")) {
+        $repoDir = $scriptDir
+    }
+}
 
-if (-not (Test-Path (Join-Path $repoDir "tools\bells-manager\install.py"))) {
-    # Not in repo — clone it
+if (-not $repoDir) {
     $repoDir = Join-Path $env:USERPROFILE "llama.cpp-BELLS"
     if (-not (Test-Path $repoDir)) {
         Write-Host "[BELLS] Cloning repository..." -ForegroundColor Yellow
@@ -52,7 +57,10 @@ if (-not (Test-Path (Join-Path $repoDir "tools\bells-manager\install.py"))) {
             exit 1
         }
     } else {
-        Write-Host "[BELLS] Repository already exists at $repoDir" -ForegroundColor Green
+        Write-Host "[BELLS] Updating repository at $repoDir..." -ForegroundColor Yellow
+        try { git -C $repoDir fetch origin 2>&1 | Out-Null } catch {}
+        try { git -C $repoDir checkout master 2>&1 | Out-Null } catch {}
+        try { git -C $repoDir reset --hard origin/master 2>&1 | Out-Null } catch {}
     }
 }
 

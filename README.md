@@ -67,8 +67,9 @@ cmake --build build --config Release
 | Qwen3.6-35B Q4 | RTX 2060 6 GB | 32 GB DDR4 | — | **36.3 tok/s** | — |
 | Qwen3-30B-A3B Q4 | RTX 2060 6 GB | 32 GB DDR4 | 22.4 tok/s | **28.3 tok/s** | 1.3x |
 | Flash-Next 177B Q2 | RTX 3060 12 GB | 32 GB DDR4 | 14.7 tok/s | **32.9 tok/s** | 2.2x |
+| Qwen3-Coder-Next 80B Q2 | RTX 2060 6 GB | 32 GB DDR4 | — | **27.2 tok/s** | — |
 
-Models streamed from NVMe via mmap. The 177B model (65 GB quantised) doesn't even fit in 32 GB RAM — the page cache handles it transparently.
+Models streamed from NVMe via mmap. The 177B model (65 GB quantised) doesn't even fit in 32 GB RAM — the page cache handles it transparently. Coder-Next at 64k context: 20.8 tok/s; at 131k: 19.3 tok/s.
 
 "Without BELLS" means `--cpu-moe -ngl 99` (all attention on GPU, all experts on CPU). The baseline for models that don't fit in VRAM at all is CPU-only, which is far slower.
 
@@ -120,6 +121,7 @@ BELLS works with any MoE model in GGUF format. Tested and tuned for:
 | Qwen3-30B-A3B | 30B total, 3B active | 128 per layer | 8 | Q4: 18 GB, Q6: 24 GB |
 | Qwen3.6-35B | 35B total, ~5B active | 64 per layer | 4 | Q4: 23 GB, Q6: 28 GB |
 | Flash-Next 177B | 177B total | 128 per layer | 8 | IQ3: 65 GB, Q2: 70 GB |
+| Qwen3-Coder-Next 80B | 80B total, 3B active | 256 per layer | 8 | Q2: 25 GB, Q4: 46 GB |
 | DeepSeek-V3 | 671B total | 256 per layer | 8 | IQ3: 100 GB, Q4: 190 GB |
 
 Dense models (Llama, Mistral, Phi, etc.) are unaffected by BELLS flags.
@@ -351,6 +353,19 @@ pip install huggingface_hub    # for model search
 | Model fits in RAM | Slightly slower copies | Fastest copies (async DMA) |
 | Model exceeds RAM | Works — OS pages from NVMe transparently | Will exhaust RAM and swap, don't use |
 | Use when | Model > RAM, or you want to share RAM with other apps | Model fits comfortably in RAM and you want max throughput |
+
+### Combining `-ot` with BELLS
+
+You can pin the hottest expert layers to the GPU with `-ot` and let BELLS cache the rest. Layers already in VRAM are skipped by the cache — no wasted slots, no conflicts. This gives you fast prefill from the pinned layers and fast decode from the cache on everything else.
+
+```sh
+# pin layers 0–7 to GPU, BELLS caches experts for layers 8–47
+llama-server -m model.gguf -ngl 99 \
+  -ot "blk\.[0-7]\.ffn_(gate|up|down)_exps\.weight=CUDA0" \
+  --cpu-moe --bells -fa -c 4096
+```
+
+Remember: `-ot` must come **before** `--cpu-moe` on the command line.
 
 ### Context window vs BELLS cache
 

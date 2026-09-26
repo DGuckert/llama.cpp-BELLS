@@ -125,6 +125,11 @@ public:
         ggml_backend_t             backend = nullptr;
     };
 
+    // Estimate total allocation size for a given slot count, including alignment and padding.
+    // Does not allocate any weights. Returns SIZE_MAX on error.
+    static size_t allocation_bytes(ggml_backend_buffer_type_t buft, const std::vector<layer_src> & srcs,
+                                   uint32_t n_slot, ggml_type cache_type = GGML_TYPE_COUNT);
+
     // `backend` is the compute backend the graph runs on.
     //
     // `copy_backend`, when given, is a *second* backend on the same device, which means a second
@@ -204,8 +209,11 @@ public:
         return (int32_t) entries_[index_[il]].n_slot;
     }
 
-    // bytes moved per expert, for budgeting
+    // Largest expert across all layers, for scratch buffers.
     size_t bytes_per_expert() const { return bytes_per_expert_; }
+
+    // Actual expert size for a specific layer.
+    size_t expert_bytes(uint32_t il) const;
 
 private:
     struct entry {
@@ -215,6 +223,7 @@ private:
         ggml_tensor * gate_up = nullptr;
         ggml_tensor * slots   = nullptr;
         layer_src     src;
+        size_t        expert_bytes = 0;
         uint32_t      n_slot  = 0;
 
         ggml_backend_t backend = nullptr;
@@ -347,6 +356,9 @@ private:
     uint64_t                    l2_n_promote_  = 0;
     std::vector<char>           l2_stage_;
 };
+
+// Read an I32 routing tensor into packed host storage, preserving all tensor strides.
+void bells_read_ids(const ggml_tensor * tensor, std::vector<int32_t> & ids);
 
 // There was a bells_predictor here: a token id -> per-layer expert ranking, counted over a
 // routing trace and used to prefetch before layer 0 ran. It worked, in the sense that it
@@ -547,7 +559,7 @@ public:
     uint64_t n_hit()       const { return cache_.n_hit();  }
     uint64_t n_miss()      const { return cache_.n_miss(); }
     uint64_t n_copied()    const { return n_copied_;       }
-    uint64_t bytes_moved() const { return n_copied_*(uint64_t) tensors_.bytes_per_expert(); }
+    uint64_t bytes_moved() const { return n_bytes_moved_; }
 
     // Cost accounting for the per-layer host round trip, in microseconds.
     //
@@ -631,6 +643,7 @@ private:
     bool     ready_      = false;
     bool     active_now_ = false;
     uint64_t n_copied_   = 0;
+    uint64_t n_bytes_moved_ = 0;
 
     uint64_t n_tok_seen_    = 0;   // ubatches served, drives the refresh rotation
 

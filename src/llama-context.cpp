@@ -1881,77 +1881,68 @@ bool llama_context::bells_eval(ggml_tensor * t, bool ask) {
         }
     }
 
-    // warmup builds its graph without the cache, so there is nothing here to make resident
-    if (is_topk && bells && bells->ready() && !cparams.warmup) {
-        const int il = atoi(t->name + plen);
+    // Read routing ids once, share across all consumers (bells cache, moe_stats, moe_prefetch).
+    const bool need_routing = is_topk && !cparams.warmup &&
+        ((bells && bells->ready()) || (moe_st && moe_st->enabled()) || moe_pf);
 
-        // the topk tensor is a strided view of the argsort, so read it row by row
+    if (need_routing) {
+        const int     il   = atoi(t->name + plen);
         const int64_t k    = t->ne[0];
         const int64_t rows = ggml_nrows(t);
 
-        std::vector<int32_t> ids((size_t) k*rows);
-
-        // This is the device->host sync that splits the graph at every MoE layer. Timed
-        // separately from the copies because it is paid whether or not anything misses.
         const auto t_rb0 = std::chrono::steady_clock::now();
-        for (int64_t i = 0; i < rows; ++i) {
-            ggml_backend_tensor_get(t, ids.data() + i*k, i*t->nb[1], k*sizeof(int32_t));
-        }
+        bells_read_ids(t, bells_routing_ids);
         const auto t_rb1 = std::chrono::steady_clock::now();
 
-        bells->add_readback_us(
-            std::chrono::duration_cast<std::chrono::microseconds>(t_rb1 - t_rb0).count());
+        const int32_t * ids  = bells_routing_ids.data();
+        const size_t    nids = bells_routing_ids.size();
 
-        // Report what routing actually saw. Valid expert ids are [0, n_expert); anything
-        // outside that means the read came back wrong, which would leave the cache holding
-        // whatever it was initialised with while the matmuls index it happily.
         if (trace) {
             static int n_rt = 0;
             if (n_rt < 12) {
                 n_rt++;
-                int32_t lo = ids.empty() ? -1 : ids[0], hi = lo;
-                for (int32_t v : ids) { if (v < lo) lo = v; if (v > hi) hi = v; }
+                int32_t lo = nids == 0 ? -1 : ids[0], hi = lo;
+                for (size_t j = 0; j < nids; ++j) { if (ids[j] < lo) lo = ids[j]; if (ids[j] > hi) hi = ids[j]; }
                 fprintf(stderr, "%s: routing il=%d rows=%lld k=%lld nb1=%zu ids[0..3]=%d,%d,%d,%d range=[%d,%d]\n",
                         __func__, il, (long long) rows, (long long) k, (size_t) t->nb[1],
-                        ids.size() > 0 ? ids[0] : -1, ids.size() > 1 ? ids[1] : -1,
-                        ids.size() > 2 ? ids[2] : -1, ids.size() > 3 ? ids[3] : -1, lo, hi);
+                        nids > 0 ? ids[0] : -1, nids > 1 ? ids[1] : -1,
+                        nids > 2 ? ids[2] : -1, nids > 3 ? ids[3] : -1, lo, hi);
                 fflush(stderr);
             }
         }
 
-        if (!bells->on_routing(il, ids.data(), ids.size())) {
-            // Once, with the numbers. Every MoE layer hits this in the same ubatch, so the
-            // unconditional version printed 48 identical lines at llama-server startup and
-            // looked like a crash. It is also not actionable without knowing how far over the
-            // cache the request went, which is what the counts are for.
-            //
-            // Reaching here means active() admitted a ubatch whose routing wants more distinct
-            // experts than the cache has slots - so n_tokens*n_expert_used exceeded n_slot
-            // despite max_tokens being derived to prevent exactly that. Worth the numbers.
-            static bool warned = false;
-            if (!warned) {
-                warned = true;
+        if (bells && bells->ready() && bells->tensors().has(il)) {
+            bells->add_readback_us(
+                std::chrono::duration_cast<std::chrono::microseconds>(t_rb1 - t_rb0).count());
 
-                std::vector<uint8_t> seen;
-                size_t n_distinct = 0;
-                for (int32_t e : ids) {
-                    if (e < 0) {
-                        continue;
+            if (!bells->on_routing(il, ids, nids)) {
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+
+                    std::vector<uint8_t> seen;
+                    size_t n_distinct = 0;
+                    for (size_t j = 0; j < nids; ++j) {
+                        if (ids[j] < 0) continue;
+                        if ((size_t) ids[j] >= seen.size()) seen.resize((size_t) ids[j] + 1, 0);
+                        if (!seen[ids[j]]) { seen[ids[j]] = 1; n_distinct++; }
                     }
-                    if ((size_t) e >= seen.size()) {
-                        seen.resize((size_t) e + 1, 0);
-                    }
-                    if (!seen[e]) {
-                        seen[e] = 1;
-                        n_distinct++;
-                    }
+
+                    LLAMA_LOG_ERROR("%s: layer %d wants %zu distinct experts from %lld tokens x %lld "
+                                    "active, more than the cache holds - raise --bells-slots. "
+                                    "Further occurrences suppressed.\n",
+                                    __func__, il, n_distinct, (long long) rows, (long long) k);
                 }
-
-                LLAMA_LOG_ERROR("%s: layer %d wants %zu distinct experts from %lld tokens x %lld "
-                                "active, more than the cache holds - raise --bells-slots. "
-                                "Further occurrences suppressed.\n",
-                                __func__, il, n_distinct, (long long) rows, (long long) k);
             }
+        }
+
+        if (moe_st && moe_st->enabled()) {
+            moe_st->note(il, ids, nids);
+        }
+
+        if (moe_pf && !(bells && bells->ready())) {
+            moe_pf->note(il, ids, nids);
+            moe_pf->lookahead(il + 1);
         }
     }
 
@@ -1961,37 +1952,6 @@ bool llama_context::bells_eval(ggml_tensor * t, bool ask) {
         std::vector<float> wv((size_t) nw);
         ggml_backend_tensor_get(t, wv.data(), 0, nw*sizeof(float));
         moe_st->note_weights((uint32_t) il_w, wv.data(), wv.size());
-    }
-
-    // Measurement path: count routing without touching any tensor. Runs alongside whatever else
-    // is enabled, including the expert cache, so the histogram reflects the real workload.
-    if (is_topk && moe_st && moe_st->enabled() && !cparams.warmup) {
-        const int     il   = atoi(t->name + plen);
-        const int64_t k    = t->ne[0];
-        const int64_t rows = ggml_nrows(t);
-
-        std::vector<int32_t> sids((size_t) k*rows);
-        for (int64_t i = 0; i < rows; ++i) {
-            ggml_backend_tensor_get(t, sids.data() + i*k, i*t->nb[1], k*sizeof(int32_t));
-        }
-        moe_st->note(il, sids.data(), sids.size());
-    }
-
-    // Prefetch-only path: no VRAM cache involved. Read which experts routing picked, then ask the
-    // OS for the next layers' likely extents while this layer is still computing on the GPU - the
-    // only point in the schedule with lead time to hide a fault behind.
-    if (is_topk && moe_pf && !(bells && bells->ready()) && !cparams.warmup) {
-        const int     il   = atoi(t->name + plen);
-        const int64_t k    = t->ne[0];
-        const int64_t rows = ggml_nrows(t);
-
-        std::vector<int32_t> ids((size_t) k*rows);
-        for (int64_t i = 0; i < rows; ++i) {
-            ggml_backend_tensor_get(t, ids.data() + i*k, i*t->nb[1], k*sizeof(int32_t));
-        }
-
-        moe_pf->note(il, ids.data(), ids.size());
-        moe_pf->lookahead(il + 1);
     }
 
     return true;

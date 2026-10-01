@@ -17,7 +17,13 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <set>
 #include <string>
+
+static bool bells_env_on(const char * name) {
+    const char * value = getenv(name);
+    return value && value[0] && value[0] != '0';
+}
 
 void bells_cache::init(uint32_t n_layer, uint32_t n_expert, uint32_t n_slot) {
     std::vector<uint32_t> per_layer(n_layer, std::min(n_slot, n_expert));
@@ -44,6 +50,7 @@ void bells_cache::init(uint32_t n_layer, uint32_t n_expert, const std::vector<ui
         l.slot_expert.assign(ns,        -1);
         l.last_used.assign(ns,           0);
         l.pinned.assign(ns,              0);
+        l.usage.assign(n_expert_,      0.0f);
     }
 
     clock_    = 0;
@@ -57,9 +64,88 @@ void bells_cache::reset() {
         std::fill(l.expert_slot.begin(), l.expert_slot.end(), -1);
         std::fill(l.slot_expert.begin(), l.slot_expert.end(), -1);
         std::fill(l.last_used.begin(),   l.last_used.end(),    0);
+        std::fill(l.usage.begin(),       l.usage.end(),      0.0f);
     }
 
     clock_ = 0;
+}
+
+void bells_cache::decay_usage(float factor) {
+    for (auto & l : layers_) {
+        for (float & u : l.usage) {
+            u *= factor;
+        }
+    }
+}
+
+void bells_cache::adapt(std::vector<adapt_swap> & out, uint32_t max_swaps,
+                        float min_usage, float threshold) {
+    struct swap_t { float gain; uint32_t il; int32_t in_expert, out_expert; };
+    std::vector<swap_t> swaps;
+    std::vector<std::pair<float, int32_t>> cand, vict;
+
+    for (uint32_t il = 0; il < n_layer_; ++il) {
+        if (n_slot_per_layer_[il] == 0) {
+            continue;
+        }
+        layer & l = layers_[il];
+        cand.clear();
+        vict.clear();
+
+        for (uint32_t e = 0; e < n_expert_; ++e) {
+            const float u = (e < l.usage.size()) ? l.usage[e] : 0.0f;
+            if (l.expert_slot[e] < 0) {
+                if (u >= min_usage) {
+                    cand.emplace_back(u, (int32_t) e);
+                }
+            } else {
+                const int32_t s = l.expert_slot[e];
+                if (!l.pinned.empty() && l.pinned[s]) {
+                    continue;
+                }
+                vict.emplace_back(u, (int32_t) e);
+            }
+        }
+
+        if (cand.empty() || vict.empty()) {
+            continue;
+        }
+
+        std::sort(cand.begin(), cand.end(), [](auto & a, auto & b) { return a.first > b.first; });
+        const size_t nc = std::min(cand.size(), vict.size());
+        std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
+                          [](auto & a, auto & b) { return a.first < b.first; });
+
+        for (size_t i = 0; i < nc; ++i) {
+            if (cand[i].first < vict[i].first + threshold) {
+                break;
+            }
+            swaps.push_back({ cand[i].first - vict[i].first, il,
+                              cand[i].second, vict[i].second });
+        }
+    }
+
+    std::sort(swaps.begin(), swaps.end(), [](const swap_t & a, const swap_t & b) {
+        return a.gain > b.gain;
+    });
+    if (swaps.size() > max_swaps) {
+        swaps.resize(max_swaps);
+    }
+
+    for (const swap_t & sw : swaps) {
+        layer & l = layers_[sw.il];
+        const int32_t slot = l.expert_slot[sw.out_expert];
+        if (slot < 0) {
+            continue;
+        }
+
+        l.expert_slot[sw.out_expert] = -1;
+        l.slot_expert[slot]          = sw.in_expert;
+        l.expert_slot[sw.in_expert]  = slot;
+        l.last_used[slot]            = clock_;
+
+        out.push_back({ sw.il, { sw.in_expert, slot, sw.out_expert } });
+    }
 }
 
 void bells_cache::pin_experts(uint32_t il, const std::vector<int32_t> & experts,
@@ -104,9 +190,11 @@ int32_t bells_cache::victim(layer & l, uint32_t n_slots, const int32_t * keep, s
                             const std::vector<uint8_t> * protect) const {
     int32_t best     = -1;
     int64_t best_age = 0;
+    float   best_use = 0.0f;
 
     int32_t fallback     = -1;
     int64_t fallback_age = 0;
+    float   fallback_use = 0.0f;
 
     for (uint32_t s = 0; s < n_slots; ++s) {
         const int32_t held = l.slot_expert[s];
@@ -115,8 +203,6 @@ int32_t bells_cache::victim(layer & l, uint32_t n_slots, const int32_t * keep, s
             return (int32_t) s;
         }
 
-        // Permanently seated by --pin-experts. Skipped before anything else is considered, so
-        // the measured hot set cannot be cycled out by a single cold token.
         if (!l.pinned.empty() && l.pinned[s]) {
             continue;
         }
@@ -134,17 +220,31 @@ int32_t bells_cache::victim(layer & l, uint32_t n_slots, const int32_t * keep, s
 
         const bool wanted_soon = protect && (size_t) held < protect->size() && (*protect)[held];
 
-        if (wanted_soon) {
-            if (fallback < 0 || l.last_used[s] < fallback_age) {
-                fallback     = (int32_t) s;
-                fallback_age = l.last_used[s];
+        if (use_usage_ && (size_t) held < l.usage.size()) {
+            const float u = l.usage[held];
+            if (wanted_soon) {
+                if (fallback < 0 || u < fallback_use) {
+                    fallback     = (int32_t) s;
+                    fallback_use = u;
+                }
+                continue;
             }
-            continue;
-        }
-
-        if (best < 0 || l.last_used[s] < best_age) {
-            best     = (int32_t) s;
-            best_age = l.last_used[s];
+            if (best < 0 || u < best_use) {
+                best     = (int32_t) s;
+                best_use = u;
+            }
+        } else {
+            if (wanted_soon) {
+                if (fallback < 0 || l.last_used[s] < fallback_age) {
+                    fallback     = (int32_t) s;
+                    fallback_age = l.last_used[s];
+                }
+                continue;
+            }
+            if (best < 0 || l.last_used[s] < best_age) {
+                best     = (int32_t) s;
+                best_age = l.last_used[s];
+            }
         }
     }
 
@@ -204,6 +304,8 @@ bool bells_cache::ensure(uint32_t il, const int32_t * experts, size_t n,
         if (e < 0 || (uint32_t) e >= n_expert_) {
             continue;
         }
+
+        l.usage[e] += 1.0f;
 
         if (l.expert_slot[e] >= 0) {
             n_hit_++;
@@ -799,6 +901,14 @@ void bells_tensors::warm_lookahead(uint32_t il_next) {
 }
 
 void bells_tensors::free() {
+    if (copy_backend_) ggml_backend_synchronize(copy_backend_);
+    if (backend_) ggml_backend_synchronize(backend_);
+    for (auto & e : entries_) {
+        if (e.copied) ggml_backend_event_free(e.copied);
+        e.copied = nullptr;
+        e.pending = false;
+    }
+
     free_l2();
 
     if (stage_buf_) {
@@ -1140,6 +1250,35 @@ void bells_tensors::sync_copies() {
     ggml_backend_event_wait(backend_, copy_event_);
 
     copies_pending_ = false;
+}
+
+bool bells_tensors::enable_layer_events() {
+    if (!copy_backend_) return false;
+    for (auto & e : entries_) {
+        if (e.copied) continue;
+        ggml_backend_dev_t dev = e.backend ? ggml_backend_get_device(e.backend) : nullptr;
+        if (!dev) dev = backend_ ? ggml_backend_get_device(backend_) : nullptr;
+        if (!dev) return false;
+        e.copied = ggml_backend_event_new(dev);
+        if (!e.copied) return false;
+    }
+    return true;
+}
+
+void bells_tensors::mark_layer_copies(uint32_t il) {
+    if (!has(il)) return;
+    entry & e = get_mut(il);
+    if (!e.copied || !copy_backend_) return;
+    ggml_backend_event_record(e.copied, copy_backend_);
+    e.pending = true;
+}
+
+void bells_tensors::wait_layer_copies(uint32_t il) {
+    if (!has(il)) return;
+    entry & e = get_mut(il);
+    if (!e.pending || !e.copied || !backend_) return;
+    ggml_backend_event_wait(backend_, e.copied);
+    e.pending = false;
 }
 
 void bells_tensors::copy_expert(uint32_t il, int32_t expert, int32_t slot) {
@@ -1827,6 +1966,7 @@ bool bells_runtime::init(const bells_params & params,
         FILE * f = fopen(params_.pin_file.c_str(), "r");
         if (!f) {
             fprintf(stderr, "%s: cannot read --pin-experts file %s\n", __func__, params_.pin_file.c_str());
+            return false;
         } else {
             char line[256];
             bool first = true;
@@ -1993,6 +2133,20 @@ bool bells_runtime::init(const bells_params & params,
         }
     }
 
+    // BELLS_ADAPT=N: run adaptive pin swaps every N decode tokens
+    if (const char * ae = getenv("BELLS_ADAPT")) {
+        adapt_every_ = (uint32_t) atoi(ae);
+        if (adapt_every_ > 0) {
+            cache_.set_use_usage(true);
+            fprintf(stderr, "%s: adaptive pins on, every %u tokens\n", __func__, adapt_every_);
+        }
+    }
+
+    // BELLS_DRAFT_GATE=0.5: confidence gate for MTP-fed lookahead
+    if (const char * dg = getenv("BELLS_DRAFT_GATE")) {
+        draft_gate_ = (float) atof(dg);
+    }
+
     params_.n_slot = min_slot;
     ready_         = true;
     n_copied_      = 0;
@@ -2031,6 +2185,8 @@ bool bells_runtime::init(const bells_params & params,
                     __func__, dev_name, 100.0*frac);
         }
     }
+
+    gp_init();
 
     return true;
 }
@@ -2084,6 +2240,23 @@ bool bells_runtime::init_l2(ggml_backend_buffer_type_t buft, ggml_backend_t l2_b
 void bells_runtime::free() {
     pf_stop();
 
+    if (gp_enabled_) {
+        fprintf(stderr, "bells_global: %llu prefetched, %llu used at deadline, %llu unused, %.2f MiB transferred, %llu backoffs\n",
+                (unsigned long long) n_prefetched_, (unsigned long long) n_pf_used_,
+                (unsigned long long) gp_unused_, gp_bytes_/1024.0/1024.0, (unsigned long long) gp_backoffs_);
+        fprintf(stderr, "bells_global: %.2f ms waiting for submission, %.2f ms scheduling\n", gp_wait_us_/1000.0, gp_schedule_us_/1000.0);
+        fprintf(stderr, "bells_global: %llu candidates filtered, %llu/%llu shadow predictions correct\n",
+                (unsigned long long) gp_filtered_, (unsigned long long) gp_trial_used_, (unsigned long long) gp_trials_);
+    }
+    gp_enabled_ = gp_active_ = false;
+    gp_links_.clear();
+    gp_layers_.clear();
+    gp_scores_.clear();
+    gp_candidates_.clear();
+    gp_inflight_ = gp_bytes_ = gp_unused_ = gp_backoffs_ = 0;
+    gp_wait_us_ = gp_schedule_us_ = 0;
+    gp_filtered_ = gp_trials_ = gp_trial_used_ = 0;
+
     const uint64_t tot = cache_.n_hit() + cache_.n_miss();
     if (tot > 0) {
         fprintf(stderr, "%s: hit %.1f%% (%llu of %llu), %llu experts copied, %.2f GiB moved\n",
@@ -2100,6 +2273,11 @@ void bells_runtime::free() {
         fprintf(stderr, "%s: prefetched %llu experts, %.2f GiB speculative\n", __func__,
                 (unsigned long long) n_prefetched_,
                 n_prefetched_*(double) tensors_.bytes_per_expert()/1024.0/1024.0/1024.0);
+    }
+
+    if (n_adapted_ > 0) {
+        fprintf(stderr, "%s: adaptive swaps: %llu experts swapped in\n", __func__,
+                (unsigned long long) n_adapted_);
     }
 
     if (n_layer_calls_ > 0) {
@@ -2132,6 +2310,21 @@ void bells_runtime::free() {
     n_bytes_moved_ = 0;
 }
 
+void bells_runtime::reset_decode_stats() {
+    cache_.reset_counters();
+    n_copied_      = 0;
+    n_bytes_moved_ = 0;
+    us_readback_   = 0;
+    us_copy_       = 0;
+    us_upload_     = 0;
+    n_layer_calls_ = 0;
+    l2_n_hit_      = 0;
+    l2_n_miss_     = 0;
+    n_prefetched_  = 0;
+    n_pf_used_     = 0;
+    n_adapted_     = 0;
+}
+
 void bells_runtime::pf_start() {
     if (pf_enabled_) {
         return;
@@ -2155,7 +2348,12 @@ void bells_runtime::pf_start() {
 
             // The only work handed to this thread. Cache bookkeeping already happened on the
             // main thread, so this touches nothing bells_cache owns.
-            tensors_.copy_expert(job.il, job.copy.expert, job.copy.slot);
+            if (gp_enabled_) {
+                std::lock_guard<std::mutex> copy_lock(gp_copy_mutex_);
+                gp_copy(job.il, job.copy);
+            } else {
+                tensors_.copy_expert(job.il, job.copy.expert, job.copy.slot);
+            }
 
             {
                 std::lock_guard<std::mutex> lk(pf_mutex_);
@@ -2203,10 +2401,26 @@ void bells_runtime::pf_drain(uint32_t il) {
     });
 }
 
+void bells_runtime::set_draft_tokens(const int32_t * ids, const float * probs, size_t n) {
+    draft_ids_.assign(ids, ids + n);
+    if (probs) {
+        draft_probs_.assign(probs, probs + n);
+    } else {
+        draft_probs_.assign(n, 1.0f);
+    }
+
+    // enable lookahead if not already on (drafts substitute for BELLS_FUTURE)
+    if (n > 0 && protect_.empty() && conf_.enabled() && !tensors_.layers().empty()) {
+        const uint32_t max_il = (uint32_t) tensors_.layers().back() + 1;
+        const uint32_t n_expert = n_expert_used_ > 0 ? 256 : 0;
+        protect_.assign(max_il, std::vector<uint8_t>(n_expert, 0));
+        if (lookahead_ == 0) {
+            lookahead_ = (uint32_t) n;
+        }
+    }
+}
+
 void bells_runtime::build_protect(int32_t pos) {
-    // Union of the experts the next K tokens are predicted to want, per layer. Confidence is
-    // deliberately not thresholded here: for eviction a weak signal is still better than the
-    // nothing LRU has, and a wrong entry only costs a slightly worse victim choice.
     for (int32_t il : tensors_.layers()) {
         if ((size_t) il >= protect_.size()) {
             continue;
@@ -2214,13 +2428,26 @@ void bells_runtime::build_protect(int32_t pos) {
         std::fill(protect_[il].begin(), protect_[il].end(), (uint8_t) 0);
     }
 
-    for (uint32_t k = 1; k <= lookahead_; ++k) {
-        const size_t p = (size_t) pos + k;
-        if (p >= future_.size()) {
-            break;
-        }
+    // MTP-fed drafts take priority over the pre-recorded future sequence
+    const bool use_drafts = !draft_ids_.empty() && conf_.enabled();
 
-        const int32_t tok = future_[p];
+    const uint32_t n_look = use_drafts ? (uint32_t) draft_ids_.size() : lookahead_;
+
+    for (uint32_t k = 0; k < n_look; ++k) {
+        int32_t tok;
+
+        if (use_drafts) {
+            if (k < draft_probs_.size() && draft_probs_[k] < draft_gate_) {
+                continue;
+            }
+            tok = draft_ids_[k];
+        } else {
+            const size_t p = (size_t) pos + k + 1;
+            if (p >= future_.size()) {
+                break;
+            }
+            tok = future_[p];
+        }
 
         for (int32_t il : tensors_.layers()) {
             if ((size_t) il >= protect_.size()) {
@@ -2244,6 +2471,186 @@ void bells_runtime::build_protect(int32_t pos) {
             }
         }
     }
+
+    // clear drafts after use so they are not reused on the next token
+    draft_ids_.clear();
+    draft_probs_.clear();
+}
+
+void bells_runtime::gp_init() {
+    if (!params_.global_prefetch && !bells_env_on("BELLS_GLOBAL_PREFETCH")) return;
+    const auto setting = [](const char * name, uint32_t fallback, uint32_t limit, uint32_t minimum = 1) {
+        const char * value = getenv(name);
+        if (!value) return fallback;
+        char * end = nullptr;
+        const long n = strtol(value, &end, 10);
+        return end != value && !*end && n >= (long) minimum && (unsigned long) n <= limit ? (uint32_t) n : fallback;
+    };
+    gp_ahead_ = setting("BELLS_GP_AHEAD", 4, 8);
+    gp_min_seen_ = setting("BELLS_GP_MIN_SEEN", 16, 512);
+    gp_budget_ = (size_t) setting("BELLS_GP_MB", 8, 256)*1024*1024;
+    gp_conf_ = setting("BELLS_GP_CONF", 90, 100)/100.0f;
+    gp_precision_ = setting("BELLS_GP_PRECISION", 80, 100, 0);
+    std::vector<uint32_t> layers;
+    for (int32_t il : tensors_.layers()) {
+        if (should_observe(il)) layers.push_back(il);
+    }
+    const uint64_t ne = cache_.n_expert();
+    const uint64_t max_bytes = layers.size()*gp_ahead_*ne*(ne + 1)*sizeof(uint16_t);
+    if (layers.size() < 2 || max_bytes > 128ull*1024*1024 || !tensors_.enable_layer_events()) {
+        fprintf(stderr, "bells_global: disabled (requires bounded predictor memory, pinned staging and one GPU with a separate copy stream)\n");
+        return;
+    }
+    gp_layers_.resize(layers.back() + 1);
+    gp_scores_.resize((size_t) ne);
+    for (size_t i = 0; i < layers.size(); ++i) {
+        for (size_t j = i + 1; j < layers.size() && j <= i + gp_ahead_; ++j) {
+            gp_link link;
+            link.from = layers[i];
+            link.to = layers[j];
+            link.count.assign((size_t) ne*ne, 0);
+            link.seen.assign((size_t) ne, 0);
+            gp_layers_[link.from].outgoing.push_back(gp_links_.size());
+            gp_layers_[link.to].incoming.push_back(gp_links_.size());
+            gp_links_.push_back(std::move(link));
+        }
+    }
+    gp_enabled_ = true;
+    if (!bells_env_on("BELLS_GP_INLINE") && !bells_env_on("BELLS_VERIFY_COPY")) {
+        pf_pending_.assign(gp_layers_.size(), 0);
+        pf_start();
+    }
+    fprintf(stderr, "bells_global: online routing predictor, %u layers ahead, %.0f%% confidence, %.0f MiB shared budget, %s submission\n",
+            gp_ahead_, 100.0*gp_conf_, gp_budget_/1024.0/1024.0, pf_enabled_ ? "worker" : "inline");
+    fprintf(stderr, "bells_global: minimum measured precision %u%% (0 disables calibration)\n", gp_precision_);
+}
+
+void bells_runtime::gp_copy(uint32_t il, const bells_copy & copy) {
+    if (tensors_.has_l2() && copy.evicted >= 0) tensors_.l2_admit_from_l1(il, copy.evicted, copy.slot);
+    if (tensors_.has_l2() && tensors_.l2_lookup(il, copy.expert) >= 0) {
+        tensors_.l2_promote(il, copy.expert, copy.slot);
+    } else {
+        tensors_.copy_expert(il, copy.expert, copy.slot);
+    }
+    tensors_.mark_layer_copies(il);
+}
+
+void bells_runtime::gp_observe(uint32_t il, const int32_t * experts, size_t n) {
+    const uint32_t ne = cache_.n_expert();
+    if (il >= gp_layers_.size()) return;
+    for (size_t k = 0; k < n; ++k) {
+        if (experts[k] < 0 || (uint32_t) experts[k] >= ne) return;
+    }
+    gp_layer & layer = gp_layers_[il];
+    gp_inflight_ -= layer.pending.size()*tensors_.expert_bytes(il);
+    for (int32_t e : layer.pending) {
+        const bool used = std::find(experts, experts + n, e) != experts + n;
+        n_pf_used_ += used;
+        gp_unused_ += !used;
+        layer.useful += used;
+        layer.tested++;
+    }
+    layer.pending.clear();
+    if (layer.cooldown > 0) layer.cooldown--;
+    if (layer.tested >= 16) {
+        if (layer.useful*2 < layer.tested) {
+            layer.cooldown = 64;
+            gp_backoffs_++;
+        }
+        layer.tested = layer.useful = 0;
+    }
+    for (size_t index : layer.incoming) {
+        gp_link & link = gp_links_[index];
+        for (int32_t e : link.trial) {
+            const bool used = std::find(experts, experts + n, e) != experts + n;
+            if (link.tested >= 64) {
+                link.tested /= 2;
+                link.useful /= 2;
+            }
+            link.tested++;
+            link.useful += used;
+            gp_trials_++;
+            gp_trial_used_ += used;
+        }
+        link.trial.clear();
+        for (int32_t src : gp_layers_[link.from].routed) {
+            uint16_t & seen = link.seen[src];
+            uint16_t * row = link.count.data() + (size_t) src*ne;
+            if (seen >= 1024) {
+                seen /= 2;
+                for (uint32_t e = 0; e < ne; ++e) row[e] /= 2;
+            }
+            seen++;
+            for (size_t k = 0; k < n; ++k) {
+                if (std::find(experts, experts + k, experts[k]) == experts + k) row[experts[k]]++;
+            }
+        }
+    }
+    layer.routed.assign(experts, experts + n);
+    std::sort(layer.routed.begin(), layer.routed.end());
+    layer.routed.erase(std::unique(layer.routed.begin(), layer.routed.end()), layer.routed.end());
+}
+
+void bells_runtime::gp_schedule(uint32_t il, const int32_t * experts, size_t n) {
+    const uint32_t ne = cache_.n_expert();
+    auto & candidates = gp_candidates_;
+    candidates.clear();
+    if (il >= gp_layers_.size()) return;
+    const uint32_t limit = std::min(n_expert_used_, std::max(1u, cache_.n_slot()/8));
+    for (size_t index : gp_layers_[il].outgoing) {
+        gp_link & link = gp_links_[index];
+        const gp_layer & target = gp_layers_[link.to];
+        if (!target.routed.empty()) continue;
+        if (gp_precision_ == 0 && target.cooldown) continue;
+        const auto & slots = cache_.slot_table(link.to);
+        std::fill(gp_scores_.begin(), gp_scores_.end(), 0.0f);
+        for (size_t k = 0; k < n; ++k) {
+            const int32_t src = experts[k];
+            if (src < 0 || (uint32_t) src >= ne || link.seen[src] < gp_min_seen_) continue;
+            const uint16_t * row = link.count.data() + (size_t) src*ne;
+            const float scale = 1.0f/link.seen[src];
+            for (uint32_t e = 0; e < ne; ++e) gp_scores_[e] = std::max(gp_scores_[e], row[e]*scale);
+        }
+        const size_t start = candidates.size();
+        for (uint32_t e = 0; e < ne; ++e) {
+            if (slots[e] >= 0) continue;
+            if (gp_scores_[e] >= gp_conf_) candidates.push_back({ link.to, (int32_t) e, gp_scores_[e] });
+        }
+        std::sort(candidates.begin() + start, candidates.end(), [](const gp_candidate & a, const gp_candidate & b) {
+            return a.score != b.score ? a.score > b.score : a.expert < b.expert;
+        });
+        link.trial.clear();
+        for (size_t i = start; i < candidates.size() && i - start < limit; ++i) {
+            link.trial.push_back(candidates[i].expert);
+        }
+        if (target.cooldown || (gp_precision_ > 0 && (link.tested < 16 || link.useful*100 < gp_precision_*link.tested))) {
+            gp_filtered_ += candidates.size() - start;
+            candidates.resize(start);
+        }
+    }
+    for (const auto & c : candidates) {
+        gp_layer & layer = gp_layers_[c.il];
+        const size_t bytes = tensors_.expert_bytes(c.il);
+        if (layer.pending.size() >= limit || bytes > gp_budget_ - gp_inflight_) continue;
+        if (cache_.slot_table(c.il)[c.expert] >= 0) continue;
+        std::vector<int32_t> keep = layer.pending;
+        keep.push_back(c.expert);
+        copies_.clear();
+        cache_.prefetch(c.il, keep.data(), keep.size(), copies_);
+        for (const auto & copy : copies_) {
+            if (pf_enabled_) {
+                pf_submit(c.il, copy);
+            } else {
+                gp_copy(c.il, copy);
+            }
+            layer.pending.push_back(copy.expert);
+            gp_inflight_ += bytes;
+            gp_bytes_ += bytes;
+            n_prefetched_++;
+            n_copied_++;
+            n_bytes_moved_ += bytes;
+        }
+    }
 }
 
 void bells_runtime::begin_ubatch(int32_t token, int32_t pos, int64_t n_tokens) {
@@ -2251,12 +2658,57 @@ void bells_runtime::begin_ubatch(int32_t token, int32_t pos, int64_t n_tokens) {
     n_tok_seen_++;
 
     active_now_ = active(n_tokens);
+    gp_active_ = gp_enabled_ && active_now_ && n_tokens == 1;
+    for (auto & layer : gp_layers_) {
+        gp_unused_ += layer.pending.size();
+        layer.pending.clear();
+        layer.routed.clear();
+    }
+    gp_inflight_ = 0;
+    for (auto & link : gp_links_) link.trial.clear();
 
-    if (!active_now_ || !conf_.enabled() || token < 0) {
+    // prefill -> decode transition: reset counters so hit rates reflect decode only
+    const bool is_prefill = !active_now_;
+    if (was_prefill_ && !is_prefill) {
+        reset_decode_stats();
+    }
+    was_prefill_ = is_prefill;
+
+    if (!active_now_) {
         return;
     }
 
-    if (lookahead_ > 0 && pos >= 0 && !future_.empty()) {
+    // adaptive pins: decay usage and run background swaps every N decode tokens
+    if (adapt_every_ > 0 && (n_tok_seen_ % adapt_every_) == 0) {
+        std::vector<bells_cache::adapt_swap> swaps;
+        cache_.adapt(swaps, adapt_swaps_, adapt_min_, adapt_thresh_);
+        for (const auto & sw : swaps) {
+            if (tensors_.has_l2() && sw.copy.evicted >= 0) {
+                tensors_.l2_admit_from_l1(sw.il, sw.copy.evicted, sw.copy.slot);
+            }
+            tensors_.copy_expert(sw.il, sw.copy.expert, sw.copy.slot);
+        }
+        if (!swaps.empty()) {
+            tensors_.sync_copies();
+            std::set<uint32_t> dirty;
+            for (const auto & sw : swaps) { dirty.insert(sw.il); }
+            for (uint32_t il : dirty) {
+                tensors_.upload_slots(il, cache_.slot_table(il));
+            }
+        }
+        for (const auto & sw : swaps) {
+            n_bytes_moved_ += tensors_.expert_bytes(sw.il);
+        }
+        n_adapted_ += swaps.size();
+        n_copied_  += swaps.size();
+        cache_.decay_usage(adapt_decay_);
+    }
+
+    if (!conf_.enabled() || token < 0) {
+        return;
+    }
+
+    if ((lookahead_ > 0 && pos >= 0 && !future_.empty()) || !draft_ids_.empty()) {
         build_protect(pos);
     }
 
@@ -2354,7 +2806,9 @@ bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
     // them. This is the only synchronisation the background copier needs, and it is why cache
     // bookkeeping was kept on this thread.
     if (pf_enabled_) {
+        const auto pf_start = std::chrono::steady_clock::now();
         pf_drain(il);
+        if (gp_enabled_) gp_wait_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - pf_start).count();
     }
 
     // With --bells-split only the first K experts of each token are read through the cache; the
@@ -2373,6 +2827,15 @@ bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
         }
         experts = split_ids.data();
         n       = split_ids.size();
+    }
+
+    if (gp_active_) gp_observe(il, experts, n);
+
+    std::unique_lock<std::mutex> copy_lock(gp_copy_mutex_, std::defer_lock);
+    if (gp_enabled_) {
+        const auto lock_start = std::chrono::steady_clock::now();
+        copy_lock.lock();
+        gp_wait_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - lock_start).count();
     }
 
     // Every expert this layer asked for must be resident before the matmul reads the slot
@@ -2432,7 +2895,12 @@ bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
     // Make the compute stream wait for this layer's copies before anything reads the slots.
     // With one stream this is a no-op and the ordering was implicit; with two it is the only
     // thing standing between the graph and a half-written expert.
-    tensors_.sync_copies();
+    if (gp_enabled_) {
+        if (!copies_.empty()) tensors_.mark_layer_copies(il);
+        tensors_.wait_layer_copies(il);
+    } else {
+        tensors_.sync_copies();
+    }
 
     tensors_.upload_slots(il, cache_.slot_table(il));
 
@@ -2490,6 +2958,13 @@ bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
 
     us_copy_   += std::chrono::duration_cast<std::chrono::microseconds>(t_copy1 - t_copy0).count();
     us_upload_ += std::chrono::duration_cast<std::chrono::microseconds>(t_up1  - t_copy1).count();
+
+    if (copy_lock.owns_lock()) copy_lock.unlock();
+    if (gp_active_) {
+        const auto sched_start = std::chrono::steady_clock::now();
+        gp_schedule(il, experts, n);
+        gp_schedule_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - sched_start).count();
+    }
 
     return true;
 }

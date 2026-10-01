@@ -73,12 +73,28 @@ public:
     uint64_t n_hit()  const { return n_hit_;  }
     uint64_t n_miss() const { return n_miss_; }
 
+    void reset_counters() { n_hit_ = 0; n_miss_ = 0; }
+
+    void set_use_usage(bool v) { use_usage_ = v; }
+
+    void decay_usage(float factor);
+
+    struct adapt_swap {
+        uint32_t il;
+        bells_copy copy;
+    };
+
+    // Adaptive pins: find hot non-resident experts and swap with cold resident ones.
+    void adapt(std::vector<adapt_swap> & out, uint32_t max_swaps,
+               float min_usage, float threshold);
+
 private:
     struct layer {
         std::vector<int32_t> expert_slot;  // n_expert, -1 if not resident
         std::vector<int32_t> slot_expert;  // n_slot,   -1 if empty
         std::vector<int64_t> last_used;    // n_slot
         std::vector<uint8_t> pinned;       // n_slot,   1 = never evict
+        std::vector<float>   usage;        // n_expert, decayed access count
     };
 
     // slot to evict, preferring empty, then least recently used, skipping anything pinned.
@@ -94,6 +110,8 @@ private:
     int64_t clock_ = 0;
 
     uint32_t n_pinned_ = 0;   // pinned slots per layer
+
+    bool use_usage_ = false;  // use decayed usage for eviction instead of LRU
 
     uint64_t n_hit_  = 0;
     uint64_t n_miss_ = 0;
@@ -157,6 +175,9 @@ public:
     // separate copy backend is in use; with one, this is what keeps the graph from reading a
     // slot mid-write.
     void sync_copies();
+    bool enable_layer_events();
+    void mark_layer_copies(uint32_t il);
+    void wait_layer_copies(uint32_t il);
 
     void free();
 
@@ -227,6 +248,8 @@ private:
         uint32_t      n_slot  = 0;
 
         ggml_backend_t backend = nullptr;
+        ggml_backend_event_t copied = nullptr;
+        bool pending = false;
     };
 
     static const entry & empty();
@@ -417,6 +440,7 @@ private:
 
 struct bells_params {
     bool        enabled    = false;
+    bool        global_prefetch = false; // online predictions with one shared transfer budget
     uint32_t    n_slot     = 0;   // experts resident per layer
     // Largest ubatch BELLS will serve. 0 means derive it from the cache size.
     //
@@ -574,6 +598,14 @@ public:
     uint64_t us_copy()     const { return us_copy_;     }
     uint64_t us_upload()   const { return us_upload_;   }
     uint64_t n_layer_calls() const { return n_layer_calls_; }
+    uint64_t n_prefetch_filtered() const { return gp_filtered_; }
+    bool global_prefetch_enabled() const { return gp_enabled_; }
+
+    void reset_decode_stats();
+
+    // Feed draft token ids (from MTP or an external drafter) for lookahead eviction.
+    // Only tokens with prob >= gate (default 0.5) are used to protect experts.
+    void set_draft_tokens(const int32_t * ids, const float * probs, size_t n);
 
 private:
     bells_params  params_;
@@ -586,6 +618,40 @@ private:
     float    conf_thresh_ = 0.9f;
     uint64_t n_prefetched_ = 0;
     uint64_t n_pf_used_    = 0;
+
+    // Global prefetch: online inter-layer routing predictor.
+    // Learns P(expert_to | expert_from) for each (from_layer, to_layer) pair within a window,
+    // then prefetches high-confidence candidates before the target layer's routing runs.
+    struct gp_link {
+        uint32_t from, to;
+        std::vector<uint16_t> count;
+        std::vector<uint16_t> seen;
+        std::vector<int32_t> trial;
+        uint32_t tested = 0, useful = 0;
+    };
+    struct gp_layer {
+        std::vector<int32_t> routed, pending;
+        std::vector<size_t> incoming, outgoing;
+        uint32_t tested = 0, useful = 0, cooldown = 0;
+    };
+    struct gp_candidate { uint32_t il; int32_t expert; float score; };
+    void gp_init();
+    void gp_observe(uint32_t il, const int32_t * experts, size_t n);
+    void gp_schedule(uint32_t il, const int32_t * experts, size_t n);
+    void gp_copy(uint32_t il, const bells_copy & copy);
+    std::mutex gp_copy_mutex_;
+    std::vector<gp_link> gp_links_;
+    std::vector<gp_layer> gp_layers_;
+    std::vector<float> gp_scores_;
+    std::vector<gp_candidate> gp_candidates_;
+    bool gp_enabled_ = false, gp_active_ = false;
+    uint32_t gp_ahead_ = 4, gp_min_seen_ = 16;
+    float gp_conf_ = 0.90f;
+    uint32_t gp_precision_ = 80;
+    size_t gp_budget_ = 8ull*1024*1024, gp_inflight_ = 0;
+    uint64_t gp_bytes_ = 0, gp_unused_ = 0, gp_backoffs_ = 0;
+    uint64_t gp_wait_us_ = 0, gp_schedule_us_ = 0;
+    uint64_t gp_filtered_ = 0, gp_trials_ = 0, gp_trial_used_ = 0;
 
     // Lookahead eviction.
     //
@@ -604,6 +670,13 @@ private:
     uint32_t              lookahead_ = 0; // K, 0 = off
     std::vector<std::vector<uint8_t>> protect_;  // per model layer, bitmap over experts
     uint64_t              n_protect_hits_ = 0;
+
+    // MTP-fed lookahead: draft tokens from the model's MTP heads or an external drafter,
+    // used instead of the pre-recorded future_ sequence. Gate: only tokens with
+    // draft_probs_[i] >= draft_gate_ are used.
+    std::vector<int32_t>  draft_ids_;
+    std::vector<float>    draft_probs_;
+    float                 draft_gate_ = 0.5f;
 
     void build_protect(int32_t pos);
 
@@ -642,10 +715,17 @@ private:
 
     bool     ready_      = false;
     bool     active_now_ = false;
+    bool     was_prefill_ = true;
     uint64_t n_copied_   = 0;
     uint64_t n_bytes_moved_ = 0;
 
     uint64_t n_tok_seen_    = 0;   // ubatches served, drives the refresh rotation
+    uint32_t adapt_every_   = 0;   // 0 = off, else run adapt() every N decode tokens
+    uint32_t adapt_swaps_   = 96;
+    float    adapt_decay_   = 0.7f;
+    float    adapt_thresh_  = 1.5f;
+    float    adapt_min_     = 2.0f;
+    uint64_t n_adapted_     = 0;
 
     uint64_t us_readback_   = 0;
     uint64_t us_copy_       = 0;

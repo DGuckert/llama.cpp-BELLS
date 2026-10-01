@@ -4,7 +4,7 @@
 
 BELLS (**B**uffered **E**xpert **L**oading with **L**ayered **S**lots) is a [llama.cpp](https://github.com/ggml-org/llama.cpp) fork that adds a per-layer VRAM expert cache for Mixture-of-Experts models. Instead of keeping all experts in VRAM (impossible on consumer cards) or running them entirely on the CPU (slow), BELLS caches the hot experts on your GPU and streams the rest from RAM or NVMe on demand.
 
-Every expert the router picks still gets computed on the GPU — nothing is skipped, pruned, or approximated. Output is bit-identical to full-GPU inference.
+Every expert the router picks still gets computed on the GPU — nothing is skipped, pruned, or approximated. With the default cache path, output is bit-identical to full-GPU inference. Optional modes like `--bells-cache-type` (re-quantisation) and `--bells-split` (CPU/GPU split) change precision by design.
 
 ## Install
 
@@ -137,7 +137,7 @@ Dense models (Llama, Mistral, Phi, etc.) are unaffected by BELLS flags.
 | `--bells-slots N` | Cache N experts per layer in VRAM. Set to `-1` to auto-size from free VRAM. More slots = higher hit rate = faster. With multiple GPUs, auto-sizing gives each device its own slot count. |
 | `--bells-l2-slots N` | Use an idle secondary GPU's VRAM as an L2 victim cache. N experts per layer on GPU 2. `-1` to auto-size. Ignored on single-GPU systems and when both GPUs are actively computing. |
 | `--bells-split K` | Run K of each token's experts on GPU, the rest on CPU concurrently. The MoE output is a weighted sum, so splitting is exact — no quality loss. Fewer experts need to be in the cache. Default: 0 (all through cache). |
-| `--bells-refresh N` | Observe a rotating 1/N of MoE layers per token instead of every layer. Reduces graph-split overhead (~2.3 ms/token across 32 layers). Default: 1 (every layer). |
+| `--bells-refresh N` | Observe a fixed 1/N subset of MoE layers per token (layers where `il % N == 0`). Unobserved layers use a permanent pinned table, so `--pin-experts` is required. Reduces graph-split overhead (~2.3 ms/token across 32 layers). Default: 1 (every layer). |
 | `--bells-cache-type TYPE` | Store cached experts at a different quantisation than the model (e.g. `q2_K` when the model is `q4_K`). Fits more experts in the same VRAM at the cost of re-quantisation overhead. Experimental. |
 | `--bells-passive` | Research only. Allocate the cache and perform graph splits, but don't copy any experts. Measures mechanism overhead in isolation. |
 
@@ -146,6 +146,13 @@ Dense models (Llama, Mistral, Phi, etc.) are unaffected by BELLS flags.
 | Variable | Description |
 |---|---|
 | `GGML_CUDA_NO_PINNED=1` | Disable CUDA pinned (page-locked) host memory allocation. Use this if you see corrupted output or NaN on systems with IOMMU/DMA issues. |
+| `BELLS_ADAPT=N` | Enable adaptive pins: every N decode tokens, decay usage counters and swap the coldest resident experts for the hottest non-resident ones. Keeps the cache aligned with shifting access patterns. Try `BELLS_ADAPT=4`. |
+| `BELLS_GLOBAL_PREFETCH=1` | Enable the online global prefetch predictor. Learns inter-layer routing correlations (`P(expert_to \| expert_from)`) and speculatively copies high-confidence candidates before their layer runs. Requires a GPU with a separate copy stream. Stats printed at shutdown. |
+| `BELLS_GP_AHEAD=N` | How many layers ahead the global predictor looks (default 4, max 8). |
+| `BELLS_GP_CONF=N` | Minimum confidence percentage to issue a prefetch (default 90). |
+| `BELLS_GP_MB=N` | Shared byte budget for in-flight prefetches, in MiB (default 8). |
+| `BELLS_GP_MIN_SEEN=N` | Minimum observations before a link's predictions are trusted (default 16). |
+| `BELLS_GP_PRECISION=N` | Minimum measured prediction accuracy percentage; links below this are filtered (default 80, 0 disables calibration). |
 
 ### Flag ordering
 
@@ -258,6 +265,14 @@ Token arrives → Router selects experts → For each expert not in L1:
 - **Per-layer indexing.** Each layer maintains its own slot map (`expert → slot`). This matches how MoE routing works and avoids cross-layer eviction interference.
 - **Victim cache semantics.** L2 only receives data evicted from L1 (or promoted back). It never loads directly from host. This keeps the L2 population naturally tuned to the model's actual access pattern.
 - **Backward compatible.** Single-GPU systems behave identically to stock llama.cpp. Dense models are completely unaffected.
+
+### Adaptive pins
+
+Set `BELLS_ADAPT=N` to let the cache track which experts are actually hot and swap cold residents for hot non-residents every N tokens. Without it, the cache is purely reactive — it only loads an expert when the router asks for it. With adaptive pins, usage counters decay over time and a background pass swaps the coldest cached experts for the hottest ones that aren't cached yet, keeping the working set aligned with the model's shifting attention.
+
+### Global prefetch
+
+Set `BELLS_GLOBAL_PREFETCH=1` to enable the online inter-layer routing predictor. It observes which experts each layer routes to and builds a co-occurrence table: for each `(from_layer, to_layer)` pair within a configurable window, it learns `P(expert_to | expert_from)`. When a layer finishes routing, the predictor scans upcoming layers and speculatively copies any candidate whose confidence exceeds the threshold (default 90%). Copies go through a worker thread and use per-layer GPU events for ordering, so speculative work overlaps with compute. Links that predict poorly are automatically cooled down.
 
 ## Performance estimator
 

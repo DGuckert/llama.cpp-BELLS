@@ -25,7 +25,35 @@ static bool task_resets_idle_timer(server_task_type type) {
     return type != SERVER_TASK_TYPE_METRICS;
 }
 
+bool server_queue::is_foreground(server_task_type type) {
+    switch (type) {
+        case SERVER_TASK_TYPE_METRICS:
+        case SERVER_TASK_TYPE_SLOT_GET:
+        case SERVER_TASK_TYPE_GET_LORA:
+        case SERVER_TASK_TYPE_NEXT_RESPONSE:
+        case SERVER_TASK_TYPE_CANCEL:
+        case SERVER_TASK_TYPE_IDLE_GET:
+            return false;
+        default: return true;
+    }
+}
+
+void server_queue::note_activity() {
+    foreground_time.store(ggml_time_ms());
+    foreground_serial.fetch_add(1);
+}
+
+bool server_queue::has_pending_foreground() {
+    std::lock_guard<std::mutex> lock(mutex_tasks);
+    if (!running) return true;
+    const auto foreground = [](const server_task & task) { return is_foreground(task.type); };
+    return std::any_of(queue_tasks.begin(), queue_tasks.end(), foreground) ||
+           std::any_of(queue_tasks_deferred.begin(), queue_tasks_deferred.end(), foreground) ||
+           std::any_of(queue_tasks_unhandled.begin(), queue_tasks_unhandled.end(), foreground);
+}
+
 int server_queue::post(server_task && task, bool front) {
+    if (is_foreground(task.type)) note_activity();
     std::unique_lock<std::mutex> lock(mutex_tasks);
     GGML_ASSERT(task.id != -1);
     // if this is cancel task make sure to clean up pending tasks
@@ -51,6 +79,7 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     bool reset_timer = false;
     for (auto & task : tasks) {
+        if (is_foreground(task.type)) note_activity();
         if (task.id == -1) {
             task.id = id++;
         }
@@ -277,6 +306,7 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
 
 void server_queue::start_loop(int64_t idle_sleep_ms) {
     running = true;
+    note_activity();
     time_last_task = ggml_time_ms();
 
     // spawn the worker thread used by yield_to_queue()
@@ -321,6 +351,13 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             std::unique_lock<std::mutex> lock(mutex_tasks);
             if (!running || !queue_tasks.empty()) {
                 break; // go back to process new tasks or terminate
+            }
+
+            if (callback_idle && !sleeping) {
+                lock.unlock();
+                const bool worked = callback_idle();
+                lock.lock();
+                if (worked || !running || !queue_tasks.empty()) break;
             }
 
             // no tasks, check for sleeping state

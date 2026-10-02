@@ -13,6 +13,8 @@
 
 
 enum server_task_type {
+    SERVER_TASK_TYPE_IDLE_GET,
+    SERVER_TASK_TYPE_IDLE_SET,
     SERVER_TASK_TYPE_COMPLETION,
     SERVER_TASK_TYPE_EMBEDDING,
     SERVER_TASK_TYPE_RERANK,
@@ -160,6 +162,7 @@ struct server_task {
     std::vector<raw_buffer> cli_files;
 
     server_task_type type;
+    json idle_options;
 
     // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE
     struct slot_action {
@@ -632,6 +635,11 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+};
+
+struct server_task_result_idle : server_task_result {
+    json data;
+    json to_json() override { return data; }
 };
 
 // used exclusively by router mode

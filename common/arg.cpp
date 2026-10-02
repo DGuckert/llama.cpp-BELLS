@@ -4005,6 +4005,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--idle-optimize"},
+        "optimize live runtime settings after 15 idle minutes; user requests take priority",
+        [](common_params & params) { params.idle_optimize_seconds = 900; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--idle-optimize-after"}, "SECONDS",
+        "enable idle optimization after this many idle seconds (default when enabled: 900)",
+        [](common_params & params, int value) {
+            if (value < 1 || value > 86400) throw std::invalid_argument("idle interval must be 1..86400 seconds");
+            params.idle_optimize_seconds = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--idle-optimize-log"}, "FILE",
+        "append idle optimizer decisions to a JSONL file (requires --idle-optimize)",
+        [](common_params & params, const std::string & value) { params.idle_optimize_log = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--sleep-idle-seconds"}, "SECONDS",
         string_format("number of seconds of idleness after which the server will sleep (default: %d; -1 = disabled)", params.sleep_idle_seconds),
         [](common_params & params, int value) {

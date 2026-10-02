@@ -1395,7 +1395,36 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    const auto foreground_cparams = cparams;
+    if (params.idle_optimize_seconds > 0) {
+        const uint64_t requested = cparams.n_ctx ? cparams.n_ctx : llama_model_n_ctx_train(model);
+        const uint64_t total = (requested + 255)/256*256;
+        const uint64_t per_seq = ((cparams.kv_unified ? total : total/cparams.n_seq_max) + 255)/256*256;
+        const uint64_t reserved_total = cparams.kv_unified ? total + 1024 : per_seq*(cparams.n_seq_max + 1);
+        if (cparams.n_seq_max < llama_max_parallel_sequences() && reserved_total <= INT32_MAX && per_seq >= 256) {
+            params.idle_optimize_user_ctx = (int) per_seq;
+            cparams.n_ctx = (uint32_t) reserved_total;
+            ++cparams.n_seq_max;
+            if (cparams.n_outputs_max) cparams.n_outputs_max = std::max(cparams.n_outputs_max, cparams.n_seq_max);
+            params.idle_optimize_reserved = true;
+        } else {
+            COM_WRN("%s", "idle_optimizer: unable to reserve a private sequence; disabled\n");
+            params.idle_optimize_seconds = 0;
+        }
+    }
+
     llama_context * lctx = llama_init_from_model(model, cparams);
+    if (lctx && params.idle_optimize_reserved && params.bells_enabled && llama_model_n_expert(model) > 0 && llama_bells_cache_decay(lctx) < 0) {
+        llama_free(lctx);
+        lctx = nullptr;
+    }
+    if (!lctx && params.idle_optimize_reserved) {
+        COM_WRN("%s", "idle_optimizer: private sequence allocation failed; retrying normal context without reloading weights\n");
+        params.idle_optimize_reserved = false;
+        params.idle_optimize_seconds = 0;
+        cparams = foreground_cparams;
+        lctx = llama_init_from_model(model, cparams);
+    }
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;

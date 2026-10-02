@@ -108,6 +108,9 @@ struct llama_context {
 
     void detach_threadpool();
 
+    int32_t bells_cache_decay() const;
+    bool bells_set_cache_decay(uint32_t decay, bool reset_history);
+
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);

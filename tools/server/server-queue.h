@@ -2,9 +2,11 @@
 
 #include "server-task.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -14,6 +16,9 @@
 // in most cases, use server_response_reader to post new tasks and retrieve results
 struct server_queue {
 private:
+    std::atomic<int64_t> foreground_time{0};
+    std::atomic<uint64_t> foreground_serial{0};
+    std::function<bool()> callback_idle;
     int id = 0;
     bool running  = false;
     bool sleeping = false;
@@ -73,6 +78,13 @@ public:
         std::unique_lock<std::mutex> lock(mutex_tasks);
         return sleeping;
     }
+
+    static bool is_foreground(server_task_type type);
+    void note_activity();
+    int64_t last_activity() const { return foreground_time.load(); }
+    uint64_t activity_serial() const { return foreground_serial.load(); }
+    bool has_pending_foreground();
+    void on_idle(std::function<bool()> callback) { callback_idle = std::move(callback); }
 
     // end the start_loop routine
     void terminate();

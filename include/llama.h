@@ -1026,6 +1026,9 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    LLAMA_API int32_t llama_bells_cache_decay(struct llama_context * ctx);
+    LLAMA_API bool llama_bells_set_cache_decay(struct llama_context * ctx, uint32_t decay, bool reset_history);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)

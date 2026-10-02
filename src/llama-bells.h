@@ -76,6 +76,8 @@ public:
     void reset_counters() { n_hit_ = 0; n_miss_ = 0; }
 
     void set_use_usage(bool v) { use_usage_ = v; }
+    uint32_t reuse_decay() const { return use_usage_ ? 1 : 0; }
+    void set_reuse_decay(uint32_t decay, bool reset_history);
 
     void decay_usage(float factor);
 
@@ -509,6 +511,8 @@ public:
     void free();
 
     bool ready() const { return ready_; }
+    uint32_t reuse_decay() const { return cache_.reuse_decay(); }
+    void set_reuse_decay(uint32_t decay, bool reset_history) { cache_.set_reuse_decay(decay, reset_history); }
 
     bool uses_device(ggml_backend_dev_t dev) const { return tensors_.uses_device(dev); }
 

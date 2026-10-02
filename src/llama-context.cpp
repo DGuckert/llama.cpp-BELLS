@@ -4608,6 +4608,22 @@ void llama_detach_threadpool(llama_context * ctx) {
     ctx->detach_threadpool();
 }
 
+int32_t llama_context::bells_cache_decay() const {
+    return bells && bells->ready() ? (int32_t) bells->reuse_decay() : -1;
+}
+
+bool llama_context::bells_set_cache_decay(uint32_t decay, bool reset_history) {
+    if (!bells || !bells->ready() || decay > 65536) return false;
+    synchronize();
+    bells->set_reuse_decay(decay, reset_history);
+    return true;
+}
+
+int32_t llama_bells_cache_decay(llama_context * ctx) { return ctx->bells_cache_decay(); }
+bool llama_bells_set_cache_decay(llama_context * ctx, uint32_t decay, bool reset_history) {
+    return ctx->bells_set_cache_decay(decay, reset_history);
+}
+
 void llama_set_n_threads(llama_context * ctx, int32_t n_threads, int32_t n_threads_batch) {
     ctx->set_n_threads(n_threads, n_threads_batch);
 }

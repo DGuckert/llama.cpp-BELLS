@@ -3,6 +3,7 @@
 #include "server-common.h"
 #include "server-decision.h"
 #include "server-http.h"
+#include "server-idle.h"
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
@@ -22,6 +23,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
+#include <chrono>
 #include <memory>
 #include <filesystem>
 #include <random>
@@ -925,6 +927,7 @@ private:
     llama_context * ctx_tgt = nullptr;
 
     server_batch batch;
+    server_idle_tuner idle_tuner;
 
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
@@ -976,7 +979,201 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+
+    static json idle_profile_json(const idle_profile & p) {
+        return {{"threads", p.threads}, {"bells_cache_policy", p.decay < 0 ? "unavailable" : p.decay ? "reuse" : "lru"},
+                {"bells_cache_decay", p.decay}};
+    }
+
+    static json idle_metrics_json(const std::vector<double> & times) {
+        const auto m = idle_measurement::summarize(times);
+        return {{"tokens", times.size()}, {"tps", m.tps}, {"low_1pct_tps", m.low},
+                {"high_1pct_tps", m.high}, {"p99_ms", m.p99_ms}};
+    }
+
+    void idle_log(const char * event, json detail = json::object()) {
+        detail["event"] = event;
+        detail["model"] = model_name;
+        detail["accepted"] = idle_profile_json(idle_tuner.accepted);
+        detail["timestamp_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const std::string line = detail.dump();
+        SRV_INF("idle_optimizer: %s\n", line.c_str());
+        if (!params_base.idle_optimize_log.empty()) {
+            std::ofstream file(params_base.idle_optimize_log, std::ios::app);
+            file << line << '\n';
+            if (!file) SRV_WRN("%s", "idle_optimizer: could not write decision log\n");
+        }
+    }
+
+    json idle_status() const {
+        return {{"available", params_base.idle_optimize_reserved}, {"enabled", idle_tuner.enabled},
+            {"state", idle_tuner.state}, {"running", idle_tuner.running},
+            {"idle_seconds", params_base.idle_optimize_seconds},
+            {"accepted", idle_profile_json(idle_tuner.accepted)},
+            {"candidate_index", idle_tuner.candidate}, {"candidate_count", idle_tuner.candidates.size()},
+            {"run", idle_tuner.run}, {"token", idle_tuner.position},
+            {"completed_trials", idle_tuner.completed_trials}, {"interruptions", idle_tuner.interruptions},
+            {"last_decision", idle_tuner.last_decision},
+            {"minimum_gain_percent", 3}, {"handoff", "next decode boundary; no model reload"}};
+    }
+
+    bool idle_apply(const idle_profile & p, bool reset_history) {
+        llama_set_n_threads(ctx_tgt, p.threads, idle_tuner.threads_batch);
+        return p.decay < 0 || llama_bells_set_cache_decay(ctx_tgt, p.decay, reset_history);
+    }
+
+    void idle_cancel(const char * reason) {
+        if (!idle_tuner.running) return;
+        idle_apply(idle_tuner.accepted, false);
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), params_base.n_parallel, -1, -1);
+        idle_tuner.running = false;
+        idle_tuner.state = idle_tuner.enabled ? "waiting" : "disabled";
+        idle_tuner.last_busy = ggml_time_ms();
+        ++idle_tuner.interruptions;
+        idle_tuner.last_decision = std::string("Interrupted: ") + reason + "; retained accepted settings";
+        idle_log("interrupted", {{"reason", reason}});
+    }
+
+    void idle_finish(const char * reason) {
+        idle_apply(idle_tuner.accepted, false);
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), params_base.n_parallel, -1, -1);
+        idle_tuner.running = false;
+        idle_tuner.state = "complete";
+        idle_tuner.last_decision = reason;
+        idle_log(reason);
+    }
+
+    void idle_start(uint64_t activity) {
+        auto & t = idle_tuner;
+        t.accepted = { llama_n_threads(ctx_tgt), llama_bells_cache_decay(ctx_tgt) };
+        t.threads_batch = llama_n_threads_batch(ctx_tgt);
+        t.candidates.clear();
+        const auto add = [&](idle_profile p) {
+            if (!(p == t.accepted) && std::find(t.candidates.begin(), t.candidates.end(), p) == t.candidates.end()) t.candidates.push_back(p);
+        };
+        const int max_threads = std::max(t.accepted.threads, params_base.cpuparams.n_threads);
+        for (int n = 1; n <= max_threads; n *= 2) add({ n, t.accepted.decay });
+        add({ max_threads, t.accepted.decay });
+        if (t.accepted.decay >= 0) {
+            for (int decay : { 0, 32, 64, 128, 256 }) {
+                if (decay != t.accepted.decay) add({ -1, decay });
+            }
+        }
+        t.activity = activity;
+        t.attempted_activity = t.activity;
+        t.candidate = t.run = t.position = 0;
+        t.adopted = false;
+        t.running = true;
+        t.state = "tuning";
+        for (auto & v : t.times) v.clear();
+        for (auto & v : t.reference) v.clear();
+        idle_log("search_started", {{"candidates", t.candidates.size()}, {"measured_tokens_per_run", t.measured}});
+    }
+
+    bool idle_step() {
+        auto & t = idle_tuner;
+        if (!t.enabled || !params_base.idle_optimize_reserved || !ctx_tgt || sleeping) return false;
+        if (queue_tasks.has_pending_foreground() || std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.is_processing(); })) {
+            idle_cancel("user activity");
+            t.last_busy = ggml_time_ms();
+            return false;
+        }
+        if (t.running && t.activity != queue_tasks.activity_serial()) {
+            idle_cancel("request received");
+            return false;
+        }
+        if (!t.running) {
+            const uint64_t activity = queue_tasks.activity_serial();
+            const int64_t last = std::max(t.last_busy, queue_tasks.last_activity());
+            if (t.attempted_activity == activity || ggml_time_ms() - last < 1000ll*params_base.idle_optimize_seconds) return false;
+            idle_start(activity);
+        }
+        if (t.candidate >= t.candidates.size()) {
+            idle_finish(t.adopted ? "search_complete_with_improvement" : "no_improvement_keep_current");
+            return true;
+        }
+        const size_t workload = t.run/4, ordering = t.run%4;
+        const bool candidate_run = ordering == 1 || ordering == 2;
+        auto & candidate = t.candidates[t.candidate];
+        if (candidate.threads < 0) candidate.threads = t.accepted.threads;
+        if (!t.position) {
+            if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), params_base.n_parallel, -1, -1) ||
+                !idle_apply(candidate_run ? candidate : t.accepted, true)) {
+                idle_finish("trial_unavailable_keep_current");
+                return true;
+            }
+        }
+        if (queue_tasks.has_pending_foreground() || t.activity != queue_tasks.activity_serial()) {
+            idle_cancel("request received");
+            return true;
+        }
+        llama_token token = t.tokens[workload][t.position];
+        llama_pos pos = (llama_pos) t.position;
+        llama_seq_id seq = params_base.n_parallel;
+        llama_seq_id * seq_ptr = &seq;
+        int32_t n_seq = 1;
+        int8_t logits = 1;
+        llama_batch b = llama_batch_get_one(&token, 1);
+        b.pos = &pos; b.n_seq_id = &n_seq; b.seq_id = &seq_ptr; b.logits = &logits;
+        const int64_t start = ggml_time_us();
+        const int result = llama_decode(ctx_tgt, b);
+        const float * output = result == 0 ? llama_get_logits(ctx_tgt) : nullptr;
+        const double elapsed = (ggml_time_us() - start)/1000000.0;
+        if (queue_tasks.has_pending_foreground() || t.activity != queue_tasks.activity_serial()) {
+            idle_cancel("request received");
+            return true;
+        }
+        if (!output || elapsed <= 0) {
+            idle_finish("decode_failed_keep_current");
+            return true;
+        }
+        uint64_t hash = 1469598103934665603ull;
+        for (int i = 0; i < llama_vocab_n_tokens(vocab); ++i) {
+            uint32_t bits;
+            std::memcpy(&bits, output + i, sizeof(bits));
+            hash = (hash ^ bits)*1099511628211ull;
+        }
+        bool valid = true;
+        if (ordering == 0) t.reference[workload].push_back(hash);
+        else valid = t.reference[workload][t.position] == hash;
+        if (!valid) {
+            idle_log("candidate_rejected", {{"reason", "logits_mismatch"}, {"candidate", idle_profile_json(candidate)}});
+            ++t.completed_trials;
+            ++t.candidate;
+            t.run = t.position = 0;
+            for (auto & v : t.times) v.clear();
+            for (auto & v : t.reference) v.clear();
+            idle_apply(t.accepted, false);
+            return true;
+        }
+        if (t.position >= (size_t) t.warm) t.times[t.run].push_back(elapsed);
+        if (++t.position < (size_t) (t.warm + t.measured)) return true;
+        t.position = 0;
+        if (++t.run < t.times.size()) return true;
+        json evidence = json::array();
+        for (const auto & times : t.times) evidence.push_back(idle_metrics_json(times));
+        const bool better = idle_is_improvement(t.times);
+        if (better) {
+            const auto before = t.accepted;
+            t.accepted = candidate;
+            t.adopted = true;
+            idle_log("adopted", {{"previous", idle_profile_json(before)}, {"runs", evidence}});
+        } else {
+            idle_log("candidate_rejected", {{"reason", "insufficient_repeatable_gain_or_tail_regression"},
+                {"candidate", idle_profile_json(candidate)}, {"runs", evidence}});
+        }
+        idle_apply(t.accepted, false);
+        ++t.completed_trials;
+        ++t.candidate;
+        t.run = 0;
+        for (auto & v : t.times) v.clear();
+        for (auto & v : t.reference) v.clear();
+        return true;
+    }
+
     void destroy() {
+        idle_cancel("shutdown");
         spec.reset();
         spec_init.reset();
 
@@ -1471,12 +1668,45 @@ private:
 
         GGML_ASSERT(!sleeping);
 
+        idle_tuner.enabled = params_base.idle_optimize_reserved;
+        idle_tuner.state = idle_tuner.enabled ? "waiting" : "disabled";
+        idle_tuner.last_busy = ggml_time_ms();
+        idle_tuner.accepted = { llama_n_threads(ctx_tgt), llama_bells_cache_decay(ctx_tgt) };
+        idle_tuner.threads_batch = llama_n_threads_batch(ctx_tgt);
+        if (idle_tuner.enabled) {
+            idle_tuner.measured = std::min(512, std::min((int) llama_n_ctx_seq(ctx_tgt), llama_model_n_ctx_train(model_tgt)) - idle_tuner.warm);
+            const std::array<std::string, 2> corpus = {
+                "A reliable service checks each request, records useful diagnostics, and retries temporary failures with a bounded delay. The operator compares latency across quiet and busy periods. A backup is verified before older copies are removed. Clear documentation explains recovery steps and helps a new team member investigate errors. ",
+                "Consider a sorted list of integers and use binary search to locate a value. At each step compare the midpoint, then keep the appropriate half. For a queue with arrivals and departures, track its length and calculate the average waiting time. Verify boundary cases such as an empty list, repeated values, and a target outside the range. "
+            };
+            for (size_t i = 0; i < corpus.size(); ++i) {
+                std::string text;
+                while (idle_tuner.tokens[i].size() < (size_t) (idle_tuner.warm + idle_tuner.measured)) {
+                    text += corpus[i];
+                    idle_tuner.tokens[i] = common_tokenize(vocab, text, true, false);
+                }
+            }
+            idle_log("enabled", {{"idle_seconds", params_base.idle_optimize_seconds}, {"private_sequence", params_base.n_parallel}});
+        }
+        queue_tasks.on_idle([this]() {
+            try { return idle_step(); }
+            catch (const std::exception & e) {
+                idle_cancel("trial exception");
+                idle_tuner.enabled = false;
+                idle_tuner.state = "error";
+                idle_log("disabled_after_error", {{"reason", e.what()}});
+                return false;
+            }
+        });
+
         // wiring up server queues
         queue_tasks.on_new_task([this](server_task && task, bool is_yielding) {
             return process_single_task(std::move(task), is_yielding);
         });
         queue_tasks.on_update_slots([this]() {
+            const bool was_busy = idle_tuner.enabled && std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.is_processing(); });
             update_slots();
+            if (was_busy) idle_tuner.last_busy = ggml_time_ms();
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -2512,12 +2742,33 @@ private:
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
-        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
+        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET && task.type != SERVER_TASK_TYPE_IDLE_GET) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
         }
 
+        if (!is_yielding && server_queue::is_foreground(task.type)) idle_cancel("user activity");
+
         switch (task.type) {
+            case SERVER_TASK_TYPE_IDLE_GET:
+            case SERVER_TASK_TYPE_IDLE_SET: {
+                if (task.type == SERVER_TASK_TYPE_IDLE_SET) {
+                    if (!params_base.idle_optimize_reserved) {
+                        send_error(task, "Start the server with --idle-optimize to reserve tuning memory", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    idle_tuner.enabled = task.idle_options.at("enabled").get<bool>();
+                    if (task.idle_options.contains("idle_seconds")) params_base.idle_optimize_seconds = task.idle_options.at("idle_seconds").get<int>();
+                    idle_tuner.last_busy = ggml_time_ms();
+                    idle_tuner.attempted_activity = UINT64_MAX;
+                    idle_tuner.state = idle_tuner.enabled ? "waiting" : "disabled";
+                    idle_log(idle_tuner.enabled ? "enabled" : "disabled");
+                }
+                auto res = std::make_unique<server_task_result_idle>();
+                res->id = task.id;
+                res->data = idle_status();
+                queue_results.send(std::move(res));
+            } break;
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_EMBEDDING:
@@ -5017,6 +5268,57 @@ void server_routes::init_routes() {
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    };
+
+    this->get_idle_optimizer = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        if (queue_tasks.is_sleeping()) {
+            res->ok({{"available", false}, {"enabled", false}, {"state", "server_sleeping"}});
+            return res;
+        }
+        server_task task(SERVER_TASK_TYPE_IDLE_GET);
+        task.id = res->rd.get_new_id();
+        res->rd.post_task(std::move(task), true);
+        auto result = res->rd.next(req.should_stop);
+        if (result) {
+            if (result->is_error()) res->error(result->to_json());
+            else res->ok(result->to_json());
+        }
+        return res;
+    };
+
+    this->post_idle_optimizer = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        if (!body.is_object() || !body.contains("enabled") || !body.at("enabled").is_boolean()) {
+            res->error(format_error_response("enabled must be a boolean", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        for (auto it = body.begin(); it != body.end(); ++it) {
+            if (it.key() != "enabled" && it.key() != "idle_seconds" && it.key() != "model") {
+                res->error(format_error_response("Unknown optimizer setting: " + it.key(), ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
+        if (body.contains("model") && !body.at("model").is_string()) {
+            res->error(format_error_response("model must be a string", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (body.contains("idle_seconds") && (!body.at("idle_seconds").is_number_integer() ||
+            body.at("idle_seconds").get<int64_t>() < 1 || body.at("idle_seconds").get<int64_t>() > 86400)) {
+            res->error(format_error_response("idle_seconds must be an integer from 1 to 86400", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        server_task task(SERVER_TASK_TYPE_IDLE_SET);
+        task.id = res->rd.get_new_id();
+        task.idle_options = body;
+        res->rd.post_task(std::move(task), true);
+        auto result = res->rd.next(req.should_stop);
+        if (result) {
+            if (result->is_error()) res->error(result->to_json());
+            else res->ok(result->to_json());
+        }
         return res;
     };
 

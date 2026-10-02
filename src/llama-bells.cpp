@@ -70,6 +70,15 @@ void bells_cache::reset() {
     clock_ = 0;
 }
 
+void bells_cache::set_reuse_decay(uint32_t decay, bool reset_history) {
+    use_usage_ = (decay > 0);
+    if (reset_history) {
+        for (auto & l : layers_) {
+            std::fill(l.usage.begin(), l.usage.end(), 0.0f);
+        }
+    }
+}
+
 void bells_cache::decay_usage(float factor) {
     for (auto & l : layers_) {
         for (float & u : l.usage) {

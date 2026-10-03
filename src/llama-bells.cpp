@@ -2142,13 +2142,21 @@ bool bells_runtime::init(const bells_params & params,
         }
     }
 
-    // BELLS_ADAPT=N: run adaptive pin swaps every N decode tokens
-    if (const char * ae = getenv("BELLS_ADAPT")) {
-        adapt_every_ = (uint32_t) atoi(ae);
-        if (adapt_every_ > 0) {
-            cache_.set_use_usage(true);
-            fprintf(stderr, "%s: adaptive pins on, every %u tokens\n", __func__, adapt_every_);
+    // adaptive cache swaps: CLI flag takes precedence, then env var
+    if (params.adapt_every > 0) {
+        adapt_every_ = params.adapt_every;
+        if (params.adapt_decay > 0.0f) {
+            adapt_decay_ = params.adapt_decay;
+        } else {
+            adapt_decay_ = 0.985f;
         }
+    } else if (const char * ae = getenv("BELLS_ADAPT")) {
+        adapt_every_ = (uint32_t) atoi(ae);
+    }
+    if (adapt_every_ > 0) {
+        cache_.set_use_usage(true);
+        fprintf(stderr, "%s: adaptive pins on, every %u tokens, decay %.3f\n",
+                __func__, adapt_every_, adapt_decay_);
     }
 
     // BELLS_DRAFT_GATE=0.5: confidence gate for MTP-fed lookahead

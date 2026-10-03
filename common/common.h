@@ -583,6 +583,8 @@ struct common_params {
     uint32_t    bells_split = 0;    // experts per token on the GPU cache; rest on the CPU
     uint32_t    bells_l2_n_slot = 0; // L2 cache slots on a secondary GPU, 0 = off
     ggml_type   bells_cache_type = GGML_TYPE_COUNT; // cache quant override, COUNT = same as model
+    uint32_t    bells_adapt = 0;    // adaptive cache swaps every N decode tokens, 0 = off
+    float       bells_adapt_decay = 0.0f; // usage decay factor per adapt round, 0 = default (0.985)
     std::string cold_tensors = "";  // tensor-name substrings to keep out of the working set
     uint32_t    moe_prefetch = 0;   // routing-informed expert prefetch, experts/layer, 0 = off
     std::string moe_stats = "";     // CSV path for expert usage counts, measurement only

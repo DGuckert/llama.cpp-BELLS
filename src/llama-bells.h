@@ -487,6 +487,15 @@ struct bells_params {
     // weights stay at their original type; only the VRAM cache is re-quantized.
     // GGML_TYPE_COUNT = use the model's own type (no re-quantization).
     ggml_type   cache_type = GGML_TYPE_COUNT;
+
+    // --bells-adapt: run adaptive cache swaps every N decode tokens. 0 = off (env BELLS_ADAPT
+    // still works as fallback). Tracks per-expert usage with exponential decay and swaps cold
+    // cached experts for hot uncached ones between tokens.
+    uint32_t    adapt_every = 0;
+
+    // --bells-adapt-decay: usage decay factor per adaptation round (0.0 = use default 0.985).
+    // Lower = forget faster. 0.985 matches Strata; the old BELLS default was 0.7.
+    float       adapt_decay = 0.0f;
 };
 
 // Ties the pieces together for the inference path.

@@ -740,6 +740,8 @@ llama_context::llama_context(
             }
             bp.pin_reserve  = params.pin_reserve;
             bp.cache_type   = params.bells_cache_type;
+            bp.adapt_every  = params.bells_adapt;
+            bp.adapt_decay  = params.bells_adapt_decay;
 
             // the cache lives wherever the graph runs, i.e. next to the rest of the offload
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends.front().get());

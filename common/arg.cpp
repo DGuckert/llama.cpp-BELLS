@@ -2805,6 +2805,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.bells_enabled = true;
             params.bells_n_slot  = 0;
+            if (params.bells_adapt == 0) {
+                params.bells_adapt = 32;
+            }
 
             const auto ov = llm_ffn_exps_pinned_override();
             if (ov.buft == nullptr) {
@@ -2911,6 +2914,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.bells_cache_type = found;
         }
     ).set_env("LLAMA_ARG_BELLS_CACHE_TYPE"));
+    add_opt(common_arg(
+        {"--bells-adapt"}, "N",
+        "BELLS: run adaptive cache swaps every N decode tokens. Tracks expert usage with "
+        "exponential decay and swaps cold cached experts for hot uncached ones (default: 0 = off, "
+        "32 is a good starting point for Flash-Next 177B)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.bells_adapt = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_BELLS_ADAPT"));
+    add_opt(common_arg(
+        {"--bells-adapt-decay"}, "F",
+        "BELLS: usage decay factor per adaptation round (default: 0.985). Lower values forget "
+        "history faster. Strata uses 0.985; BELLS legacy default was 0.7",
+        [](common_params & params, const std::string & value) {
+            params.bells_adapt_decay = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_BELLS_ADAPT_DECAY"));
     add_opt(common_arg(
         {"--pin-experts"}, "FILE",
         "seat the hottest experts per layer permanently in the BELLS cache, using a usage CSV "

@@ -1,13 +1,15 @@
-﻿#pragma once
+#pragma once
 
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 // BELLS: a per-layer VRAM expert cache.
@@ -25,15 +27,18 @@
 struct bells_copy {
     int32_t expert;
     int32_t slot;
+    int32_t evicted = -1;  // expert that was in this slot before, -1 if empty
 };
 
 class bells_cache {
 public:
     void init(uint32_t n_layer, uint32_t n_expert, uint32_t n_slot);
+    void init(uint32_t n_layer, uint32_t n_expert, const std::vector<uint32_t> & per_layer_slots);
 
-    bool enabled() const { return n_slot_ > 0; }
+    bool enabled() const { return max_slot_ > 0; }
 
-    uint32_t n_slot()   const { return n_slot_;   }
+    uint32_t n_slot()   const { return max_slot_; }    // largest per-layer slot count
+    uint32_t n_slot(uint32_t il) const { return il < n_slot_per_layer_.size() ? n_slot_per_layer_[il] : 0; }
     uint32_t n_expert() const { return n_expert_; }
 
     // expert -> slot for layer il, -1 where not resident. Uploaded to the graph each token.
@@ -58,6 +63,13 @@ public:
 
     void reset();
 
+    // Permanently seat these experts in this layer's slots. Returns the copies to execute.
+    // Pinned slots are never chosen by victim(), so the hot set measured offline stays resident
+    // for the life of the process instead of being cycled out by the next token that misses.
+    void pin_experts(uint32_t il, const std::vector<int32_t> & experts, std::vector<bells_copy> & out);
+
+    uint32_t n_pinned() const { return n_pinned_; }
+
     uint64_t n_hit()  const { return n_hit_;  }
     uint64_t n_miss() const { return n_miss_; }
 
@@ -66,18 +78,22 @@ private:
         std::vector<int32_t> expert_slot;  // n_expert, -1 if not resident
         std::vector<int32_t> slot_expert;  // n_slot,   -1 if empty
         std::vector<int64_t> last_used;    // n_slot
+        std::vector<uint8_t> pinned;       // n_slot,   1 = never evict
     };
 
     // slot to evict, preferring empty, then least recently used, skipping anything pinned.
     // With `protect`, unprotected slots are exhausted before any protected one is touched.
-    int32_t victim(layer & l, const int32_t * keep, size_t n_keep,
+    int32_t victim(layer & l, uint32_t n_slots, const int32_t * keep, size_t n_keep,
                    const std::vector<uint8_t> * protect = nullptr) const;
 
     uint32_t n_layer_  = 0;
     uint32_t n_expert_ = 0;
-    uint32_t n_slot_   = 0;
+    uint32_t max_slot_ = 0;                       // largest per-layer slot count
+    std::vector<uint32_t> n_slot_per_layer_;       // per-layer slot counts
 
     int64_t clock_ = 0;
+
+    uint32_t n_pinned_ = 0;   // pinned slots per layer
 
     uint64_t n_hit_  = 0;
     uint64_t n_miss_ = 0;
@@ -124,7 +140,13 @@ public:
 
     bool init(ggml_backend_buffer_type_t buft, const std::vector<layer_src> & srcs,
               uint32_t n_slot, ggml_backend_t backend = nullptr,
-              ggml_backend_t copy_backend = nullptr);
+              ggml_backend_t copy_backend = nullptr,
+              ggml_type cache_type = GGML_TYPE_COUNT);
+
+    bool init(ggml_backend_buffer_type_t buft, const std::vector<layer_src> & srcs,
+              const std::vector<uint32_t> & per_layer_slots, ggml_backend_t backend = nullptr,
+              ggml_backend_t copy_backend = nullptr,
+              ggml_type cache_type = GGML_TYPE_COUNT);
 
     // Order the copies issued since the last call against the compute stream. No-op unless a
     // separate copy backend is in use; with one, this is what keeps the graph from reading a
@@ -139,6 +161,13 @@ public:
     size_t n_device() const { return buffers_.size(); }
 
     size_t vram_bytes() const { return vram_bytes_; }
+
+    bool uses_device(ggml_backend_dev_t dev) const {
+        for (const auto & e : entries_) {
+            if (e.backend && ggml_backend_get_device(e.backend) == dev) return true;
+        }
+        return false;
+    }
 
     // cache tensors for the layer, indexed by model layer id
     ggml_tensor * gate(uint32_t il)    const { return get(il).gate;    }
@@ -170,7 +199,10 @@ public:
     // Index of the spare slot holding zeros. Routing a non-resident expert here makes it
     // contribute nothing instead of indexing out of bounds, which is what lets the graph
     // run without stopping to ask the host which experts were selected.
-    int32_t zero_slot() const { return (int32_t) n_slot_; }
+    int32_t zero_slot(uint32_t il) const {
+        if (!has(il)) return 0;
+        return (int32_t) entries_[index_[il]].n_slot;
+    }
 
     // bytes moved per expert, for budgeting
     size_t bytes_per_expert() const { return bytes_per_expert_; }
@@ -183,8 +215,8 @@ private:
         ggml_tensor * gate_up = nullptr;
         ggml_tensor * slots   = nullptr;
         layer_src     src;
+        uint32_t      n_slot  = 0;
 
-        // the device this layer's slices live on; copies must be issued against it
         ggml_backend_t backend = nullptr;
     };
 
@@ -215,12 +247,105 @@ private:
 
     size_t   vram_bytes_       = 0;
     size_t   bytes_per_expert_ = 0;
-    uint32_t n_slot_           = 0;
+
+    // Re-quantization: when cache_type_ != GGML_TYPE_COUNT, the VRAM cache holds experts at a
+    // smaller type. Converting on every miss is too expensive (Q4_K->Q2_K: ~6 ms/expert on an
+    // i3-13100F, 480+ CPU seconds for 200 tokens). Instead, each expert is converted once on first
+    // miss and the result is kept in rq_cache_ for all subsequent copies.
+    ggml_type              cache_type_    = GGML_TYPE_COUNT;
+    std::vector<float>     requant_f32_;  // scratch for dequant->requant
+
+    struct rq_precomp {
+        std::vector<std::vector<uint8_t>> experts;  // [n_expert], empty = not yet converted
+        size_t stride = 0;
+    };
+    std::unordered_map<const ggml_tensor *, rq_precomp> rq_cache_;
 
     // Sanitised copy of the slot table, uploaded in place of the raw one so a non-resident
     // expert is routed to the spare zero slot rather than handed to the graph as -1. Reused
     // across uploads to keep this off the per-layer, per-token allocation path.
     std::vector<int32_t> slot_scratch_;
+
+    // Pinned staging ring for expert copies. cudaMemcpyAsync from pageable memory blocks; from
+    // pinned memory it returns immediately and overlaps. Measured 164.9 us vs 5.3 us per
+    // layer-call, so for any model too large to load with --cpu-moe-pinned this is the single
+    // largest cost in the cache path.
+    ggml_backend_buffer_type_t host_buft_  = nullptr;   // pinned host buffer type, if any
+    ggml_backend_buffer_t      stage_buf_  = nullptr;
+    char *                     stage_ptr_  = nullptr;
+    size_t                     stage_cap_  = 0;
+    size_t                     stage_off_  = 0;
+    uint64_t                   n_staged_   = 0;
+    uint64_t                   n_wraps_    = 0;
+
+public:
+    // BELLS_MMAP_WARM: keep the hot expert working set faulted into the page cache.
+    //
+    // Only meaningful when the expert source is an mmap of a model larger than RAM. The kernel
+    // then applies plain LRU over the whole mapping and evicts experts it has no reason to think
+    // are hot; BELLS sees every routing decision and does know. Advisory and asynchronous, so the
+    // fault lands ahead of demand instead of stalling a matmul.
+    void warm_init(uint32_t n_layer, uint32_t n_expert);
+    void warm_note(uint32_t il, const int32_t * experts, size_t n);
+    void warm_lookahead(uint32_t il_next);
+    bool warm_enabled() const { return warm_keep_ > 0; }
+
+private:
+    uint32_t              warm_keep_     = 0;
+    uint32_t              warm_skip_     = 0;   // layer-calls to skip before next sweep
+    uint32_t              warm_backoff_  = 1;   // interval, doubles while nothing misses
+    uint64_t              warm_hinted_   = 0;
+    uint64_t              warm_sweeps_   = 0;   // experts kept warm per layer, 0 = disabled
+    uint32_t              warm_n_expert_ = 0;
+    std::vector<uint64_t> warm_used_;           // [layer*n_expert + expert] -> last routed clock
+    uint64_t              warm_clock_    = 0;
+    std::mutex            warm_mu_;
+
+public:
+    // L2 cache: a secondary GPU's VRAM used as extra expert storage. All compute stays on the
+    // primary GPU; the secondary just holds expert data that was recently evicted from L1. On
+    // a miss, checking L2 first avoids a host copy that might page-fault from NVMe.
+    bool init_l2(ggml_backend_buffer_type_t buft, uint32_t n_l2_slot,
+                 ggml_backend_t l2_backend, uint32_t n_expert);
+    void free_l2();
+
+    bool   has_l2()        const { return l2_n_slot_ > 0 && l2_buf_; }
+    size_t l2_vram_bytes() const { return l2_vram_bytes_; }
+
+    int32_t l2_lookup(uint32_t il, int32_t expert) const;
+    void    l2_admit_from_l1(uint32_t il, int32_t expert, int32_t l1_slot);
+    void    l2_promote(uint32_t il, int32_t expert, int32_t l1_slot);
+
+    uint64_t l2_n_admit()  const { return l2_n_admit_;  }
+    uint64_t l2_n_promote() const { return l2_n_promote_; }
+
+private:
+    struct l2_entry {
+        ggml_tensor * gate    = nullptr;
+        ggml_tensor * up      = nullptr;
+        ggml_tensor * down    = nullptr;
+        ggml_tensor * gate_up = nullptr;
+    };
+
+    struct l2_layer_info {
+        std::vector<int32_t> expert_slot;  // [n_expert] -> l2 slot, -1 if absent
+        std::vector<int32_t> slot_expert;  // [n_l2_slot] -> expert, -1 if empty
+        std::vector<int64_t> last_used;    // [n_l2_slot] LRU clock
+    };
+
+    int32_t l2_victim(const l2_layer_info & info) const;
+
+    ggml_context *              l2_ctx_        = nullptr;
+    ggml_backend_buffer_t       l2_buf_        = nullptr;
+    ggml_backend_t              l2_backend_    = nullptr;
+    std::vector<l2_entry>       l2_entries_;
+    std::vector<l2_layer_info>  l2_info_;
+    uint32_t                    l2_n_slot_     = 0;
+    int64_t                     l2_clock_      = 0;
+    size_t                      l2_vram_bytes_ = 0;
+    uint64_t                    l2_n_admit_    = 0;
+    uint64_t                    l2_n_promote_  = 0;
+    std::vector<char>           l2_stage_;
 };
 
 // There was a bells_predictor here: a token id -> per-layer expert ranking, counted over a
@@ -301,6 +426,29 @@ struct bells_params {
     //   baseline vs passive = the fixed price of the mechanism
     //   passive vs BELLS    = what the cache is actually worth
     bool        passive = false;
+
+    // --bells-refresh: observe a rotating 1/N of MoE layers per token instead of all of them.
+    // Each observation point costs a graph split; measured at ~2.3 ms per token across 32 layers,
+    // which is more than the readback, copy and upload put together.
+    uint32_t    refresh = 1;   // 1 = observe every layer every token (original behaviour)
+
+    // --bells-split: how many of each token's experts run on the GPU via the cache. The rest run
+    // on the CPU from the host weights, concurrently. 0 = all through the cache (original).
+    uint32_t    split = 0;
+
+    // --pin-experts: CSV of layer,expert,count from --moe-stats. The hottest experts per layer
+    // are seated permanently, the rest of the slots stay dynamic so residency is still
+    // guaranteed for whatever a token routes to outside the pinned set.
+    std::string pin_file;
+    uint32_t    pin_reserve = 0;   // dynamic slots to keep per layer, 0 = auto
+
+    uint32_t    n_l2_slot  = 0;   // L2 cache slots on secondary GPU, 0 = off
+
+    // Store cached experts at a different (typically smaller) quant type. Saves VRAM by
+    // fitting more experts per slot at the cost of precision on the cached copy. The host
+    // weights stay at their original type; only the VRAM cache is re-quantized.
+    // GGML_TYPE_COUNT = use the model's own type (no re-quantization).
+    ggml_type   cache_type = GGML_TYPE_COUNT;
 };
 
 // Ties the pieces together for the inference path.
@@ -317,11 +465,16 @@ public:
               ggml_backend_t backend = nullptr,
               ggml_backend_t copy_backend = nullptr);
 
+    bool init_l2(ggml_backend_buffer_type_t buft, ggml_backend_t l2_backend,
+                 uint32_t n_l2_slot);
+
     ~bells_runtime() { free(); }
 
     void free();
 
     bool ready() const { return ready_; }
+
+    bool uses_device(ggml_backend_dev_t dev) const { return tensors_.uses_device(dev); }
 
     // BELLS only serves decode. A prefill ubatch touches nearly every expert, so there is no
     // hot set to exploit and a cache would only thrash.
@@ -333,6 +486,45 @@ public:
     }
 
     bool passive() const { return params_.passive; }
+
+    // experts per token routed to the GPU cache; the remainder go to the CPU path
+    uint32_t split() const { return params_.split; }
+
+    // Is the CURRENT ubatch one the cache will serve? Set by begin_ubatch.
+    //
+    // Prefill is never served - a prefill ubatch is far wider than n_slot/n_expert_used - yet the
+    // eval callback was still asking for every layer's routing during it, which split the graph
+    // 32 times per prefill batch for information that is then discarded. Measured cost: prefill
+    // 454 tok/s with the cache allocated against 549 when it failed to allocate and took no
+    // splits. Skipping the ask when inactive is free.
+    bool active_now() const { return active_now_; }
+
+    // Should this layer's routing be read this token? Layers that are not observed keep the slot
+    // table they were last given, and anything routed outside it lands on the zero slot.
+    //
+    // Every layer is observed until each has been seen once, otherwise the first tokens of a
+    // generation run against slot tables that were never filled - which is not a slow start, it
+    // is wrong output, since every expert would map to the zero slot.
+    // STATIC observation set. Must not depend on a token counter.
+    //
+    // The graph - including where it splits - is built once and reused across tokens, so this is
+    // consulted only at graph build time. A per-token rotation therefore never rotates: whichever
+    // layers were skipped at that one build stay skipped forever, and their slot tables are never
+    // uploaded at all. That produced an illegal memory access at some refresh values and, worse,
+    // plausible-looking output at others.
+    //
+    // A fixed rule is safe under reuse: dynamic layers are always observed, static layers never
+    // are, and static layers get a permanent pinned table at init.
+    bool should_observe(uint32_t il) const {
+        if (params_.refresh <= 1) {
+            return true;
+        }
+        return (il % params_.refresh) == 0;
+    }
+
+    bool is_static_layer(uint32_t il) const {
+        return params_.refresh > 1 && (il % params_.refresh) != 0;
+    }
 
     const bells_tensors & tensors() const { return tensors_; }
 
@@ -440,8 +632,109 @@ private:
     bool     active_now_ = false;
     uint64_t n_copied_   = 0;
 
+    uint64_t n_tok_seen_    = 0;   // ubatches served, drives the refresh rotation
+
     uint64_t us_readback_   = 0;
     uint64_t us_copy_       = 0;
     uint64_t us_upload_     = 0;
     uint64_t n_layer_calls_ = 0;
+
+    uint64_t l2_n_hit_      = 0;
+    uint64_t l2_n_miss_     = 0;
+};
+
+// Keep a set of address ranges out of the process working set.
+//
+// For weights that are large, file-backed and read once per use - a per-token lookup table, say -
+// the page cache's LRU is actively wrong: it keeps them for the same reason it keeps a hot expert.
+// Sweeping them out repeatedly inverts that priority without ever making them unavailable.
+void bells_cold_start(const std::vector<std::pair<void *, size_t>> & ranges,
+                      uint64_t bytes, const char * what);
+void bells_cold_stop();
+
+// Routing-informed expert prefetch, independent of the VRAM cache.
+//
+// Serves the case where the model does not fit in RAM and the experts are mmap'd. The kernel then
+// pulls each missing expert in at its own readahead granularity - measured 62.7 KB against an
+// expert extent of 513-900 KB - one request at a time, on the critical path. Knowing the routing
+// one layer ahead turns that into a handful of extent-sized asynchronous requests.
+//
+// Costs a device->host readback per MoE layer to learn the routing, which is the same price the
+// expert cache pays; whether it is worth it depends entirely on how much the model is faulting.
+class moe_prefetch {
+public:
+    void init(uint32_t n_layer, uint32_t n_expert, uint32_t keep);
+    void add_layer(uint32_t il, ggml_tensor * gate, ggml_tensor * up,
+                   ggml_tensor * down, ggml_tensor * gate_up = nullptr);
+    void note(uint32_t il, const int32_t * experts, size_t n);
+    void lookahead(uint32_t il_next);
+
+    bool enabled() const { return keep_ > 0; }
+    void report() const;
+
+    ~moe_prefetch() { report(); }
+
+private:
+    struct layer {
+        ggml_tensor * t[4] = { nullptr, nullptr, nullptr, nullptr };  // gate, up, down, fused gate_up
+    };
+
+    std::vector<layer>    layers_;
+    std::vector<uint64_t> used_;      // [layer*n_expert + expert] -> last routed clock
+    uint32_t              keep_      = 0;
+    uint32_t              n_expert_  = 0;
+    uint64_t              clock_     = 0;
+
+    // two-sided backoff: idle when nothing misses, and also when everything does - a cold model
+    // has the demand path already saturating the queue, so speculation only pushes it back
+    uint32_t              skip_      = 0;
+    uint32_t              backoff_   = 1;
+
+    uint64_t              hinted_    = 0;
+    uint64_t              sweeps_    = 0;
+    mutable std::mutex    mu_;
+};
+
+// Count which experts routing picks, per layer. Pure measurement: no tensors, no cache, no
+// placement decisions - just the histogram needed to decide whether frequency-based pinning is
+// worth building at all.
+class moe_stats {
+public:
+    void init(uint32_t n_layer, uint32_t n_expert, const char * path);
+    void note(uint32_t il, const int32_t * ids, size_t n);
+
+    // Routing weights for the ids most recently passed to note() for this layer. Ranking a static
+    // table by summed weight rather than by occurrence minimises the output actually lost when an
+    // expert is dropped, which is what perturbs the model - occurrence count treats a 0.35-weight
+    // pick and a 0.03-weight pick as equally worth keeping.
+    void note_weights(uint32_t il, const float * w, size_t n);
+
+    void dump();
+
+    bool enabled() const { return !path_.empty(); }
+    ~moe_stats() { dump(); }
+
+private:
+    void write_locked();
+
+    std::vector<uint64_t> count_;      // [layer*n_expert + expert]
+    std::vector<double>   weight_;     // [layer*n_expert + expert], summed normalised weight
+    // ids from the most recent note() for each layer, kept at their actual length. Fixing the
+    // width to whatever the first call happened to use dropped 96% of the weight samples: the
+    // topk tensor is not always the same width (prefill vs decode, and it is sometimes n_expert
+    // wide rather than n_expert_used).
+    std::vector<std::vector<int32_t>> last_ids_;
+    uint32_t              n_layer_  = 0;
+    uint32_t              n_expert_ = 0;
+    uint64_t              n_events_ = 0;
+    std::string           path_;
+    uint64_t              last_dump_ = 0;
+
+    // cross-token recency predictability, decode-sized calls only
+    static const uint32_t REC_WINDOW = 10;                  // ~64 slots / 6 experts per token
+    std::vector<std::vector<std::vector<int32_t>>> hist_;   // [layer][ring slot] -> ids
+    std::vector<uint32_t> hist_pos_;
+    uint64_t rec1_hit_ = 0, rec1_tot_ = 0;                  // vs previous token
+    uint64_t recK_hit_ = 0, recK_tot_ = 0;                  // vs union of last REC_WINDOW
+    std::mutex            mu_;
 };

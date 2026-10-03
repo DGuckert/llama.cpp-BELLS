@@ -406,6 +406,31 @@ extern "C" {
         bool         bells_enabled; // enable the BELLS expert cache
         uint32_t     bells_n_slot;  // resident experts per layer, 0 = size from free VRAM
         bool         bells_passive; // research: allocate and split, but do not use the cache
+        uint32_t     bells_refresh; // observe a rotating 1/N of MoE layers per token, 1 = all
+        uint32_t     bells_split;   // experts per token on the GPU cache; rest run on the CPU
+        uint32_t     bells_l2_n_slot; // L2 cache slots on a secondary GPU, 0 = off
+        enum ggml_type bells_cache_type; // store cached experts at this quant type instead of the
+                                         // model's own type. A smaller type fits more experts in the
+                                         // same VRAM at the cost of some precision on cached experts.
+                                         // GGML_TYPE_COUNT = use the model's type (default)
+
+        // comma-separated tensor-name substrings to keep out of the working set, NULL = none.
+        // for weights read once per use (a per-token lookup table), the page cache's LRU keeps
+        // them for the same reason it keeps a hot expert, which is the wrong call under pressure.
+        const char * cold_tensors;
+
+        // routing-informed expert prefetch: keep the N hottest experts per layer hinted to the OS
+        // one layer ahead. Independent of the expert cache - this is about NVMe request size and
+        // queue depth, not VRAM. 0 = off.
+        uint32_t     moe_prefetch;
+
+        // path for a CSV of expert usage counts, NULL = off. Measurement only.
+        const char * moe_stats;
+
+        // --pin-experts: CSV from --moe-stats. Seats the hottest experts per layer permanently
+        // in the BELLS cache instead of admitting on demand. NULL = off.
+        const char * pin_experts;
+        uint32_t     pin_reserve;   // dynamic slots kept per layer, 0 = auto
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)

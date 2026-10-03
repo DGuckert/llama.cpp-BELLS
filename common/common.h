@@ -583,6 +583,15 @@ struct common_params {
     bool        bells_enabled = false; // BELLS on at all
     uint32_t    bells_n_slot = 0;   // MoE experts resident per layer, 0 = size from free VRAM
     bool        bells_passive = false; // research: allocate and split, but do not use the cache
+    uint32_t    bells_refresh = 1;  // observe a rotating 1/N of MoE layers per token
+    uint32_t    bells_split = 0;    // experts per token on the GPU cache; rest on the CPU
+    uint32_t    bells_l2_n_slot = 0; // L2 cache slots on a secondary GPU, 0 = off
+    ggml_type   bells_cache_type = GGML_TYPE_COUNT; // cache quant override, COUNT = same as model
+    std::string cold_tensors = "";  // tensor-name substrings to keep out of the working set
+    uint32_t    moe_prefetch = 0;   // routing-informed expert prefetch, experts/layer, 0 = off
+    std::string moe_stats = "";     // CSV path for expert usage counts, measurement only
+    std::string pin_experts = "";   // CSV of expert usage; seat the hottest permanently
+    uint32_t    pin_reserve = 0;    // dynamic slots kept per layer, 0 = auto
 
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data

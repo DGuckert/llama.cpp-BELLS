@@ -1,0 +1,1086 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BELLS Manager</title>
+<style>
+:root {
+  --bg: #ffffff;
+  --bg-secondary: #f6f8fa;
+  --bg-tertiary: #f0f2f5;
+  --card: #ffffff;
+  --border: #d1d5db;
+  --border-light: #e5e7eb;
+  --text: #111827;
+  --text-secondary: #4b5563;
+  --text-muted: #9ca3af;
+  --accent: #111827;
+  --accent-hover: #374151;
+  --green: #16a34a;
+  --green-bg: #f0fdf4;
+  --red: #dc2626;
+  --red-bg: #fef2f2;
+  --orange: #d97706;
+  --orange-bg: #fffbeb;
+  --blue: #2563eb;
+  --blue-bg: #eff6ff;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --shadow: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.04);
+  --shadow-md: 0 4px 6px rgba(0,0,0,0.07), 0 2px 4px rgba(0,0,0,0.04);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  display: flex;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---- Sidebar ---- */
+.sidebar {
+  width: 240px;
+  min-width: 240px;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border-light);
+  display: flex;
+  flex-direction: column;
+}
+
+.sidebar-brand {
+  padding: 24px 20px 20px;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.sidebar-logo {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: 2px;
+}
+
+.sidebar-tagline {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  line-height: 1.4;
+}
+
+.sidebar-nav {
+  padding: 12px 8px;
+  flex: 1;
+}
+
+.nav-label {
+  padding: 8px 12px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  margin: 2px 0;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 14px;
+  font-weight: 450;
+  transition: all 0.12s ease;
+}
+
+.nav-item:hover {
+  background: rgba(0,0,0,0.04);
+  color: var(--text);
+}
+
+.nav-item.active {
+  background: var(--accent);
+  color: white;
+  font-weight: 500;
+}
+
+.nav-icon { font-size: 15px; width: 20px; text-align: center; }
+
+.sidebar-footer {
+  padding: 16px 20px;
+  border-top: 1px solid var(--border-light);
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.sidebar-footer strong {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+/* ---- Main ---- */
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.page-header {
+  padding: 24px 32px 20px;
+  border-bottom: 1px solid var(--border-light);
+  background: var(--bg);
+}
+
+.page-title {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.page-subtitle {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-top: 3px;
+}
+
+.page-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px 32px;
+}
+
+/* ---- Cards ---- */
+.card {
+  background: var(--card);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  margin-bottom: 20px;
+  box-shadow: var(--shadow);
+}
+
+.card-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 16px;
+}
+
+/* ---- Stats ---- */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 16px;
+}
+
+.stat-item { }
+
+.stat-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 2px;
+}
+
+.stat-value {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+/* ---- GPU cards ---- */
+.gpu-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 14px 16px;
+  background: var(--bg-secondary);
+  border-radius: var(--radius);
+  margin-bottom: 8px;
+}
+
+.gpu-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.gpu-info { flex: 1; min-width: 0; }
+.gpu-name { font-size: 14px; font-weight: 500; }
+.gpu-detail { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+
+.vram-bar {
+  height: 4px;
+  background: var(--border-light);
+  border-radius: 2px;
+  margin-top: 8px;
+  overflow: hidden;
+}
+
+.vram-fill {
+  height: 100%;
+  background: var(--green);
+  border-radius: 2px;
+  transition: width 0.3s;
+}
+
+/* ---- Tables ---- */
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius);
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.data-table th {
+  text-align: left;
+  padding: 10px 14px;
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-light);
+  position: sticky;
+  top: 0;
+  white-space: nowrap;
+}
+
+.data-table td {
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--border-light);
+  color: var(--text-secondary);
+}
+
+.data-table tbody tr { cursor: pointer; transition: background 0.1s; }
+.data-table tbody tr:last-child td { border-bottom: none; }
+.data-table tbody tr:hover td { background: var(--bg-secondary); }
+
+.data-table tbody tr.selected td {
+  background: var(--blue-bg);
+  color: var(--text);
+}
+
+.cell-primary { color: var(--text); font-weight: 500; }
+
+/* ---- Buttons ---- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: white;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.12s ease;
+  white-space: nowrap;
+}
+
+.btn:hover { background: var(--bg-secondary); }
+.btn:active { transform: scale(0.98); }
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+
+.btn-primary:hover { background: var(--accent-hover); }
+
+.btn-danger {
+  color: var(--red);
+  border-color: var(--red);
+  background: white;
+}
+
+.btn-danger:hover { background: var(--red-bg); }
+
+.btn-sm { padding: 5px 12px; font-size: 12px; }
+.btn:disabled { opacity: 0.4; pointer-events: none; }
+
+.btn-group { display: flex; gap: 8px; align-items: center; }
+
+/* ---- Inputs ---- */
+input[type="text"], input[type="number"], select {
+  width: 100%;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+input:focus, select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(17,24,39,0.08);
+}
+
+input::placeholder { color: var(--text-muted); }
+
+/* ---- Toggle ---- */
+.toggle {
+  position: relative;
+  width: 36px;
+  height: 20px;
+  display: inline-block;
+  cursor: pointer;
+}
+
+.toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
+
+.toggle-track {
+  position: absolute;
+  inset: 0;
+  background: var(--border);
+  border-radius: 10px;
+  transition: background 0.2s;
+}
+
+.toggle input:checked + .toggle-track { background: var(--accent); }
+
+.toggle-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  background: white;
+  border-radius: 50%;
+  transition: left 0.2s;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+}
+
+.toggle input:checked ~ .toggle-thumb { left: 18px; }
+
+/* ---- Config flags ---- */
+.flag-group { margin-bottom: 24px; }
+
+.flag-group-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border-light);
+  margin-bottom: 4px;
+}
+
+.flag-row {
+  display: flex;
+  align-items: center;
+  padding: 10px 0;
+  gap: 16px;
+  border-bottom: 1px solid var(--bg-tertiary);
+}
+
+.flag-row:last-child { border-bottom: none; }
+
+.flag-label {
+  width: 150px;
+  min-width: 150px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.flag-control {
+  width: 200px;
+  min-width: 200px;
+}
+
+.flag-desc {
+  flex: 1;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* ---- Command preview ---- */
+.cmd-preview {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  font-size: 12px;
+  color: var(--text);
+  word-break: break-all;
+  line-height: 1.6;
+}
+
+/* ---- Log ---- */
+.log-viewer {
+  background: #1e1e1e;
+  border-radius: var(--radius);
+  padding: 16px;
+  font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  font-size: 12px;
+  color: #d4d4d4;
+  line-height: 1.7;
+  overflow-y: auto;
+  max-height: 300px;
+  white-space: pre-wrap;
+}
+
+/* ---- Badges ---- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 99px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.badge-green { background: var(--green-bg); color: var(--green); }
+.badge-red { background: var(--red-bg); color: var(--red); }
+.badge-orange { background: var(--orange-bg); color: var(--orange); }
+.badge-blue { background: var(--blue-bg); color: var(--blue); }
+
+/* ---- Search ---- */
+.search-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.search-bar input { flex: 1; }
+
+/* ---- HF panel ---- */
+.hf-panel {
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  margin-bottom: 20px;
+  background: var(--bg-secondary);
+}
+
+/* ---- Utils ---- */
+.flex { display: flex; }
+.items-center { align-items: center; }
+.justify-between { justify-content: space-between; }
+.gap-8 { gap: 8px; }
+.gap-12 { gap: 12px; }
+.gap-16 { gap: 16px; }
+.mt-12 { margin-top: 12px; }
+.mt-16 { margin-top: 16px; }
+.mt-20 { margin-top: 20px; }
+.mb-12 { margin-bottom: 12px; }
+.mb-16 { margin-bottom: 16px; }
+.hidden { display: none !important; }
+
+.loading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 20px 0;
+}
+
+.spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--border-light);
+  border-top-color: var(--text-muted);
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.empty-state {
+  text-align: center;
+  padding: 40px 20px;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+/* ---- Scrollbar ---- */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* ---- Pages ---- */
+.page { display: none; }
+.page.active { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
+</style>
+</head>
+<body>
+
+<div class="sidebar">
+  <div class="sidebar-brand">
+    <div class="sidebar-logo">BELLS</div>
+    <div class="sidebar-tagline">Per-layer VRAM expert cache for MoE models</div>
+  </div>
+  <div class="sidebar-nav">
+    <div class="nav-label">Menu</div>
+    <div class="nav-item active" data-page="dashboard">
+      <span class="nav-icon">&#9632;</span> Dashboard
+    </div>
+    <div class="nav-item" data-page="models">
+      <span class="nav-icon">&#9670;</span> Models
+    </div>
+    <div class="nav-item" data-page="configure">
+      <span class="nav-icon">&#9881;</span> Configure
+    </div>
+    <div class="nav-item" data-page="benchmark">
+      <span class="nav-icon">&#9650;</span> Benchmark
+    </div>
+    <div class="nav-item" data-page="server">
+      <span class="nav-icon">&#9654;</span> Server
+    </div>
+  </div>
+  <div class="sidebar-footer">
+    <div><strong id="sidebar-gpu">Detecting...</strong></div>
+    <div id="sidebar-ram"></div>
+  </div>
+</div>
+
+<div class="main">
+
+  <!-- DASHBOARD -->
+  <div class="page active" id="page-dashboard">
+    <div class="page-header">
+      <div class="page-title">Dashboard</div>
+      <div class="page-subtitle">System overview and hardware detection</div>
+    </div>
+    <div class="page-body">
+      <div class="card">
+        <div class="card-title">System</div>
+        <div class="stat-grid" id="sys-stats">
+          <div class="loading"><div class="spinner"></div> Detecting hardware...</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">GPUs</div>
+        <div id="gpu-list">
+          <div class="loading"><div class="spinner"></div> Scanning...</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Binaries</div>
+        <div id="bin-list">
+          <div class="loading"><div class="spinner"></div> Searching...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODELS -->
+  <div class="page" id="page-models">
+    <div class="page-header">
+      <div class="flex justify-between items-center">
+        <div>
+          <div class="page-title">Models</div>
+          <div class="page-subtitle">Local GGUF models and HuggingFace search</div>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-sm" onclick="refreshModels()">Refresh</button>
+          <button class="btn btn-sm" onclick="toggleHF()">Search HuggingFace</button>
+        </div>
+      </div>
+    </div>
+    <div class="page-body">
+      <div id="hf-panel" class="hf-panel hidden">
+        <div class="card-title">HuggingFace</div>
+        <div class="search-bar">
+          <input type="text" id="hf-query" placeholder="Search models (e.g. Qwen3 GGUF Q4)..."
+                 onkeydown="if(event.key==='Enter')searchHF()">
+          <button class="btn btn-primary btn-sm" onclick="searchHF()">Search</button>
+        </div>
+        <div id="hf-results"></div>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table" id="model-table">
+          <thead><tr><th>Name</th><th>Quant</th><th>Size</th><th>Location</th></tr></thead>
+          <tbody id="model-tbody">
+            <tr><td colspan="4"><div class="loading"><div class="spinner"></div> Scanning for models...</div></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- CONFIGURE -->
+  <div class="page" id="page-configure">
+    <div class="page-header">
+      <div class="flex justify-between items-center">
+        <div>
+          <div class="page-title">Configure</div>
+          <div class="page-subtitle">Build your launch command</div>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-primary" onclick="launchServer()">Launch Server</button>
+          <button class="btn" onclick="copyCommand()">Copy Command</button>
+          <button class="btn btn-sm" onclick="resetConfig()">Reset</button>
+        </div>
+      </div>
+    </div>
+    <div class="page-body">
+      <div class="card" style="padding:14px 20px;">
+        <div class="flex items-center gap-12">
+          <span style="font-size:12px;font-weight:600;color:var(--text-muted);">MODEL</span>
+          <span id="config-model" style="font-size:14px;color:var(--text-muted);">No model selected — pick one from Models</span>
+        </div>
+      </div>
+
+      <div id="config-flags"></div>
+
+      <div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:8px;">COMMAND PREVIEW</div>
+      <div class="cmd-preview" id="cmd-preview">llama-server</div>
+    </div>
+  </div>
+
+  <!-- BENCHMARK -->
+  <div class="page" id="page-benchmark">
+    <div class="page-header">
+      <div class="page-title">Benchmark</div>
+      <div class="page-subtitle">Automatically find the optimal configuration for your hardware</div>
+    </div>
+    <div class="page-body">
+      <div class="card">
+        <div class="card-title">Setup</div>
+        <div class="flag-row">
+          <div class="flag-label">Model</div>
+          <div class="flag-control"><input type="text" id="bench-model" placeholder="Select from Models tab"></div>
+          <div class="flag-desc" id="bench-model-name"></div>
+        </div>
+        <div class="flag-row">
+          <div class="flag-label">Context</div>
+          <div class="flag-control"><input type="number" id="bench-ctx" value="4096"></div>
+        </div>
+        <div class="flag-row" style="border-bottom:none;">
+          <div class="flag-label">Profile</div>
+          <div class="flag-control">
+            <select id="bench-profile">
+              <option value="short">Short ~1hr (7 configs)</option>
+              <option value="medium">Medium ~4hr (22 configs)</option>
+              <option value="long">Long ~8hr (34 configs)</option>
+            </select>
+          </div>
+        </div>
+        <div class="btn-group mt-12">
+          <button class="btn btn-primary" id="bench-start-btn" onclick="startBench()">Start Benchmark</button>
+          <button class="btn btn-danger" id="bench-cancel-btn" onclick="cancelBench()" disabled>Cancel</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Log</div>
+        <div class="log-viewer" id="bench-log">Ready.</div>
+      </div>
+      <div class="card" style="padding:0;overflow:hidden;">
+        <table class="data-table">
+          <thead><tr><th>Config</th><th>Gen tok/s</th><th>Prompt tok/s</th><th>Status</th></tr></thead>
+          <tbody id="bench-results"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- SERVER -->
+  <div class="page" id="page-server">
+    <div class="page-header">
+      <div class="flex justify-between items-center">
+        <div>
+          <div class="page-title">Server</div>
+          <div class="page-subtitle">Manage llama-server</div>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-primary" id="srv-start" onclick="srvStart()">Start</button>
+          <button class="btn btn-danger" id="srv-stop" onclick="srvStop()" disabled>Stop</button>
+          <button class="btn" id="srv-browser" onclick="srvBrowser()" disabled>Open Browser</button>
+        </div>
+      </div>
+    </div>
+    <div class="page-body">
+      <div class="card">
+        <div class="flex items-center gap-16">
+          <div>
+            <div class="stat-label">Status</div>
+            <div id="srv-status" class="mt-4"><span class="badge badge-red">Stopped</span></div>
+          </div>
+          <div>
+            <div class="stat-label">PID</div>
+            <div id="srv-pid" class="stat-value" style="margin-top:4px;">—</div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Output</div>
+        <div class="log-viewer" id="srv-log" style="max-height:500px;">Server not started.</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const api = window.pywebview ? window.pywebview.api : null;
+let sysInfo = null;
+let models = [];
+let selectedModel = '';
+let serverLogOffset = 0;
+let benchPollTimer = null;
+let srvPollTimer = null;
+
+document.querySelectorAll('.nav-item').forEach(item => {
+  item.addEventListener('click', () => {
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    item.classList.add('active');
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    document.getElementById('page-' + item.dataset.page).classList.add('active');
+  });
+});
+
+function esc(s) {
+  if (s === null || s === undefined) return '';
+  const d = document.createElement('div');
+  d.textContent = String(s);
+  return d.innerHTML;
+}
+
+async function init() {
+  if (!api) return;
+  await loadSystem();
+  await refreshModels();
+  buildConfigUI();
+}
+
+async function loadSystem() {
+  sysInfo = await api.get_system_info();
+
+  document.getElementById('sys-stats').innerHTML = `
+    <div class="stat-item"><div class="stat-label">OS</div><div class="stat-value">${esc(sysInfo.os)} ${esc(sysInfo.arch)}</div></div>
+    <div class="stat-item"><div class="stat-label">CPU</div><div class="stat-value">${esc(sysInfo.cpu)}</div></div>
+    <div class="stat-item"><div class="stat-label">Cores</div><div class="stat-value">${sysInfo.cpu_cores}</div></div>
+    <div class="stat-item"><div class="stat-label">RAM</div><div class="stat-value">${Math.floor(sysInfo.ram_total_mb/1024)} GB total, ${Math.floor(sysInfo.ram_free_mb/1024)} GB free</div></div>
+    <div class="stat-item"><div class="stat-label">CUDA</div><div class="stat-value">${sysInfo.has_cuda ? 'Available' : 'Not found'}</div></div>
+    <div class="stat-item"><div class="stat-label">Vulkan</div><div class="stat-value">${sysInfo.has_vulkan ? 'Available' : 'Not found'}</div></div>
+  `;
+
+  if (sysInfo.gpus.length === 0) {
+    document.getElementById('gpu-list').innerHTML = '<div class="empty-state">No GPUs detected</div>';
+  } else {
+    let html = '';
+    for (const g of sysInfo.gpus) {
+      const pct = g.vram_mb ? Math.round((g.vram_mb - g.vram_free_mb) / g.vram_mb * 100) : 0;
+      const vram = g.vram_mb ? `${g.vram_mb} MB (${g.vram_free_mb} MB free)` : 'Unknown';
+      html += `
+        <div class="gpu-card">
+          <div class="gpu-icon">G</div>
+          <div class="gpu-info">
+            <div class="gpu-name">${esc(g.name)}</div>
+            <div class="gpu-detail">${esc(g.vendor)} · ${vram}${g.driver ? ' · ' + esc(g.driver) : ''}</div>
+            ${g.vram_mb ? `<div class="vram-bar"><div class="vram-fill" style="width:${pct}%"></div></div>` : ''}
+          </div>
+        </div>`;
+    }
+    document.getElementById('gpu-list').innerHTML = html;
+  }
+
+  const bins = sysInfo.binaries;
+  const binKeys = Object.keys(bins);
+  if (binKeys.length === 0) {
+    document.getElementById('bin-list').innerHTML = '<div class="empty-state">No binaries found — run the installer</div>';
+  } else {
+    let bHtml = '<div style="display:grid;grid-template-columns:auto 1fr;gap:6px 16px;">';
+    for (const k of binKeys) {
+      bHtml += `<div style="font-weight:500;font-size:13px;">${esc(k)}</div><div style="color:var(--text-muted);font-size:12px;">${esc(bins[k])}</div>`;
+    }
+    bHtml += '</div>';
+    document.getElementById('bin-list').innerHTML = bHtml;
+  }
+
+  if (sysInfo.gpus.length > 0) {
+    let t = sysInfo.gpus[0].name;
+    if (sysInfo.gpus.length > 1) t += ` + ${sysInfo.gpus.length - 1} more`;
+    document.getElementById('sidebar-gpu').textContent = t;
+  } else {
+    document.getElementById('sidebar-gpu').textContent = 'No GPU';
+  }
+  document.getElementById('sidebar-ram').textContent = `${Math.floor(sysInfo.ram_total_mb/1024)} GB RAM`;
+}
+
+async function refreshModels() {
+  if (!api) return;
+  const tbody = document.getElementById('model-tbody');
+  tbody.innerHTML = '<tr><td colspan="4"><div class="loading"><div class="spinner"></div> Scanning...</div></td></tr>';
+  models = await api.get_models();
+  if (models.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" class="empty-state">No .gguf models found</td></tr>';
+    return;
+  }
+  let html = '';
+  for (let i = 0; i < models.length; i++) {
+    const m = models[i];
+    const parts = m.parts ? ` (${m.parts} parts)` : '';
+    const sel = m.path === selectedModel ? ' selected' : '';
+    html += `<tr class="${sel}" onclick="selectModel(${i})">
+      <td class="cell-primary">${esc(m.name)}</td>
+      <td>${esc(m.quant)}</td>
+      <td>${m.size_gb.toFixed(1)} GB${parts}</td>
+      <td style="font-size:11px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(m.dir)}</td>
+    </tr>`;
+  }
+  tbody.innerHTML = html;
+}
+
+function selectModel(idx) {
+  const m = models[idx];
+  selectedModel = m.path;
+  document.getElementById('config-model').innerHTML =
+    `<span style="color:var(--text);font-weight:500;">${esc(m.name)}</span> <span style="color:var(--text-muted);margin-left:8px;">${m.size_gb.toFixed(1)} GB · ${esc(m.quant)}</span>`;
+  document.getElementById('bench-model').value = m.path;
+  refreshModels();
+  updatePreview();
+}
+
+function toggleHF() {
+  document.getElementById('hf-panel').classList.toggle('hidden');
+  if (!document.getElementById('hf-panel').classList.contains('hidden')) {
+    document.getElementById('hf-query').focus();
+  }
+}
+
+async function searchHF() {
+  const q = document.getElementById('hf-query').value.trim();
+  if (!q || !api) return;
+  document.getElementById('hf-results').innerHTML = '<div class="loading"><div class="spinner"></div> Searching...</div>';
+  const results = await api.search_huggingface(q);
+  if (results.length && results[0].error) {
+    document.getElementById('hf-results').innerHTML = `<div style="color:var(--red);padding:8px 0;">${esc(results[0].error)}</div>`;
+    return;
+  }
+  let html = '<div class="table-wrap"><table class="data-table"><thead><tr><th>Model</th><th>Downloads</th><th>Repo</th></tr></thead><tbody>';
+  for (const r of results) {
+    html += `<tr><td class="cell-primary">${esc(r.name)}</td><td>${Number(r.downloads).toLocaleString()}</td><td style="font-size:11px;">${esc(r.id)}</td></tr>`;
+  }
+  html += '</tbody></table></div>';
+  document.getElementById('hf-results').innerHTML = html;
+}
+
+const FLAG_DEFS = [
+  {flag:'--cpu-moe', label:'CPU MoE (mmap)', desc:'Expert layers on CPU via mmap', type:'bool', group:'offload'},
+  {flag:'--cpu-moe-pinned', label:'CPU MoE (pinned)', desc:'Pinned memory, faster when model fits RAM', type:'bool', group:'offload'},
+  {flag:'-ngl', label:'GPU layers', desc:'99 = all non-expert layers', type:'int', def:'99', group:'offload'},
+  {flag:'-ot', label:'Override tensor', desc:'Partial offload pattern', type:'str', group:'offload'},
+  {flag:'--n-cpu-moe', label:'N CPU MoE', desc:'First N expert layers on CPU', type:'int', group:'offload'},
+  {flag:'--bells-slots', label:'Cache slots', desc:'Experts per layer in VRAM', type:'int', group:'bells'},
+  {flag:'--bells-l2-slots', label:'L2 slots', desc:'Second GPU victim cache', type:'int', group:'bells'},
+  {flag:'--bells-refresh', label:'Refresh rate', desc:'Observe 1-in-N layers', type:'int', group:'bells'},
+  {flag:'--bells-split', label:'Split', desc:'Experts on GPU per token', type:'int', group:'bells'},
+  {flag:'-c', label:'Context', desc:'Max context tokens', type:'int', def:'4096', group:'general'},
+  {flag:'-fa', label:'Flash attention', desc:'Faster attention computation', type:'select', opts:['on','off','auto'], def:'on', group:'general'},
+  {flag:'-t', label:'Threads', desc:'CPU threads', type:'int', def:'8', group:'general'},
+  {flag:'-ctk', label:'KV cache K', desc:'K quantization', type:'select', opts:['f16','q8_0','q4_0'], def:'f16', group:'general'},
+  {flag:'-ctv', label:'KV cache V', desc:'V quantization', type:'select', opts:['f16','q8_0','q4_0'], def:'f16', group:'general'},
+  {flag:'--port', label:'Port', desc:'Server port', type:'int', def:'8080', group:'server'},
+  {flag:'--host', label:'Host', desc:'Bind address', type:'str', def:'127.0.0.1', group:'server'},
+  {flag:'--override-kv', label:'KV override', desc:'e.g. general.expert_used_count=int:6', type:'str', group:'advanced'},
+  {flag:'--temp', label:'Temperature', desc:'Lower = more deterministic', type:'str', def:'0.6', group:'sampling'},
+];
+
+const GROUPS = [
+  ['offload','Offloading'], ['bells','BELLS Cache'], ['general','General'],
+  ['server','Server'], ['sampling','Sampling'], ['advanced','Advanced']
+];
+
+function buildConfigUI() {
+  let html = '';
+  for (const [gid, gname] of GROUPS) {
+    const flags = FLAG_DEFS.filter(f => f.group === gid);
+    if (!flags.length) continue;
+    html += `<div class="flag-group"><div class="flag-group-title">${gname}</div>`;
+    for (const f of flags) {
+      html += `<div class="flag-row">
+        <div class="flag-label">${esc(f.label)}</div>
+        <div class="flag-control">`;
+      if (f.type === 'bool') {
+        html += `<label class="toggle"><input type="checkbox" id="cfg${f.flag}" onchange="updatePreview()"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>`;
+      } else if (f.type === 'select') {
+        html += `<select id="cfg${f.flag}" onchange="updatePreview()">`;
+        for (const o of f.opts) html += `<option value="${o}" ${o===f.def?'selected':''}>${o}</option>`;
+        html += '</select>';
+      } else {
+        html += `<input type="text" id="cfg${f.flag}" value="${f.def||''}" placeholder="${f.def||''}" oninput="updatePreview()">`;
+      }
+      html += `</div><div class="flag-desc">${esc(f.desc)}</div></div>`;
+    }
+    html += '</div>';
+  }
+  document.getElementById('config-flags').innerHTML = html;
+  updatePreview();
+}
+
+function buildArgs() {
+  const args = [];
+  if (selectedModel) args.push('-m', selectedModel);
+  for (const f of FLAG_DEFS) {
+    const el = document.getElementById('cfg' + f.flag);
+    if (!el) continue;
+    if (f.type === 'bool') {
+      if (el.checked) args.push(f.flag);
+    } else if (f.type === 'select') {
+      const v = el.value;
+      if (v && (v !== f.def || f.flag === '-fa')) args.push(f.flag, v);
+    } else {
+      const v = el.value.trim();
+      if (v && (v !== (f.def||'') || ['-c','-ngl','-t'].includes(f.flag))) args.push(f.flag, v);
+    }
+  }
+  return args;
+}
+
+function updatePreview() {
+  document.getElementById('cmd-preview').textContent = 'llama-server ' + buildArgs().join(' ');
+}
+
+function resetConfig() {
+  for (const f of FLAG_DEFS) {
+    const el = document.getElementById('cfg' + f.flag);
+    if (!el) continue;
+    if (f.type === 'bool') el.checked = false;
+    else el.value = f.def || '';
+  }
+  updatePreview();
+}
+
+async function copyCommand() {
+  const cmd = 'llama-server ' + buildArgs().join(' ');
+  try { await navigator.clipboard.writeText(cmd); } catch(e) {}
+}
+
+async function launchServer() {
+  if (!api) return;
+  const r = await api.start_server(buildArgs());
+  if (r.error) return;
+  document.querySelector('[data-page="server"]').click();
+  startSrvPoll();
+}
+
+async function startBench() {
+  if (!api) return;
+  const model = document.getElementById('bench-model').value.trim();
+  if (!model) return;
+  const ctx = parseInt(document.getElementById('bench-ctx').value) || 4096;
+  const profile = document.getElementById('bench-profile').value;
+  document.getElementById('bench-start-btn').disabled = true;
+  document.getElementById('bench-cancel-btn').disabled = false;
+  document.getElementById('bench-log').textContent = 'Starting benchmark...\n';
+  document.getElementById('bench-results').innerHTML = '';
+  await api.start_benchmark(model, ctx, profile);
+  benchPollTimer = setInterval(pollBench, 2000);
+}
+
+async function pollBench() {
+  if (!api) return;
+  const s = await api.bench_status();
+  document.getElementById('bench-log').textContent = s.log.join('\n');
+  const el = document.getElementById('bench-log');
+  el.scrollTop = el.scrollHeight;
+  if (s.results.length) {
+    let html = '';
+    for (const r of s.results) {
+      const st = r.oom ? '<span class="badge badge-red">OOM</span>' :
+                 r.error ? `<span class="badge badge-orange">${esc(r.error)}</span>` :
+                 '<span class="badge badge-green">OK</span>';
+      html += `<tr><td class="cell-primary">${esc(r.config)}</td><td>${r.gen_tps}</td><td>${r.prompt_tps}</td><td>${st}</td></tr>`;
+    }
+    document.getElementById('bench-results').innerHTML = html;
+  }
+  if (!s.running) {
+    clearInterval(benchPollTimer);
+    document.getElementById('bench-start-btn').disabled = false;
+    document.getElementById('bench-cancel-btn').disabled = true;
+  }
+}
+
+async function cancelBench() { if (api) await api.cancel_benchmark(); }
+
+async function srvStart() {
+  if (!api) return;
+  const r = await api.start_server(buildArgs());
+  if (r.error) return;
+  startSrvPoll();
+}
+
+async function srvStop() { if (api) await api.stop_server(); }
+
+function startSrvPoll() {
+  if (srvPollTimer) clearInterval(srvPollTimer);
+  serverLogOffset = 0;
+  srvPollTimer = setInterval(pollServer, 1000);
+  pollServer();
+}
+
+async function pollServer() {
+  if (!api) return;
+  const s = await api.server_status();
+  if (s.running) {
+    document.getElementById('srv-status').innerHTML = '<span class="badge badge-green">Running</span>';
+    document.getElementById('srv-pid').textContent = s.pid;
+    document.getElementById('srv-start').disabled = true;
+    document.getElementById('srv-stop').disabled = false;
+    document.getElementById('srv-browser').disabled = false;
+  } else {
+    document.getElementById('srv-status').innerHTML = '<span class="badge badge-red">Stopped</span>';
+    document.getElementById('srv-pid').textContent = s.exit_code != null ? `Exit ${s.exit_code}` : '—';
+    document.getElementById('srv-start').disabled = false;
+    document.getElementById('srv-stop').disabled = true;
+    document.getElementById('srv-browser').disabled = true;
+    if (srvPollTimer && s.pid) { clearInterval(srvPollTimer); srvPollTimer = null; }
+  }
+  const logs = await api.server_logs(serverLogOffset);
+  if (logs.lines.length) {
+    const el = document.getElementById('srv-log');
+    if (serverLogOffset === 0) el.textContent = '';
+    el.textContent += logs.lines.join('\n') + '\n';
+    el.scrollTop = el.scrollHeight;
+    serverLogOffset = logs.total;
+  }
+}
+
+function srvBrowser() {
+  const port = document.getElementById('cfg--port')?.value || '8080';
+  const host = document.getElementById('cfg--host')?.value || '127.0.0.1';
+  window.open(`http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}`, '_blank');
+}
+
+if (window.pywebview) window.addEventListener('pywebviewready', init);
+else document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>

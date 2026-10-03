@@ -2798,6 +2798,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CPU_MOE_PINNED"));
     add_opt(common_arg(
+        {"--auto"},
+        "detect MoE models and automatically enable --cpu-moe-pinned and --bells with auto-sizing. "
+        "For dense models this is a harmless no-op. Combine with -m and -c; everything else is "
+        "figured out from the hardware",
+        [](common_params & params) {
+            params.bells_enabled = true;
+            params.bells_n_slot  = 0;
+
+            const auto ov = llm_ffn_exps_pinned_override();
+            if (ov.buft == nullptr) {
+                params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+            } else {
+                params.tensor_buft_overrides.push_back(ov);
+                params.load_mode = LLAMA_LOAD_MODE_NONE;
+            }
+        }
+    ).set_env("LLAMA_ARG_AUTO"));
+    add_opt(common_arg(
         {"--bells"},
         "enable the BELLS expert cache, sizing it automatically from free VRAM. Equivalent to "
         "--bells-slots -1. Use with --cpu-moe, which keeps the expert weights on the host",
@@ -2823,6 +2841,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_BELLS_SLOTS"));
     add_opt(common_arg(
+        {"--bells-split"}, "K",
+        "BELLS: run K of each token's experts on the GPU from the VRAM cache and the remaining "
+        "n_expert_used-K on the CPU from the host weights, concurrently. The MoE output is a "
+        "weighted sum over experts, so splitting it is exact - no quality cost. Only K experts per "
+        "token need to be resident, so the cache covers proportionally more, and a miss costs what "
+        "--cpu-moe costs instead of costing more (default: 0 = all experts through the cache)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.bells_split = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_BELLS_SPLIT"));
+    add_opt(common_arg(
+        {"--bells-refresh"}, "N",
+        "BELLS: observe a rotating 1/N of MoE layers per token instead of every layer. Each "
+        "observation point costs a graph split, measured at ~2.3 ms/token across 32 layers - more "
+        "than the readback, copy and upload combined. Layers not observed reuse their last slot "
+        "table and anything routed outside it is dropped via the zero slot, so this trades hit "
+        "rate for split cost (default: 1 = observe every layer)",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.bells_refresh = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_BELLS_REFRESH"));
+    add_opt(common_arg(
         {"--bells-passive"},
         "BELLS: research only. Allocate the cache and keep taking the per-layer graph split, but "
         "leave the matmuls on the full expert stack and copy nothing. Measures what the mechanism "
@@ -2831,6 +2877,103 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.bells_passive = true;
         }
     ).set_env("LLAMA_ARG_BELLS_PASSIVE"));
+    add_opt(common_arg(
+        {"--bells-l2-slots"}, "N",
+        "BELLS: use a secondary GPU's VRAM as an L2 expert cache. N experts per layer are cached "
+        "on the secondary GPU; evicted L1 experts are demoted there instead of discarded. On a "
+        "future miss, data is copied from GPU2 (guaranteed resident) instead of host RAM (which may "
+        "page-fault from NVMe). Use -1 to auto-size from the secondary GPU's free VRAM",
+        [](common_params & params, int value) {
+            params.bells_enabled    = true;
+            // -1 means auto-size from free VRAM; 0 is stored as UINT32_MAX so the
+            // context code knows L2 was requested and passes 0 to init_l2 for auto-sizing
+            params.bells_l2_n_slot  = value > 0 ? (uint32_t) value : UINT32_MAX;
+        }
+    ).set_env("LLAMA_ARG_BELLS_L2_SLOTS"));
+    add_opt(common_arg(
+        {"--bells-cache-type"}, "TYPE",
+        "BELLS: store cached experts at a different quant type than the model (e.g. q2_K when "
+        "the model is q4_K). Fits more experts in the same VRAM at the cost of some precision "
+        "on cached experts. The host weights stay at the model's original type; only the VRAM "
+        "cache is re-quantized on admission",
+        [](common_params & params, const std::string & value) {
+            ggml_type found = GGML_TYPE_COUNT;
+            for (int i = 0; i < (int) GGML_TYPE_COUNT; i++) {
+                const char * name = ggml_type_name((ggml_type) i);
+                if (name && value == name) {
+                    found = (ggml_type) i;
+                    break;
+                }
+            }
+            if (found == GGML_TYPE_COUNT) {
+                throw std::runtime_error("unknown type: " + value);
+            }
+            params.bells_cache_type = found;
+        }
+    ).set_env("LLAMA_ARG_BELLS_CACHE_TYPE"));
+    add_opt(common_arg(
+        {"--pin-experts"}, "FILE",
+        "seat the hottest experts per layer permanently in the BELLS cache, using a usage CSV "
+        "from --moe-stats, instead of admitting on demand. Routing is heavily skewed, so the same "
+        "VRAM covers far more traffic chosen by frequency than spent on whole layers via -ot. "
+        "Requires --bells-slots and --cpu-moe",
+        [](common_params & params, const std::string & value) {
+            params.pin_experts = value;
+        }
+    ).set_env("LLAMA_ARG_PIN_EXPERTS"));
+    add_opt(common_arg(
+        {"--pin-reserve"}, "N",
+        "dynamic slots to keep free per layer when using --pin-experts, for experts a token "
+        "routes to outside the pinned set (default: 0 = auto, 4x n_expert_used)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.pin_reserve = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_PIN_RESERVE"));
+    add_opt(common_arg(
+        {"--moe-stats"}, "FILE",
+        "write a CSV of how often routing picks each expert, per layer. Measurement only - it "
+        "changes nothing about execution. Used to decide whether pinning experts by frequency "
+        "beats pinning whole layers at the same VRAM budget",
+        [](common_params & params, const std::string & value) {
+            params.moe_stats = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_STATS"));
+    add_opt(common_arg(
+        {"--moe-prefetch"}, "N",
+        "keep the N hottest experts per layer hinted to the OS one layer ahead, as whole extents. "
+        "For a model larger than RAM the kernel pulls each missing expert in at its own readahead "
+        "granularity, one request at a time on the critical path; one expert is a single "
+        "contiguous extent, so asking for it as one asynchronous request collapses ~31 serialised "
+        "faults into 1. Independent of --bells: this is about NVMe request size and queue depth, "
+        "not VRAM (default: 0 = off)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_prefetch = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH"));
+    add_opt(common_arg(
+        {"--cold-tensors"}, "SUBSTR[,SUBSTR...]",
+        "keep tensors whose name contains any of these substrings out of the process working set, "
+        "so the page cache evicts them before anything else. For weights that are large and read "
+        "once per use - a per-token lookup table - plain LRU keeps them for the same reason it "
+        "keeps a hot expert, which is wrong when the model does not fit in RAM",
+        [](common_params & params, const std::string & value) {
+            params.cold_tensors = value;
+        }
+    ).set_env("LLAMA_ARG_COLD_TENSORS"));
+    add_opt(common_arg(
+        {"--cold-ple"},
+        "shorthand for --cold-tensors per_layer_token_embd. Gemma3n-style per-layer embeddings are "
+        "a large lookup table read one row per token, so they are the ideal eviction victim",
+        [](common_params & params) {
+            params.cold_tensors = "per_layer_token_embd";
+        }
+    ).set_env("LLAMA_ARG_COLD_PLE"));
     add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",

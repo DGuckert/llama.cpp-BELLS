@@ -22,14 +22,12 @@ app = modal.App("bells-vs-strata")
 vol = modal.Volume.from_name("bells-benchmark-models", create_if_missing=True)
 MODEL_DIR = "/models"
 
-STRATA_LLAMA_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
-
 comparison_image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
     .apt_install("cmake", "build-essential", "git", "wget", "curl", "ninja-build", "unzip")
     # --- Build BELLS ---
     .run_commands("git clone --branch bells-next https://github.com/DGuckert/llama.cpp-BELLS.git /opt/bells")
-    .run_commands("cd /opt/bells && git pull origin bells-next && git log --oneline -3")  # bust:e74a82f77
+    .run_commands("cd /opt/bells && git pull origin bells-next && git log --oneline -3")  # bust:cmake324
     .run_commands(
         "mkdir -p /opt/bells/build && cd /opt/bells/build && "
         "cmake .. -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES='86'"
@@ -40,20 +38,16 @@ comparison_image = (
         "cd /opt/bells/build && cmake --build . --target llama-server -j$(nproc)"
     )
     # --- Build Strata ---
+    # Strata needs CMake >= 3.24, Ubuntu 22.04 ships 3.22
+    .run_commands("pip install cmake --upgrade && cmake --version")
     .run_commands("git clone https://github.com/Niko1221/Strata.git /opt/strata")
     .run_commands("cd /opt/strata && git log --oneline -3")
-    # Download pinned llama.cpp for Strata's ggml dependency
-    .run_commands(
-        f"cd /opt/strata && mkdir -p third_party && cd third_party && "
-        f"wget -q https://github.com/ggml-org/llama.cpp/archive/{STRATA_LLAMA_COMMIT}.zip -O llama.zip && "
-        f"unzip -q llama.zip && mv llama.cpp-{STRATA_LLAMA_COMMIT} llama.cpp && rm llama.zip"
-    )
+    # Strata's FetchContent grabs its own pinned llama.cpp/ggml if STRATA_GGML_DIR is unset
     .run_commands(
         "mkdir -p /opt/strata/build && cd /opt/strata/build && "
         "cmake -DCMAKE_BUILD_TYPE=Release "
         "-DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF "
         "-DCMAKE_CUDA_ARCHITECTURES='86' "
-        f"-DSTRATA_GGML_DIR=/opt/strata/third_party/llama.cpp "
         "-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc "
         ".. || echo 'WARNING: Strata cmake configure failed'"
     )

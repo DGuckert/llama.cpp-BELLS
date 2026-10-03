@@ -4430,6 +4430,8 @@ llama_context_params llama_context_default_params() {
         /*.bells_split                 =*/ 0,
         /*.bells_l2_n_slot             =*/ 0,
         /*.bells_cache_type            =*/ GGML_TYPE_COUNT,
+        /*.bells_adapt                 =*/ 0,
+        /*.bells_adapt_decay           =*/ 0.0f,
         /*.cold_tensors                =*/ nullptr,
         /*.moe_prefetch                =*/ 0,
         /*.moe_stats                   =*/ nullptr,

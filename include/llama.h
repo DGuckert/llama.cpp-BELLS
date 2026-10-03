@@ -413,6 +413,8 @@ extern "C" {
                                          // model's own type. A smaller type fits more experts in the
                                          // same VRAM at the cost of some precision on cached experts.
                                          // GGML_TYPE_COUNT = use the model's type (default)
+        uint32_t     bells_adapt;      // adaptive cache swaps every N decode tokens, 0 = off
+        float        bells_adapt_decay; // usage decay factor per adapt round, 0 = default (0.985)
 
         // comma-separated tensor-name substrings to keep out of the working set, NULL = none.
         // for weights read once per use (a per-token lookup table), the page cache's LRU keeps

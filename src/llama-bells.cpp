@@ -1785,6 +1785,9 @@ bool bells_runtime::init(const bells_params & params,
                 }
             } else {
                 headroom = std::max<size_t>(256ull*1024*1024, di.free_bytes / 20);
+                if (params.vram_reserve_mib > 0) {
+                    headroom += (size_t)params.vram_reserve_mib * 1024 * 1024;
+                }
                 budget   = di.free_bytes > headroom ? di.free_bytes - headroom : 0;
             }
 

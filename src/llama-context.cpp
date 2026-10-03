@@ -742,8 +742,9 @@ llama_context::llama_context(
             }
             bp.pin_reserve  = params.pin_reserve;
             bp.cache_type   = params.bells_cache_type;
-            bp.adapt_every  = params.bells_adapt;
-            bp.adapt_decay  = params.bells_adapt_decay;
+            bp.adapt_every      = params.bells_adapt;
+            bp.adapt_decay      = params.bells_adapt_decay;
+            bp.vram_reserve_mib = params.bells_vram_reserve;
 
             // the cache lives wherever the graph runs, i.e. next to the rest of the offload
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends.front().get());
@@ -4432,6 +4433,7 @@ llama_context_params llama_context_default_params() {
         /*.bells_cache_type            =*/ GGML_TYPE_COUNT,
         /*.bells_adapt                 =*/ 0,
         /*.bells_adapt_decay           =*/ 0.0f,
+        /*.bells_vram_reserve          =*/ 0,
         /*.cold_tensors                =*/ nullptr,
         /*.moe_prefetch                =*/ 0,
         /*.moe_stats                   =*/ nullptr,

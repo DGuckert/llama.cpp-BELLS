@@ -496,6 +496,11 @@ struct bells_params {
     // --bells-adapt-decay: usage decay factor per adaptation round (0.0 = use default 0.985).
     // Lower = forget faster. 0.985 matches Strata; the old BELLS default was 0.7.
     float       adapt_decay = 0.0f;
+
+    // --bells-reserve: extra VRAM (MiB) to keep free beyond the base headroom.
+    // Needed when speculative decoding (MTP) shares the same GPU — its compute
+    // graph needs ~1 GiB that --auto would otherwise fill with expert cache.
+    uint32_t    vram_reserve_mib = 0;
 };
 
 // Ties the pieces together for the inference path.

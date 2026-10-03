@@ -1733,6 +1733,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.bells_cache_type   = params.bells_cache_type;
     cparams.bells_adapt        = params.bells_adapt;
     cparams.bells_adapt_decay  = params.bells_adapt_decay;
+    cparams.bells_vram_reserve = params.bells_vram_reserve;
+    if (cparams.bells_vram_reserve == 0 && params.speculative.has_dft()) {
+        cparams.bells_vram_reserve = 1536;
+    }
     // points into params, which outlives the context in every caller here
     cparams.cold_tensors       = params.cold_tensors.empty() ? nullptr : params.cold_tensors.c_str();
     cparams.moe_prefetch       = params.moe_prefetch;

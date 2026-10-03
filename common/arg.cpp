@@ -2935,6 +2935,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_BELLS_ADAPT_DECAY"));
     add_opt(common_arg(
+        {"--bells-reserve"}, "N",
+        "BELLS: extra VRAM (MiB) to keep free beyond the base headroom when using --auto. "
+        "Needed when speculative decoding (MTP) shares the same GPU — its compute graph needs "
+        "~1024 MiB that --auto would otherwise fill with expert cache (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--bells-reserve must be non-negative");
+            }
+            params.bells_vram_reserve = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_BELLS_RESERVE"));
+    add_opt(common_arg(
         {"--pin-experts"}, "FILE",
         "seat the hottest experts per layer permanently in the BELLS cache, using a usage CSV "
         "from --moe-stats, instead of admitting on demand. Routing is heavily skewed, so the same "
